@@ -32,11 +32,12 @@ async def generate_risk_report(req: RiskRequest):
     fx_rate = fx_resp.get("rates", {}).get(country_code, "N/A")
 
     # 2. Get IMF Inflation (CPI)
-    imf_url = f"https://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData/IFS/M.{country_code}.PCPI_IX.?startPeriod=2022"
-    imf_resp = requests.get(imf_url).json()
     try:
+        imf_url = f"https://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData/IFS/M.{country_code}.PCPI_IX.?startPeriod=2022"
+        imf_resp = requests.get(imf_url, timeout=10).json()
         inflation = imf_resp["CompactData"]["DataSet"]["Series"]["Obs"][-1]["@OBS_VALUE"]
-    except:
+    except Exception as e:
+        print(f"[IMF ERROR] {str(e)}")
         inflation = "N/A"
 
     # 3. Get World Bank External Debt
