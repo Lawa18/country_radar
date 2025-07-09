@@ -1,7 +1,11 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Response
 from typing import Dict, Any
 import requests
 import pycountry
+import io
+import matplotlib.pyplot as plt
+import pandas as pd
+from datetime import datetime
 
 app = FastAPI()
 
@@ -78,3 +82,58 @@ def get_country_data(country: str = Query(..., description="Full country name, e
         "imf_data": imf_data,
         "world_bank_data": wb_data
     }
+
+# --- Chart endpoint ---
+@app.get("/chart")
+def get_chart(country: str, type: str):
+    codes = resolve_country_codes(country)
+    if not codes:
+        return Response(content="Invalid country name", media_type="text/plain", status_code=400)
+
+    iso_alpha_2 = codes["iso_alpha_2"]
+    if type == "inflation":
+        indicator = "FP.CPI.TOTL.ZG"
+        label = "Inflation (%)"
+    elif type == "fx_rate":
+        indicator = "ENDE_XDC_USD_RATE"
+        label = "Exchange Rate (to USD)"
+        iso_alpha_3 = codes["iso_alpha_3"]
+        url = f"https://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData/IFS/{iso_alpha_3}.{indicator}"
+        try:
+            r = requests.get(url)
+            r.raise_for_status()
+            data = r.json()
+            series = data['CompactData']['DataSet']['Series']
+            obs = series['Obs']
+            dates = [datetime.strptime(o['@TIME_PERIOD'], "%Y-%m") for o in obs]
+            values = [float(o['@OBS_VALUE']) for o in obs]
+        except Exception:
+            return Response(content="Failed to fetch IMF FX data", media_type="text/plain", status_code=500)
+    else:
+        url = f"http://api.worldbank.org/v2/country/{iso_alpha_2}/indicator/{indicator}?format=json&per_page=100"
+        try:
+            r = requests.get(url)
+            r.raise_for_status()
+            raw = r.json()
+            entries = raw[1]
+            entries = [e for e in entries if e["value"] is not None]
+            dates = [datetime.strptime(e["date"], "%Y") for e in entries]
+            values = [float(e["value"]) for e in entries]
+        except Exception:
+            return Response(content="Failed to fetch World Bank data", media_type="text/plain", status_code=500)
+
+    # Create chart
+    plt.figure(figsize=(8, 4))
+    plt.plot(dates, values, marker='o')
+    plt.title(f"{label} – {country}")
+    plt.xlabel("Date")
+    plt.ylabel(label)
+    plt.grid(True)
+    plt.tight_layout()
+
+    # Return image
+    img_bytes = io.BytesIO()
+    plt.savefig(img_bytes, format="png")
+    plt.close()
+    img_bytes.seek(0)
+    return Response(content=img_bytes.read(), media_type="image/png")
