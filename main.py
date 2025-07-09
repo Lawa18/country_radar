@@ -1,84 +1,80 @@
-import os
+from fastapi import FastAPI, Query
+from typing import Dict, Any
 import requests
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import openai
+import pycountry
 
 app = FastAPI()
 
-# Allow all origins (for MVP simplicity)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-openai.api_key = os.getenv("OPENAI_API_KEY")
-OPENEX_API_KEY = os.getenv("OPENEX_API_KEY")
-
-class RiskRequest(BaseModel):
-    country_code: str  # e.g. "NG"
-
-@app.post("/risk-report")
-async def generate_risk_report(req: RiskRequest):
-    country_code = req.country_code.upper()
-
-    # 1. Get FX Rate
-    fx_url = f"https://openexchangerates.org/api/latest.json?app_id={OPENEX_API_KEY}&symbols={country_code}&base=USD"
-    fx_resp = requests.get(fx_url).json()
-    fx_rate = fx_resp.get("rates", {}).get(country_code, "N/A")
-
-    # 2. Get IMF Inflation (CPI)
+# --- Country Name → ISO code resolver ---
+def resolve_country_codes(name: str):
     try:
-        imf_url = f"https://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData/IFS/M.{country_code}.PCPI_IX.?startPeriod=2022"
-        imf_resp = requests.get(imf_url, timeout=10).json()
-        inflation = imf_resp["CompactData"]["DataSet"]["Series"]["Obs"][-1]["@OBS_VALUE"]
-    except Exception as e:
-        print(f"[IMF ERROR] {str(e)}")
-        inflation = "N/A"
+        country = pycountry.countries.lookup(name)
+        return {
+            "iso_alpha_2": country.alpha_2,
+            "iso_alpha_3": country.alpha_3
+        }
+    except LookupError:
+        return None
 
-    # 3. Get World Bank External Debt
-    wb_url = f"https://api.worldbank.org/v2/country/{country_code}/indicator/GC.DOD.TOTL.GD.ZS?format=json&per_page=100"
-    wb_resp = requests.get(wb_url).json()
-    try:
-        external_debt = wb_resp[1][0]["value"]
-    except:
-        external_debt = "N/A"
+# --- IMF IFS indicators ---
+IMF_INDICATORS = {
+    "CPI": "PCPI_IX",
+    "FX Rate": "ENDE_XDC_USD_RATE",
+    "Interest Rate": "FIDSR",
+    "Reserves (USD)": "TRESEGUSD",
+    "GDP Nominal": "NGDPD"
+}
 
-    # 4. Create GPT prompt
-    summary = f"""
-    Country: {country_code}
-    FX rate (USD/{country_code}): {fx_rate}
-    Inflation (YoY): {inflation}%
-    External Debt to GNI: {external_debt}%
-    """
+# --- World Bank WDI indicators ---
+WB_INDICATORS = {
+    "GDP (USD)": "NY.GDP.MKTP.CD",
+    "Inflation (%)": "FP.CPI.TOTL.ZG",
+    "Unemployment (%)": "SL.UEM.TOTL.ZS",
+    "Debt to GDP (%)": "GC.DOD.TOTL.GD.ZS",
+    "Current Account Balance (% of GDP)": "BN.CAB.XOKA.GD.ZS"
+}
 
-    prompt = f"""
-    Based on the following macro data, generate a receivables risk summary for credit insurers and exporters.
+# --- IMF fetch ---
+def fetch_imf_data(iso_alpha_3: str) -> Dict[str, Any]:
+    base_url = "https://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData/IFS"
+    results = {}
+    for label, code in IMF_INDICATORS.items():
+        url = f"{base_url}/{iso_alpha_3}.{code}"
+        try:
+            r = requests.get(url)
+            r.raise_for_status()
+            results[label] = r.json()
+        except Exception as e:
+            results[label] = {"error": str(e)}
+    return results
 
-    {summary}
+# --- World Bank fetch ---
+def fetch_worldbank_data(iso_alpha_2: str) -> Dict[str, Any]:
+    base_url = "http://api.worldbank.org/v2/country"
+    results = {}
+    for label, code in WB_INDICATORS.items():
+        url = f"{base_url}/{iso_alpha_2}/indicator/{code}?format=json&per_page=100"
+        try:
+            r = requests.get(url)
+            r.raise_for_status()
+            results[label] = r.json()
+        except Exception as e:
+            results[label] = {"error": str(e)}
+    return results
 
-    Include:
-    - FX volatility impact
-    - Payment behavior implications
-    - Sovereign or systemic risk tier (Low, Med, High)
-    """
+# --- Main API endpoint ---
+@app.get("/country-data")
+def get_country_data(country: str = Query(..., description="Full country name, e.g., Sweden")):
+    codes = resolve_country_codes(country)
+    if not codes:
+        return {"error": "Invalid country name"}
 
-    try:
-        completion = openai.ChatCompletion.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}]
-        )
-        gpt_reply = completion.choices[0].message["content"]
-    except Exception as e:
-        gpt_reply = f"Error generating GPT summary: {str(e)}"
+    imf_data = fetch_imf_data(codes["iso_alpha_3"])
+    wb_data = fetch_worldbank_data(codes["iso_alpha_2"])
 
     return {
-        "fx_rate": fx_rate,
-        "inflation": inflation,
-        "external_debt": external_debt,
-        "gpt_summary": gpt_reply
+        "country": country,
+        "iso_codes": codes,
+        "imf_data": imf_data,
+        "world_bank_data": wb_data
     }
