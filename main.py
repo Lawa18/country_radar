@@ -9,6 +9,10 @@ from datetime import datetime
 
 app = FastAPI()
 
+@app.get("/ping")
+def ping():
+    return {"status": "ok"}
+
 def resolve_country_codes(name: str):
     try:
         country = pycountry.countries.lookup(name)
@@ -45,6 +49,7 @@ def fetch_imf_data(iso_alpha_3: str) -> Dict[str, Any]:
             r.raise_for_status()
             results[label] = r.json()
         except Exception as e:
+            print(f"IMF fetch error for {label}: {e}")
             results[label] = {"error": str(e)}
     return results
 
@@ -58,6 +63,7 @@ def fetch_worldbank_data(iso_alpha_2: str) -> Dict[str, Any]:
             r.raise_for_status()
             results[label] = r.json()
         except Exception as e:
+            print(f"World Bank fetch error for {label}: {e}")
             results[label] = {"error": str(e)}
     return results
 
@@ -80,33 +86,37 @@ def fetch_imf_series(iso_alpha_3: str, indicator_code: str, label: str, years: i
         ]
         return {label: filtered}
     except Exception as e:
+        print(f"IMF series fetch error for {label}: {e}")
         return {label: {"error": str(e)}}
 
 @app.get("/country-data")
 def get_country_data(country: str = Query(..., description="Full country name, e.g., Sweden")):
-    codes = resolve_country_codes(country)
-    if not codes:
-        return {"error": "Invalid country name"}
+    try:
+        codes = resolve_country_codes(country)
+        if not codes:
+            return {"error": "Invalid country name"}
 
-    iso_alpha_2 = codes["iso_alpha_2"]
-    iso_alpha_3 = codes["iso_alpha_3"]
+        iso_alpha_2 = codes["iso_alpha_2"]
+        iso_alpha_3 = codes["iso_alpha_3"]
 
-    imf_data = fetch_imf_data(iso_alpha_3)
-    wb_data = fetch_worldbank_data(iso_alpha_2)
+        imf_data = fetch_imf_data(iso_alpha_3)
+        wb_data = fetch_worldbank_data(iso_alpha_2)
 
-    # Add historical CPI, FX, interest rate
-    history = {}
-    history.update(fetch_imf_series(iso_alpha_3, "PCPI_IX", "CPI"))
-    history.update(fetch_imf_series(iso_alpha_3, "ENDE_XDC_USD_RATE", "FX Rate"))
-    history.update(fetch_imf_series(iso_alpha_3, "FIDSR", "Interest Rate"))
+        history = {}
+        history.update(fetch_imf_series(iso_alpha_3, "PCPI_IX", "CPI"))
+        history.update(fetch_imf_series(iso_alpha_3, "ENDE_XDC_USD_RATE", "FX Rate"))
+        history.update(fetch_imf_series(iso_alpha_3, "FIDSR", "Interest Rate"))
 
-    return {
-        "country": country,
-        "iso_codes": codes,
-        "imf_data": imf_data,
-        "world_bank_data": wb_data,
-        "history": history
-    }
+        return {
+            "country": country,
+            "iso_codes": codes,
+            "imf_data": imf_data,
+            "world_bank_data": wb_data,
+            "history": history
+        }
+    except Exception as e:
+        print(f"/country-data endpoint error: {e}")
+        return {"error": f"Server error: {str(e)}"}
 
 @app.get("/chart")
 def get_chart(country: str, type: str, years: int = 5):
@@ -139,7 +149,8 @@ def get_chart(country: str, type: str, years: int = 5):
         values = [float(o['@OBS_VALUE']) for o in obs]
         combined = [(d, v) for d, v in zip(dates, values) if d.year >= start_year]
         dates, values = zip(*combined) if combined else ([], [])
-    except Exception:
+    except Exception as e:
+        print(f"/chart endpoint error: {e}")
         return Response(content=f"Failed to fetch IMF {label} data", media_type="text/plain", status_code=500)
 
     plt.figure(figsize=(10, 5))
