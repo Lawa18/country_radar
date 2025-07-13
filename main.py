@@ -39,18 +39,24 @@ WB_INDICATORS = {
     "Current Account Balance (% of GDP)": "BN.CAB.XOKA.GD.ZS"
 }
 
-def fetch_imf_datamapper_cpi(iso_alpha_3: str) -> Dict[str, Any]:
-    indicator_code = "PCPI_IX"
-    url = f"https://www.imf.org/external/datamapper/api/v1/IFS/{iso_alpha_3}/{indicator_code}"
-    try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        values = data.get(iso_alpha_3, {}).get(indicator_code, {})
-        return {"CPI": values}
-    except Exception as e:
-        print(f"IMF DataMapper CPI fetch error: {e}")
-        return {"CPI": {"error": str(e)}}
+def fetch_imf_datamapper(iso_alpha_3: str) -> Dict[str, Any]:
+    indicators = ["PCPI_IX", "ENDE_XDC_USD_RATE"]
+    base_url = "https://www.imf.org/external/datamapper/api/v1/IFS"
+    result = {}
+    for code in indicators:
+        url = f"{base_url}/{iso_alpha_3}/{code}"
+        try:
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            result[code] = data.get(iso_alpha_3, {}).get(code, {})
+        except Exception as e:
+            print(f"IMF DataMapper fetch error for {code}: {e}")
+            result[code] = {"error": str(e)}
+    return {
+        "CPI": result.get("PCPI_IX", {}),
+        "FX Rate": result.get("ENDE_XDC_USD_RATE", {})
+    }
 
 def fetch_worldbank_data(iso_alpha_2: str) -> Dict[str, Any]:
     base_url = "http://api.worldbank.org/v2/country"
@@ -99,11 +105,10 @@ def get_country_data(country: str = Query(..., description="Full country name, e
         iso_alpha_2 = codes["iso_alpha_2"]
         iso_alpha_3 = codes["iso_alpha_3"]
 
-        imf_data = fetch_imf_datamapper_cpi(iso_alpha_3)
+        imf_data = fetch_imf_datamapper(iso_alpha_3)
         wb_data = fetch_worldbank_data(iso_alpha_2)
 
         history = {}
-        # Only keep IMF chart series for now, using legacy endpoint until replaced
         history.update(fetch_imf_series(iso_alpha_3, "PCPI_IX", "CPI"))
         history.update(fetch_imf_series(iso_alpha_3, "ENDE_XDC_USD_RATE", "FX Rate"))
         history.update(fetch_imf_series(iso_alpha_3, "FIDSR", "Interest Rate"))
