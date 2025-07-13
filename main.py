@@ -40,7 +40,7 @@ WB_INDICATORS = {
 }
 
 def fetch_imf_datamapper(iso_alpha_3: str) -> Dict[str, Any]:
-    indicators = ["PCPI_IX", "ENDE_XDC_USD_RATE"]
+    indicators = ["PCPI_IX", "ENDE_XDC_USD_RATE", "FIDSR", "TRESEGUSD"]
     base_url = "https://www.imf.org/external/datamapper/api/v1/IFS"
     result = {}
     for code in indicators:
@@ -55,7 +55,9 @@ def fetch_imf_datamapper(iso_alpha_3: str) -> Dict[str, Any]:
             result[code] = {"error": str(e)}
     return {
         "CPI": result.get("PCPI_IX", {}),
-        "FX Rate": result.get("ENDE_XDC_USD_RATE", {})
+        "FX Rate": result.get("ENDE_XDC_USD_RATE", {}),
+        "Interest Rate": result.get("FIDSR", {}),
+        "Reserves (USD)": result.get("TRESEGUSD", {})
     }
 
 def fetch_worldbank_data(iso_alpha_2: str) -> Dict[str, Any]:
