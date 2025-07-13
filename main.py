@@ -90,6 +90,7 @@ def fetch_imf_series(iso_alpha_3: str, indicator_code: str, label: str, years: i
         return {label: {"error": str(e)}}
 
 @app.get("/country-data")
+@app.head("/country-data")
 def get_country_data(country: str = Query(..., description="Full country name, e.g., Sweden")):
     try:
         codes = resolve_country_codes(country)
@@ -119,6 +120,7 @@ def get_country_data(country: str = Query(..., description="Full country name, e
         return {"error": f"Server error: {str(e)}"}
 
 @app.get("/chart")
+@app.head("/chart")
 def get_chart(country: str, type: str, years: int = 5):
     codes = resolve_country_codes(country)
     if not codes:
