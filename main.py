@@ -74,28 +74,6 @@ def fetch_worldbank_data(iso_alpha_2: str) -> Dict[str, Any]:
             results[label] = {"error": str(e)}
     return results
 
-def fetch_imf_series(iso_alpha_3: str, indicator_code: str, label: str, years: int = 20):
-    url = f"https://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData/IFS/{iso_alpha_3}.{indicator_code}"
-    try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        series = data['CompactData']['DataSet']['Series']
-        obs = series['Obs']
-        current_year = datetime.today().year
-        filtered = [
-            {
-                "date": o["@TIME_PERIOD"],
-                "value": float(o["@OBS_VALUE"])
-            }
-            for o in obs
-            if int(o["@TIME_PERIOD"][:4]) >= current_year - years
-        ]
-        return {label: filtered}
-    except Exception as e:
-        print(f"IMF series fetch error for {label}: {e}")
-        return {label: {"error": str(e)}}
-
 @app.get("/country-data")
 @app.head("/country-data")
 def get_country_data(country: str = Query(..., description="Full country name, e.g., Sweden")):
@@ -110,17 +88,11 @@ def get_country_data(country: str = Query(..., description="Full country name, e
         imf_data = fetch_imf_datamapper(iso_alpha_3)
         wb_data = fetch_worldbank_data(iso_alpha_2)
 
-        history = {}
-        history.update(fetch_imf_series(iso_alpha_3, "PCPI_IX", "CPI"))
-        history.update(fetch_imf_series(iso_alpha_3, "ENDE_XDC_USD_RATE", "FX Rate"))
-        history.update(fetch_imf_series(iso_alpha_3, "FIDSR", "Interest Rate"))
-
         return {
             "country": country,
             "iso_codes": codes,
             "imf_data": imf_data,
-            "world_bank_data": wb_data,
-            "history": history
+            "world_bank_data": wb_data
         }
     except Exception as e:
         print(f"/country-data endpoint error: {e}")
@@ -134,38 +106,38 @@ def get_chart(country: str, type: str, years: int = 5):
         return Response(content="Invalid country name", media_type="text/plain", status_code=400)
 
     iso_alpha_3 = codes["iso_alpha_3"]
-    end_year = datetime.today().year
-    start_year = end_year - years
+    indicator_map = {
+        "inflation": ("PCPI_IX", "Inflation (%)"),
+        "fx_rate": ("ENDE_XDC_USD_RATE", "Exchange Rate (to USD)"),
+        "interest_rate": ("FIDSR", "Interest Rate (%)")
+    }
 
-    if type == "fx_rate":
-        indicator = "ENDE_XDC_USD_RATE"
-        label = "Exchange Rate (to USD)"
-    elif type == "interest_rate":
-        indicator = "FIDSR"
-        label = "Interest Rate (%)"
-    else:
-        indicator = "PCPI_IX"
-        label = "Inflation (%)"
+    if type not in indicator_map:
+        return Response(content="Invalid chart type", media_type="text/plain", status_code=400)
 
-    url = f"https://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData/IFS/{iso_alpha_3}.{indicator}"
+    indicator_code, label = indicator_map[type]
+    url = f"https://www.imf.org/external/datamapper/api/v1/IFS/{iso_alpha_3}/{indicator_code}"
+
     try:
         r = requests.get(url, timeout=10)
         r.raise_for_status()
         data = r.json()
-        series = data['CompactData']['DataSet']['Series']
-        obs = series['Obs']
-        dates = [datetime.strptime(o['@TIME_PERIOD'], "%Y-%m") for o in obs]
-        values = [float(o['@OBS_VALUE']) for o in obs]
-        combined = [(d, v) for d, v in zip(dates, values) if d.year >= start_year]
-        dates, values = zip(*combined) if combined else ([], [])
+        series = data.get(iso_alpha_3, {}).get(indicator_code, {})
+        records = [(int(year), val) for year, val in series.items() if isinstance(val, (int, float))]
+        records.sort()
+        current_year = datetime.today().year
+        filtered = [(datetime(year, 1, 1), val) for year, val in records if year >= current_year - years]
+        if not filtered:
+            return Response(content="No data available", media_type="text/plain", status_code=404)
+        dates, values = zip(*filtered)
     except Exception as e:
-        print(f"/chart endpoint error: {e}")
-        return Response(content=f"Failed to fetch IMF {label} data", media_type="text/plain", status_code=500)
+        print(f"/chart error: {e}")
+        return Response(content="Failed to fetch chart data", media_type="text/plain", status_code=500)
 
     plt.figure(figsize=(10, 5))
     plt.plot(dates, values, marker='o', linewidth=2)
-    plt.title(f"{label} – {country} ({start_year}–{end_year})")
-    plt.xlabel("Date")
+    plt.title(f"{label} – {country} ({dates[0].year}–{dates[-1].year})")
+    plt.xlabel("Year")
     plt.ylabel(label)
     plt.grid(True)
     plt.tight_layout()
