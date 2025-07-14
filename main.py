@@ -159,3 +159,21 @@ def get_chart(country: str, type: str, years: int = 5):
     plt.close()
     img_bytes.seek(0)
     return Response(content=img_bytes.read(), media_type="image/png")
+
+from fastapi.responses import JSONResponse
+
+@app.get("/test-imf-series")
+def test_imf_series(country: str, indicator: str):
+    codes = resolve_country_codes(country)
+    if not codes:
+        return {"error": "Invalid country name"}
+    iso_alpha_3 = codes["iso_alpha_3"]
+    url = f"https://www.imf.org/external/datamapper/api/v1/IFS/{iso_alpha_3}/{indicator}"
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        series = data.get(iso_alpha_3, {}).get(indicator, {})
+        return JSONResponse(content=series)
+    except Exception as e:
+        return {"error": str(e)}
