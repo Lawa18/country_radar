@@ -105,46 +105,45 @@ def get_chart(country: str, type: str, years: int = 5):
     if not codes:
         return Response(content="Invalid country name", media_type="text/plain", status_code=400)
 
+    iso_alpha_2 = codes["iso_alpha_2"]
     iso_alpha_3 = codes["iso_alpha_3"]
+
     indicator_map = {
-        "inflation": ("PCPI_IX", "Inflation (%)"),
-        "fx_rate": ("ENDE_XDC_USD_RATE", "Exchange Rate (to USD)"),
-        "interest_rate": ("FIDSR", "Interest Rate (%)")
+        "fx_rate": ("ENDE_XDC_USD_RATE", "Exchange Rate (to USD)", "imf"),
+        "interest_rate": ("FIDSR", "Interest Rate (%)", "imf"),
+        "inflation": ("FP.CPI.TOTL.ZG", "Inflation (%)", "worldbank")
     }
 
     if type not in indicator_map:
         return Response(content="Invalid chart type", media_type="text/plain", status_code=400)
 
-    indicator_code, label = indicator_map[type]
-    url = f"https://www.imf.org/external/datamapper/api/v1/IFS/{iso_alpha_3}/{indicator_code}"
-
+    indicator_code, label, source = indicator_map[type]
     try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        series = data.get(iso_alpha_3, {}).get(indicator_code, {})
-
-        print(f"[DEBUG] Raw series keys for {country} {indicator_code}: {list(series.keys())[:5]}")
-
-        records = []
-        for year, val in series.items():
-            try:
-                yr = int(year)
-                v = float(val)
-                records.append((yr, v))
-            except:
-                continue
+        if source == "imf":
+            url = f"https://www.imf.org/external/datamapper/api/v1/IFS/{iso_alpha_3}/{indicator_code}"
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            series = data.get(iso_alpha_3, {}).get(indicator_code, {})
+            records = [(int(year), float(val)) for year, val in series.items() if isinstance(val, (int, float, str))]
+        else:
+            url = f"http://api.worldbank.org/v2/country/{iso_alpha_2}/indicator/{indicator_code}?format=json&per_page=1000"
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            raw = r.json()
+            entries = raw[1]
+            records = [(int(e["date"]), float(e["value"])) for e in entries if e["value"] is not None]
 
         records.sort()
         current_year = datetime.today().year
         filtered = [(datetime(year, 1, 1), val) for year, val in records if year >= current_year - years]
         if not filtered:
-            print(f"[DEBUG] No filtered data found for {label} in {country}")
+            print(f"[DEBUG] No data found for {label} in {country}")
             return Response(content="No data available", media_type="text/plain", status_code=404)
         dates, values = zip(*filtered)
     except Exception as e:
         print(f"/chart error: {e}")
-        return Response(content="Failed to fetch chart data", media_type="text/plain", status_code=500)
+        return Response(content=f"Failed to fetch chart data: {e}", media_type="text/plain", status_code=500)
 
     plt.figure(figsize=(10, 5))
     plt.plot(dates, values, marker='o', linewidth=2)
@@ -159,8 +158,6 @@ def get_chart(country: str, type: str, years: int = 5):
     plt.close()
     img_bytes.seek(0)
     return Response(content=img_bytes.read(), media_type="image/png")
-
-from fastapi.responses import JSONResponse
 
 @app.get("/test-imf-series")
 def test_imf_series(country: str, indicator: str):
