@@ -123,11 +123,23 @@ def get_chart(country: str, type: str, years: int = 5):
         r.raise_for_status()
         data = r.json()
         series = data.get(iso_alpha_3, {}).get(indicator_code, {})
-        records = [(int(year), val) for year, val in series.items() if isinstance(val, (int, float))]
+
+        print(f"[DEBUG] Raw series keys for {country} {indicator_code}: {list(series.keys())[:5]}")
+
+        records = []
+        for year, val in series.items():
+            try:
+                yr = int(year)
+                v = float(val)
+                records.append((yr, v))
+            except:
+                continue
+
         records.sort()
         current_year = datetime.today().year
         filtered = [(datetime(year, 1, 1), val) for year, val in records if year >= current_year - years]
         if not filtered:
+            print(f"[DEBUG] No filtered data found for {label} in {country}")
             return Response(content="No data available", media_type="text/plain", status_code=404)
         dates, values = zip(*filtered)
     except Exception as e:
