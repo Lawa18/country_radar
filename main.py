@@ -107,43 +107,54 @@ def get_chart(country: str, type: str, years: int = 5):
 
     iso_alpha_2 = codes["iso_alpha_2"]
     iso_alpha_3 = codes["iso_alpha_3"]
+    end_year = datetime.today().year
+    start_year = end_year - years
 
     indicator_map = {
-        "fx_rate": ("ENDE_XDC_USD_RATE", "Exchange Rate (to USD)", "imf"),
-        "interest_rate": ("FIDSR", "Interest Rate (%)", "imf"),
-        "inflation": ("FP.CPI.TOTL.ZG", "Inflation (%)", "worldbank")
+        "inflation": ("PCPI_IX", "Inflation (%)", "FP.CPI.TOTL.ZG"),
+        "fx_rate": ("ENDE_XDC_USD_RATE", "Exchange Rate (to USD)", "PA.NUS.FCRF"),
+        "interest_rate": ("FIDSR", "Interest Rate (%)", "FR.INR.RINR")
     }
 
     if type not in indicator_map:
         return Response(content="Invalid chart type", media_type="text/plain", status_code=400)
 
-    indicator_code, label, source = indicator_map[type]
+    imf_code, label, wb_code = indicator_map[type]
+
+    # === Step 1: Try IMF Data ===
+    url_imf = f"https://www.imf.org/external/datamapper/api/v1/IFS/{iso_alpha_3}/{imf_code}"
     try:
-        if source == "imf":
-            url = f"https://www.imf.org/external/datamapper/api/v1/IFS/{iso_alpha_3}/{indicator_code}"
-            r = requests.get(url, timeout=10)
-            r.raise_for_status()
-            data = r.json()
-            series = data.get(iso_alpha_3, {}).get(indicator_code, {})
-            records = [(int(year), float(val)) for year, val in series.items() if isinstance(val, (int, float, str))]
-        else:
-            url = f"http://api.worldbank.org/v2/country/{iso_alpha_2}/indicator/{indicator_code}?format=json&per_page=1000"
-            r = requests.get(url, timeout=10)
+        r = requests.get(url_imf, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        series = data.get(iso_alpha_3, {}).get(imf_code, {})
+        records = [(int(year), val) for year, val in series.items() if isinstance(val, (int, float))]
+    except Exception as e:
+        print(f"[IMF fallback] error for {label}: {e}")
+        records = []
+
+    # === Step 2: Fallback to World Bank if no data ===
+    if not records:
+        print(f"[INFO] No IMF data found for {type}, trying World Bank.")
+        url_wb = f"http://api.worldbank.org/v2/country/{iso_alpha_2}/indicator/{wb_code}?format=json&per_page=1000"
+        try:
+            r = requests.get(url_wb, timeout=10)
             r.raise_for_status()
             raw = r.json()
             entries = raw[1]
-            records = [(int(e["date"]), float(e["value"])) for e in entries if e["value"] is not None]
+            entries = [e for e in entries if e["value"] is not None and int(e["date"]) >= start_year]
+            records = [(int(e["date"]), float(e["value"])) for e in entries]
+        except Exception as e:
+            print(f"[WB fallback] error for {label}: {e}")
+            records = []
 
-        records.sort()
-        current_year = datetime.today().year
-        filtered = [(datetime(year, 1, 1), val) for year, val in records if year >= current_year - years]
-        if not filtered:
-            print(f"[DEBUG] No data found for {label} in {country}")
-            return Response(content="No data available", media_type="text/plain", status_code=404)
-        dates, values = zip(*filtered)
-    except Exception as e:
-        print(f"/chart error: {e}")
-        return Response(content=f"Failed to fetch chart data: {e}", media_type="text/plain", status_code=500)
+    if not records:
+        print(f"[DEBUG] No data found for {label} in {country}")
+        return Response(content="No data available", media_type="text/plain", status_code=404)
+
+    records.sort()
+    filtered = [(datetime(year, 1, 1), val) for year, val in records if year >= start_year]
+    dates, values = zip(*filtered) if filtered else ([], [])
 
     plt.figure(figsize=(10, 5))
     plt.plot(dates, values, marker='o', linewidth=2)
