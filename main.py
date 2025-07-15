@@ -85,8 +85,39 @@ def get_country_data(country: str = Query(..., description="Full country name, e
         iso_alpha_2 = codes["iso_alpha_2"]
         iso_alpha_3 = codes["iso_alpha_3"]
 
+        # --- Step 1: Try IMF ---
         imf_data = fetch_imf_datamapper(iso_alpha_3)
+
+        # --- Step 2: Fetch World Bank once ---
         wb_data = fetch_worldbank_data(iso_alpha_2)
+
+        # --- Step 3: Fallback logic ---
+        wb_fallbacks = {
+            "CPI": "FP.CPI.TOTL.ZG",
+            "FX Rate": "PA.NUS.FCRF",
+            "Interest Rate": "FR.INR.RINR",
+            "Reserves (USD)": "FI.RES.TOTL.CD"
+        }
+
+        for label, wb_code in wb_fallbacks.items():
+            imf_value = imf_data.get(label, {})
+            if not isinstance(imf_value, dict) or not any(isinstance(v, (float, int)) for v in imf_value.values()):
+                print(f"[INFO] Using World Bank fallback for {label}")
+                try:
+                    raw = wb_data.get(label) or wb_data.get(wb_code)
+                    if isinstance(raw, list) and len(raw) > 1:
+                        entries = raw[1]
+                        entries = [e for e in entries if e["value"] is not None]
+                        if entries:
+                            latest = max(entries, key=lambda x: x["date"])
+                            imf_data[label] = {
+                                "value": latest["value"],
+                                "date": latest["date"],
+                                "source": "World Bank"
+                            }
+                except Exception as e:
+                    print(f"[WB fallback error] for {label}: {e}")
+                    imf_data[label] = {"error": "Fallback failed"}
 
         return {
             "country": country,
@@ -94,6 +125,7 @@ def get_country_data(country: str = Query(..., description="Full country name, e
             "imf_data": imf_data,
             "world_bank_data": wb_data
         }
+
     except Exception as e:
         print(f"/country-data endpoint error: {e}")
         return {"error": f"Server error: {str(e)}"}
