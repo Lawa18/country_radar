@@ -85,45 +85,67 @@ def get_country_data(country: str = Query(..., description="Full country name, e
         iso_alpha_2 = codes["iso_alpha_2"]
         iso_alpha_3 = codes["iso_alpha_3"]
 
-        # --- Step 1: Try IMF ---
-        imf_data = fetch_imf_datamapper(iso_alpha_3)
+        # --- Step 1: IMF fetch ---
+        raw_imf = fetch_imf_datamapper(iso_alpha_3)
 
-        # --- Step 2: Fetch World Bank once ---
-        wb_data = fetch_worldbank_data(iso_alpha_2)
+        # --- Step 2: World Bank fetch ---
+        raw_wb = fetch_worldbank_data(iso_alpha_2)
 
-        # --- Step 3: Fallback logic ---
-        wb_fallbacks = {
-            "CPI": "FP.CPI.TOTL.ZG",
-            "FX Rate": "PA.NUS.FCRF",
-            "Interest Rate": "FR.INR.RINR",
-            "Reserves (USD)": "FI.RES.TOTL.CD"
+        # --- Step 3: Normalize values ---
+        def extract_latest_numeric_entry(entry_dict):
+            try:
+                pairs = [(int(year), float(val)) for year, val in entry_dict.items() if isinstance(val, (float, int, str)) and str(val).replace('.', '', 1).isdigit()]
+                if not pairs:
+                    return None
+                latest = max(pairs, key=lambda x: x[0])
+                return {
+                    "value": latest[1],
+                    "date": str(latest[0]),
+                    "source": "IMF"
+                }
+            except Exception:
+                return None
+
+        def extract_wb_entry(entries):
+            try:
+                if isinstance(entries, list) and len(entries) > 1:
+                    valid = [e for e in entries[1] if e.get("value") is not None]
+                    if not valid:
+                        return None
+                    latest = max(valid, key=lambda x: x["date"])
+                    return {
+                        "value": latest["value"],
+                        "date": latest["date"],
+                        "source": "World Bank"
+                    }
+            except Exception:
+                return None
+
+        indicators = {
+            "CPI": ("FP.CPI.TOTL.ZG", "PCPI_IX"),
+            "FX Rate": ("PA.NUS.FCRF", "ENDE_XDC_USD_RATE"),
+            "Interest Rate": ("FR.INR.RINR", "FIDSR"),
+            "Reserves (USD)": ("FI.RES.TOTL.CD", "TRESEGUSD"),
         }
 
-        for label, wb_code in wb_fallbacks.items():
-            imf_value = imf_data.get(label, {})
-            if not isinstance(imf_value, dict) or not any(isinstance(v, (float, int)) for v in imf_value.values()):
-                print(f"[INFO] Using World Bank fallback for {label}")
-                try:
-                    raw = wb_data.get(label) or wb_data.get(wb_code)
-                    if isinstance(raw, list) and len(raw) > 1:
-                        entries = raw[1]
-                        entries = [e for e in entries if e["value"] is not None]
-                        if entries:
-                            latest = max(entries, key=lambda x: x["date"])
-                            imf_data[label] = {
-                                "value": latest["value"],
-                                "date": latest["date"],
-                                "source": "World Bank"
-                            }
-                except Exception as e:
-                    print(f"[WB fallback error] for {label}: {e}")
-                    imf_data[label] = {"error": "Fallback failed"}
+        imf_data = {}
+
+        for label, (wb_code, imf_code) in indicators.items():
+            imf_entry = extract_latest_numeric_entry(raw_imf.get(label, {}))
+            if imf_entry:
+                imf_data[label] = imf_entry
+            else:
+                wb_entry = extract_wb_entry(raw_wb.get(label) or raw_wb.get(wb_code))
+                if wb_entry:
+                    imf_data[label] = wb_entry
+                else:
+                    imf_data[label] = {"value": None, "date": None, "source": None}
 
         return {
             "country": country,
             "iso_codes": codes,
             "imf_data": imf_data,
-            "world_bank_data": wb_data
+            "world_bank_data": raw_wb  # optional for full trace
         }
 
     except Exception as e:
