@@ -154,89 +154,74 @@ def get_country_data(country: str = Query(..., description="Full country name, e
 
 @app.get("/chart")
 @app.head("/chart")
-def get_chart(
-    country: str,
-    type: str,
-    years: int = 5,
-    format: str = Query(default="png", description="png or json")
-):
+def get_chart(country: str, type: str, years: int = 5):
     codes = resolve_country_codes(country)
     if not codes:
         return Response(content="Invalid country name", media_type="text/plain", status_code=400)
 
-    iso_alpha_3 = codes["iso_alpha_3"]
+    iso_alpha_2 = codes["iso_alpha_2"]  # e.g. "MX" for Mexico
+    end_year = datetime.today().year
+    start_year = end_year - years
 
+    # Mapping for IMF SDMX monthly indicators
     indicator_map = {
-        "inflation": [("PCPIPCH", "Inflation (%)")],
-        "fx_rate": [("ENDE_XDC_USD_RATE", "Exchange Rate (to USD)")],
-        "interest_rate": [("FIDSR", "Interest Rate (%)")]
+        "inflation": ("PCPIPCH", "Inflation (%)"),
+        "fx_rate": ("ENDA_XDC_USD_RATE", "Exchange Rate (to USD)"),
+        "interest_rate": ("FIMM_PA", "Interest Rate (%)")
     }
 
     if type not in indicator_map:
         return Response(content="Invalid chart type", media_type="text/plain", status_code=400)
 
-    for indicator_code, label in indicator_map[type]:
-        url = f"https://www.imf.org/external/datamapper/api/v1/IFS/{iso_alpha_3}/{indicator_code}"
+    indicator_code, label = indicator_map[type]
+    sdmx_url = f"http://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData/IFS/M.{iso_alpha_2}.{indicator_code}"
 
-        try:
-            r = requests.get(url, timeout=10)
-            r.raise_for_status()
-            data = r.json()
-            series = (
-                data.get("values", {})
-                .get(indicator_code, {})
-                .get(iso_alpha_3, {})
-            )
+    try:
+        r = requests.get(sdmx_url, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        series = data.get("CompactData", {}).get("DataSet", {}).get("Series", {})
+        obs = series.get("Obs", [])
 
-            print(f"[DEBUG] Fetched {indicator_code} for {country}: {list(series.items())[:3]}")
+        print(f"[DEBUG] {country} {indicator_code} entries found: {len(obs)}")
 
-            records = []
-            for year_str, val in series.items():
-                try:
-                    year = int(year_str)
-                    value = float(val)
-                    records.append((year, value))
-                except:
-                    continue
-
-            records.sort()
-            current_year = datetime.today().year
-            filtered = [(datetime(y, 1, 1), v) for y, v in records if y >= current_year - years]
-            if not filtered:
-                print(f"[DEBUG] No data found for {label} in {country}")
+        # Parse the observation list
+        records = []
+        for entry in obs:
+            try:
+                date_str = entry["@TIME_PERIOD"]
+                value = float(entry["@OBS_VALUE"])
+                date = datetime.strptime(date_str, "%Y-%m")
+                if date.year >= start_year:
+                    records.append((date, value))
+            except Exception as e:
                 continue
 
-            dates, values = zip(*filtered)
+        if not records:
+            return Response(content="No data available", media_type="text/plain", status_code=404)
 
-            if format == "json":
-                return {
-                    "label": label,
-                    "country": country,
-                    "start_year": dates[0].year,
-                    "end_year": dates[-1].year,
-                    "source": "IMF DataMapper",
-                    "series": [{"year": d.year, "value": v} for d, v in zip(dates, values)]
-                }
+        # Sort and unzip
+        records.sort()
+        dates, values = zip(*records)
 
-            plt.figure(figsize=(10, 5))
-            plt.plot(dates, values, marker='o', linewidth=2)
-            plt.title(f"{label} – {country} ({dates[0].year}–{dates[-1].year})")
-            plt.xlabel("Year")
-            plt.ylabel(label)
-            plt.grid(True)
-            plt.tight_layout()
+    except Exception as e:
+        print(f"/chart error for {country} {indicator_code}: {e}")
+        return Response(content="Failed to fetch chart data", media_type="text/plain", status_code=500)
 
-            img_bytes = io.BytesIO()
-            plt.savefig(img_bytes, format="png")
-            plt.close()
-            img_bytes.seek(0)
-            return Response(content=img_bytes.read(), media_type="image/png")
+    # Plot the chart
+    plt.figure(figsize=(10, 5))
+    plt.plot(dates, values, marker='o', linewidth=2)
+    plt.title(f"{label} – {country} ({dates[0].year}–{dates[-1].year})")
+    plt.xlabel("Date")
+    plt.ylabel(label)
+    plt.grid(True)
+    plt.tight_layout()
 
-        except Exception as e:
-            print(f"[DEBUG] Failed fetching {indicator_code} for {country}: {e}")
-            continue
-
-    return Response(content="No data available", media_type="text/plain", status_code=404)
+    img_bytes = io.BytesIO()
+    plt.savefig(img_bytes, format="png")
+    plt.close()
+    img_bytes.seek(0)
+    return Response(content=img_bytes.read(), media_type="image/png")
 
 @app.get("/test-imf-series")
 def test_imf_series(country: str, indicator: str):
