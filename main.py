@@ -167,7 +167,7 @@ def get_chart(
     iso_alpha_3 = codes["iso_alpha_3"]
 
     indicator_map = {
-        "inflation": [("PCPI_IX", "Inflation Index"), ("PCPIPCH", "Inflation (%)")],
+        "inflation": [("PCPIPCH", "Inflation (%)")],
         "fx_rate": [("ENDE_XDC_USD_RATE", "Exchange Rate (to USD)")],
         "interest_rate": [("FIDSR", "Interest Rate (%)")]
     }
@@ -203,6 +203,7 @@ def get_chart(
             current_year = datetime.today().year
             filtered = [(datetime(y, 1, 1), v) for y, v in records if y >= current_year - years]
             if not filtered:
+                print(f"[DEBUG] No data found for {label} in {country}")
                 continue
 
             dates, values = zip(*filtered)
