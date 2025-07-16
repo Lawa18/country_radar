@@ -166,7 +166,6 @@ def get_chart(
 
     iso_alpha_3 = codes["iso_alpha_3"]
 
-    # Fallback options
     indicator_map = {
         "inflation": [("PCPI_IX", "Inflation Index"), ("PCPIPCH", "Inflation (%)")],
         "fx_rate": [("ENDE_XDC_USD_RATE", "Exchange Rate (to USD)")],
@@ -176,7 +175,6 @@ def get_chart(
     if type not in indicator_map:
         return Response(content="Invalid chart type", media_type="text/plain", status_code=400)
 
-    # Try indicators in fallback order
     for indicator_code, label in indicator_map[type]:
         url = f"https://www.imf.org/external/datamapper/api/v1/IFS/{iso_alpha_3}/{indicator_code}"
 
@@ -184,22 +182,29 @@ def get_chart(
             r = requests.get(url, timeout=10)
             r.raise_for_status()
             data = r.json()
-            series = data.get(iso_alpha_3, {}).get(indicator_code, {})
-            print(f"[DEBUG] Trying {indicator_code}, got keys: {list(series.keys())[:5]}")
+            series = (
+                data.get("values", {})
+                .get(indicator_code, {})
+                .get(iso_alpha_3, {})
+            )
+
+            print(f"[DEBUG] Fetched {indicator_code} for {country}: {list(series.items())[:3]}")
+
             records = []
-            for year, val in series.items():
+            for year_str, val in series.items():
                 try:
-                    yr = int(year)
-                    v = float(val)
-                    records.append((yr, v))
+                    year = int(year_str)
+                    value = float(val)
+                    records.append((year, value))
                 except:
                     continue
 
             records.sort()
             current_year = datetime.today().year
-            filtered = [(datetime(year, 1, 1), val) for year, val in records if year >= current_year - years]
+            filtered = [(datetime(y, 1, 1), v) for y, v in records if y >= current_year - years]
             if not filtered:
-                continue  # Try next fallback
+                continue
+
             dates, values = zip(*filtered)
 
             if format == "json":
@@ -208,11 +213,10 @@ def get_chart(
                     "country": country,
                     "start_year": dates[0].year,
                     "end_year": dates[-1].year,
-                    "source": "IMF",
+                    "source": "IMF DataMapper",
                     "series": [{"year": d.year, "value": v} for d, v in zip(dates, values)]
                 }
 
-            # fallback to PNG
             plt.figure(figsize=(10, 5))
             plt.plot(dates, values, marker='o', linewidth=2)
             plt.title(f"{label} – {country} ({dates[0].year}–{dates[-1].year})")
@@ -228,7 +232,7 @@ def get_chart(
             return Response(content=img_bytes.read(), media_type="image/png")
 
         except Exception as e:
-            print(f"[DEBUG] Failed {indicator_code}: {e}")
+            print(f"[DEBUG] Failed fetching {indicator_code} for {country}: {e}")
             continue
 
     return Response(content="No data available", media_type="text/plain", status_code=404)
