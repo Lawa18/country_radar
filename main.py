@@ -39,26 +39,44 @@ WB_INDICATORS = {
     "Current Account Balance (% of GDP)": "BN.CAB.XOKA.GD.ZS"
 }
 
-def fetch_imf_datamapper(iso_alpha_3: str) -> Dict[str, Any]:
-    indicators = ["PCPI_IX", "ENDE_XDC_USD_RATE", "FIDSR", "TRESEGUSD"]
-    base_url = "https://www.imf.org/external/datamapper/api/v1/IFS"
-    result = {}
-    for code in indicators:
-        url = f"{base_url}/{iso_alpha_3}/{code}"
+def fetch_imf_sdmx_series(iso_alpha_2: str) -> Dict[str, Any]:
+    indicator_map = {
+        "Inflation (%)": "PCPIPCH",
+        "Exchange Rate (to USD)": "ENDA_XDC_USD_RATE",
+        "Interest Rate (%)": "FIMM_PA"
+    }
+
+    base_url = "http://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData/IFS"
+    results = {}
+
+    for label, code in indicator_map.items():
+        url = f"{base_url}/M.{iso_alpha_2}.{code}"
         try:
-            r = requests.get(url, timeout=10)
+            r = requests.get(url, timeout=15)
             r.raise_for_status()
             data = r.json()
-            result[code] = data.get(iso_alpha_3, {}).get(code, {})
+            series = data.get("CompactData", {}).get("DataSet", {}).get("Series", {})
+            obs = series.get("Obs", [])
+
+            # Extract latest value (most recent by date)
+            parsed = []
+            for entry in obs:
+                try:
+                    date = entry["@TIME_PERIOD"]
+                    value = float(entry["@OBS_VALUE"])
+                    parsed.append((date, value))
+                except:
+                    continue
+
+            parsed.sort(reverse=True)
+            latest = parsed[0] if parsed else ("N/A", "N/A")
+            results[label] = {"date": latest[0], "value": latest[1]}
+
         except Exception as e:
-            print(f"IMF DataMapper fetch error for {code}: {e}")
-            result[code] = {"error": str(e)}
-    return {
-        "CPI": result.get("PCPI_IX", {}),
-        "FX Rate": result.get("ENDE_XDC_USD_RATE", {}),
-        "Interest Rate": result.get("FIDSR", {}),
-        "Reserves (USD)": result.get("TRESEGUSD", {})
-    }
+            print(f"[IMF SDMX ERROR] {label}: {e}")
+            results[label] = {"error": str(e)}
+
+    return results
 
 def fetch_worldbank_data(iso_alpha_2: str) -> Dict[str, Any]:
     base_url = "http://api.worldbank.org/v2/country"
