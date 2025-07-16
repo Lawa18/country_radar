@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Query, Response
+from fastapi.responses import JSONResponse
 from typing import Dict, Any
 import requests
 import pycountry
@@ -58,7 +59,6 @@ def fetch_imf_sdmx_series(iso_alpha_2: str) -> Dict[str, Any]:
             series = data.get("CompactData", {}).get("DataSet", {}).get("Series", {})
             obs = series.get("Obs", [])
 
-            # Extract latest value (most recent by date)
             parsed = []
             for entry in obs:
                 try:
@@ -103,13 +103,9 @@ def get_country_data(country: str = Query(..., description="Full country name, e
         iso_alpha_2 = codes["iso_alpha_2"]
         iso_alpha_3 = codes["iso_alpha_3"]
 
-        # --- Step 1: IMF fetch ---
-        raw_imf = fetch_imf_datamapper(iso_alpha_3)
-
-        # --- Step 2: World Bank fetch ---
+        raw_imf = fetch_imf_sdmx_series(iso_alpha_2)
         raw_wb = fetch_worldbank_data(iso_alpha_2)
 
-        # --- Step 3: Normalize values ---
         def extract_latest_numeric_entry(entry_dict):
             try:
                 pairs = [(int(year), float(val)) for year, val in entry_dict.items() if isinstance(val, (float, int, str)) and str(val).replace('.', '', 1).isdigit()]
@@ -163,7 +159,7 @@ def get_country_data(country: str = Query(..., description="Full country name, e
             "country": country,
             "iso_codes": codes,
             "imf_data": imf_data,
-            "world_bank_data": raw_wb  # optional for full trace
+            "world_bank_data": raw_wb
         }
 
     except Exception as e:
@@ -177,11 +173,10 @@ def get_chart(country: str, type: str, years: int = 5):
     if not codes:
         return Response(content="Invalid country name", media_type="text/plain", status_code=400)
 
-    iso_alpha_2 = codes["iso_alpha_2"]  # e.g. "MX" for Mexico
+    iso_alpha_2 = codes["iso_alpha_2"]
     end_year = datetime.today().year
     start_year = end_year - years
 
-    # Mapping for IMF SDMX monthly indicators
     indicator_map = {
         "inflation": ("PCPIPCH", "Inflation (%)"),
         "fx_rate": ("ENDA_XDC_USD_RATE", "Exchange Rate (to USD)"),
@@ -203,7 +198,6 @@ def get_chart(country: str, type: str, years: int = 5):
 
         print(f"[DEBUG] {country} {indicator_code} entries found: {len(obs)}")
 
-        # Parse the observation list
         records = []
         for entry in obs:
             try:
@@ -218,7 +212,6 @@ def get_chart(country: str, type: str, years: int = 5):
         if not records:
             return Response(content="No data available", media_type="text/plain", status_code=404)
 
-        # Sort and unzip
         records.sort()
         dates, values = zip(*records)
 
@@ -226,7 +219,6 @@ def get_chart(country: str, type: str, years: int = 5):
         print(f"/chart error for {country} {indicator_code}: {e}")
         return Response(content="Failed to fetch chart data", media_type="text/plain", status_code=500)
 
-    # Plot the chart
     plt.figure(figsize=(10, 5))
     plt.plot(dates, values, marker='o', linewidth=2)
     plt.title(f"{label} – {country} ({dates[0].year}–{dates[-1].year})")
