@@ -165,71 +165,73 @@ def get_chart(
         return Response(content="Invalid country name", media_type="text/plain", status_code=400)
 
     iso_alpha_3 = codes["iso_alpha_3"]
+
+    # Fallback options
     indicator_map = {
-        "inflation": ("PCPI_IX", "Inflation (%)"),
-        "fx_rate": ("ENDE_XDC_USD_RATE", "Exchange Rate (to USD)"),
-        "interest_rate": ("FIDSR", "Interest Rate (%)")
+        "inflation": [("PCPI_IX", "Inflation Index"), ("PCPIPCH", "Inflation (%)")],
+        "fx_rate": [("ENDE_XDC_USD_RATE", "Exchange Rate (to USD)")],
+        "interest_rate": [("FIDSR", "Interest Rate (%)")]
     }
 
     if type not in indicator_map:
         return Response(content="Invalid chart type", media_type="text/plain", status_code=400)
 
-    indicator_code, label = indicator_map[type]
-    url = f"https://www.imf.org/external/datamapper/api/v1/IFS/{iso_alpha_3}/{indicator_code}"
+    # Try indicators in fallback order
+    for indicator_code, label in indicator_map[type]:
+        url = f"https://www.imf.org/external/datamapper/api/v1/IFS/{iso_alpha_3}/{indicator_code}"
 
-    try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        series = data.get(iso_alpha_3, {}).get(indicator_code, {})
+        try:
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            series = data.get(iso_alpha_3, {}).get(indicator_code, {})
+            print(f"[DEBUG] Trying {indicator_code}, got keys: {list(series.keys())[:5]}")
+            records = []
+            for year, val in series.items():
+                try:
+                    yr = int(year)
+                    v = float(val)
+                    records.append((yr, v))
+                except:
+                    continue
 
-        records = []
-        for year, val in series.items():
-            try:
-                yr = int(year)
-                v = float(val)
-                records.append((yr, v))
-            except:
-                continue
+            records.sort()
+            current_year = datetime.today().year
+            filtered = [(datetime(year, 1, 1), val) for year, val in records if year >= current_year - years]
+            if not filtered:
+                continue  # Try next fallback
+            dates, values = zip(*filtered)
 
-        records.sort()
-        current_year = datetime.today().year
-        filtered = [(year, val) for year, val in records if year >= current_year - years]
-        if not filtered:
-            print(f"[DEBUG] No data found for {label} in {country}")
-            return Response(content="No data available", media_type="text/plain", status_code=404)
+            if format == "json":
+                return {
+                    "label": label,
+                    "country": country,
+                    "start_year": dates[0].year,
+                    "end_year": dates[-1].year,
+                    "source": "IMF",
+                    "series": [{"year": d.year, "value": v} for d, v in zip(dates, values)]
+                }
 
-        if format == "json":
-            return {
-                "label": label,
-                "country": country,
-                "start_year": filtered[0][0],
-                "end_year": filtered[-1][0],
-                "source": "IMF",
-                "series": [{"year": y, "value": v} for y, v in filtered]
-            }
+            # fallback to PNG
+            plt.figure(figsize=(10, 5))
+            plt.plot(dates, values, marker='o', linewidth=2)
+            plt.title(f"{label} – {country} ({dates[0].year}–{dates[-1].year})")
+            plt.xlabel("Year")
+            plt.ylabel(label)
+            plt.grid(True)
+            plt.tight_layout()
 
-        # fallback to PNG chart
-        dates = [datetime(y, 1, 1) for y, _ in filtered]
-        values = [v for _, v in filtered]
+            img_bytes = io.BytesIO()
+            plt.savefig(img_bytes, format="png")
+            plt.close()
+            img_bytes.seek(0)
+            return Response(content=img_bytes.read(), media_type="image/png")
 
-        plt.figure(figsize=(10, 5))
-        plt.plot(dates, values, marker='o', linewidth=2)
-        plt.title(f"{label} – {country} ({filtered[0][0]}–{filtered[-1][0]})")
-        plt.xlabel("Year")
-        plt.ylabel(label)
-        plt.grid(True)
-        plt.tight_layout()
+        except Exception as e:
+            print(f"[DEBUG] Failed {indicator_code}: {e}")
+            continue
 
-        img_bytes = io.BytesIO()
-        plt.savefig(img_bytes, format="png")
-        plt.close()
-        img_bytes.seek(0)
-        return Response(content=img_bytes.read(), media_type="image/png")
-
-    except Exception as e:
-        print(f"/chart error: {e}")
-        return Response(content="Failed to fetch chart data", media_type="text/plain", status_code=500)
+    return Response(content="No data available", media_type="text/plain", status_code=404)
 
 @app.get("/test-imf-series")
 def test_imf_series(country: str, indicator: str):
