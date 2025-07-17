@@ -177,47 +177,53 @@ def get_chart(country: str, type: str, years: int = 5):
     end_year = datetime.today().year
     start_year = end_year - years
 
+    # Fallback indicator logic
     indicator_map = {
-        "inflation": ("PCPIPCH", "Inflation (%)"),
-        "fx_rate": ("ENDA_XDC_USD_RATE", "Exchange Rate (to USD)"),
-        "interest_rate": ("FIMM_PA", "Interest Rate (%)")
+        "inflation": [("PCPIPCH", "Inflation (%)"), ("PCPIEPCH", "Inflation (Alt)")],
+        "fx_rate": [("ENDA_XDC_USD_RATE", "Exchange Rate (to USD)")],
+        "interest_rate": [("FIMM_PA", "Interest Rate (%)"), ("FIDSR", "Interest Rate (Alt)")]
     }
 
     if type not in indicator_map:
         return Response(content="Invalid chart type", media_type="text/plain", status_code=400)
 
-    indicator_code, label = indicator_map[type]
-    sdmx_url = f"http://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData/IFS/M.{iso_alpha_2}.{indicator_code}"
+    fallback_list = indicator_map[type]
 
-    try:
-        r = requests.get(sdmx_url, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        series = data.get("CompactData", {}).get("DataSet", {}).get("Series", {})
-        obs = series.get("Obs", [])
+    for indicator_code, label in fallback_list:
+        sdmx_url = f"http://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData/IFS/M.{iso_alpha_2}.{indicator_code}"
 
-        print(f"[DEBUG] {country} {indicator_code} entries found: {len(obs)}")
+        try:
+            r = requests.get(sdmx_url, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            series = data.get("CompactData", {}).get("DataSet", {}).get("Series", {})
+            obs = series.get("Obs", [])
 
-        records = []
-        for entry in obs:
-            try:
-                date_str = entry["@TIME_PERIOD"]
-                value = float(entry["@OBS_VALUE"])
-                date = datetime.strptime(date_str, "%Y-%m")
-                if date.year >= start_year:
-                    records.append((date, value))
-            except Exception as e:
-                continue
+            print(f"[DEBUG] {country} {indicator_code} entries found: {len(obs)}")
 
-        if not records:
-            return Response(content="No data available", media_type="text/plain", status_code=404)
+            records = []
+            for entry in obs:
+                try:
+                    date_str = entry["@TIME_PERIOD"]
+                    value = float(entry["@OBS_VALUE"])
+                    date = datetime.strptime(date_str, "%Y-%m")
+                    if date.year >= start_year:
+                        records.append((date, value))
+                except:
+                    continue
 
-        records.sort()
-        dates, values = zip(*records)
+            if records:
+                break  # Stop at first indicator with data
 
-    except Exception as e:
-        print(f"/chart error for {country} {indicator_code}: {e}")
-        return Response(content="Failed to fetch chart data", media_type="text/plain", status_code=500)
+        except Exception as e:
+            print(f"/chart error for {country} {indicator_code}: {e}")
+            continue
+
+    if not records:
+        return Response(content="No data available", media_type="text/plain", status_code=404)
+
+    records.sort()
+    dates, values = zip(*records)
 
     plt.figure(figsize=(10, 5))
     plt.plot(dates, values, marker='o', linewidth=2)
