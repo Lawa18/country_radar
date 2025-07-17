@@ -40,11 +40,11 @@ WB_INDICATORS = {
     "Current Account Balance (% of GDP)": "BN.CAB.XOKA.GD.ZS"
 }
 
-def fetch_imf_sdmx_series(iso_alpha_2: str) -> Dict[str, Any]:
+def fetch_imf_sdmx_series(iso_alpha_2: str) -> Dict[str, Dict[str, float]]:
     indicator_map = {
-        "Inflation (%)": "PCPIPCH",
-        "Exchange Rate (to USD)": "ENDA_XDC_USD_RATE",
-        "Interest Rate (%)": "FIMM_PA"
+        "CPI": "PCPIPCH",
+        "FX Rate": "ENDA_XDC_USD_RATE",
+        "Interest Rate": "FIMM_PA"
     }
 
     base_url = "http://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData/IFS"
@@ -59,22 +59,21 @@ def fetch_imf_sdmx_series(iso_alpha_2: str) -> Dict[str, Any]:
             series = data.get("CompactData", {}).get("DataSet", {}).get("Series", {})
             obs = series.get("Obs", [])
 
-            parsed = []
+            parsed = {}
             for entry in obs:
                 try:
                     date = entry["@TIME_PERIOD"]
                     value = float(entry["@OBS_VALUE"])
-                    parsed.append((date, value))
+                    year = date.split("-")[0]
+                    parsed[year] = value
                 except:
                     continue
 
-            parsed.sort(reverse=True)
-            latest = parsed[0] if parsed else ("N/A", "N/A")
-            results[label] = {"date": latest[0], "value": latest[1]}
+            results[label] = parsed
 
         except Exception as e:
             print(f"[IMF SDMX ERROR] {label}: {e}")
-            results[label] = {"error": str(e)}
+            results[label] = {}
 
     return results
 
