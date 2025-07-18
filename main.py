@@ -134,25 +134,45 @@ def get_country_data(country: str = Query(..., description="Full country name, e
             except Exception:
                 return None
 
-        indicators = {
-            "CPI": ("FP.CPI.TOTL.ZG", "PCPI_IX"),
-            "FX Rate": ("PA.NUS.FCRF", "ENDE_XDC_USD_RATE"),
-            "Interest Rate": ("FR.INR.RINR", "FIDSR"),
-            "Reserves (USD)": ("FI.RES.TOTL.CD", "TRESEGUSD"),
-        }
-
         imf_data = {}
 
-        for label, (wb_code, imf_code) in indicators.items():
-            imf_entry = extract_latest_numeric_entry(raw_imf.get(label, {}))
-            if imf_entry:
-                imf_data[label] = imf_entry
-            else:
-                wb_entry = extract_wb_entry(raw_wb.get(label) or raw_wb.get(wb_code))
-                if wb_entry:
-                    imf_data[label] = wb_entry
-                else:
-                    imf_data[label] = {"value": None, "date": None, "source": None}
+        # 1. CPI
+        cpi_entry = extract_latest_numeric_entry(raw_imf.get("CPI", {}))
+        if cpi_entry:
+            imf_data["CPI"] = cpi_entry
+        else:
+            wb_entry = extract_wb_entry(raw_wb.get("Inflation (%)"))
+            imf_data["CPI"] = wb_entry or {"value": None, "date": None, "source": None}
+
+        # 2. FX Rate
+        fx_entry = extract_latest_numeric_entry(raw_imf.get("FX Rate", {}))
+        if fx_entry:
+            imf_data["FX Rate"] = fx_entry
+        else:
+            wb_entry = extract_wb_entry(raw_wb.get("PA.NUS.FCRF"))
+            imf_data["FX Rate"] = wb_entry or {"value": None, "date": None, "source": None}
+
+        # 3. Interest Rate with fallback list
+        interest_fallbacks = ["Interest Rate", "FIDSR", "FILR_PA"]
+        interest_found = None
+        for label in interest_fallbacks:
+            ir_entry = extract_latest_numeric_entry(raw_imf.get(label, {}))
+            if ir_entry:
+                interest_found = ir_entry
+                break
+        if interest_found:
+            imf_data["Interest Rate"] = interest_found
+        else:
+            wb_entry = extract_wb_entry(raw_wb.get("FR.INR.RINR"))
+            imf_data["Interest Rate"] = wb_entry or {"value": None, "date": None, "source": None}
+
+        # 4. Reserves
+        reserves_entry = extract_latest_numeric_entry(raw_imf.get("Reserves (USD)", {}))
+        if reserves_entry:
+            imf_data["Reserves (USD)"] = reserves_entry
+        else:
+            wb_entry = extract_wb_entry(raw_wb.get("FI.RES.TOTL.CD"))
+            imf_data["Reserves (USD)"] = wb_entry or {"value": None, "date": None, "source": None}
 
         return {
             "country": country,
