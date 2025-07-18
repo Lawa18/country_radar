@@ -40,6 +40,48 @@ WB_INDICATORS = {
     "Current Account Balance (% of GDP)": "BN.CAB.XOKA.GD.ZS"
 }
 
+INTEREST_RATE_CODES = {
+    "FIMM_PA": "Money Market Rate",
+    "FIDSR": "Discount Rate",
+    "FILR_PA": "Lending Rate",
+    "FIRR_PA": "Deposit Rate",
+    "FINT_PA": "Treasury Bill Rate",
+    "FISN_PA": "Interbank Rate"
+}
+
+def get_interest_rate(country_code):
+    """
+    Attempts to fetch the latest interest rate for a given country using multiple IMF series.
+    Tries each code until one returns valid data.
+
+    Returns:
+        dict: {
+            "value": float,
+            "source": str  # Label for the type of interest rate
+        }
+        or None if no data found
+    """
+    for code, label in INTEREST_RATE_CODES.items():
+        series_key = f"M.{country_code}.{code}"
+        try:
+            url = f"http://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData/IFS/{series_key}"
+            r = requests.get(url, timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            series = data.get("CompactData", {}).get("DataSet", {}).get("Series", {})
+            obs = series.get("Obs", [])
+
+            if obs:
+                latest_entry = sorted(obs, key=lambda x: x["@TIME_PERIOD"], reverse=True)[0]
+                value = float(latest_entry["@OBS_VALUE"])
+                return {
+                    "value": value,
+                    "source": label
+                }
+        except Exception:
+            continue
+    return None
+
 def fetch_imf_sdmx_series(iso_alpha_2: str) -> Dict[str, Dict[str, float]]:
     indicator_map = {
         "CPI": "PCPIPCH",
@@ -152,16 +194,13 @@ def get_country_data(country: str = Query(..., description="Full country name, e
             wb_entry = extract_wb_entry(raw_wb.get("PA.NUS.FCRF"))
             imf_data["FX Rate"] = wb_entry or {"value": None, "date": None, "source": None}
 
-        # 3. Interest Rate with fallback list
-        interest_fallbacks = ["Interest Rate", "FIDSR", "FILR_PA"]
-        interest_found = None
-        for label in interest_fallbacks:
-            ir_entry = extract_latest_numeric_entry(raw_imf.get(label, {}))
-            if ir_entry:
-                interest_found = ir_entry
-                break
-        if interest_found:
-            imf_data["Interest Rate"] = interest_found
+        # 3. Interest Rate – uses new get_interest_rate()
+        interest_result = get_interest_rate(iso_alpha_2)
+        if interest_result:
+            imf_data["Interest Rate"] = {
+                "value": interest_result["value"],
+                "source": f"IMF ({interest_result['source']})"
+            }
         else:
             wb_entry = extract_wb_entry(raw_wb.get("FR.INR.RINR"))
             imf_data["Interest Rate"] = wb_entry or {"value": None, "date": None, "source": None}
@@ -196,7 +235,6 @@ def get_chart(country: str, type: str, years: int = 5):
     end_year = datetime.today().year
     start_year = end_year - years
 
-    # Fallback indicator logic
     indicator_map = {
         "inflation": [("PCPIPCH", "Inflation (%)"), ("PCPIEPCH", "Inflation (Alt)")],
         "fx_rate": [("ENDA_XDC_USD_RATE", "Exchange Rate (to USD)")],
