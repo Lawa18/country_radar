@@ -176,6 +176,23 @@ def get_country_data(country: str = Query(..., description="Full country name, e
             except Exception:
                 return None
 
+        def get_debt_to_gdp(wb_data):
+            try:
+                entries = wb_data.get("Debt to GDP (%)", [])
+                if isinstance(entries, list) and len(entries) > 1:
+                    valid = [e for e in entries[1] if e.get("value") is not None]
+                    if not valid:
+                        return None
+                    latest = max(valid, key=lambda x: x["date"])
+                    return {
+                        "value": latest["value"],
+                        "date": latest["date"],
+                        "source": "World Bank"
+                    }
+            except Exception as e:
+                print(f"[Debt-to-GDP] Parsing error: {e}")
+            return None
+
         imf_data = {}
 
         # 1. CPI
@@ -213,10 +230,14 @@ def get_country_data(country: str = Query(..., description="Full country name, e
             wb_entry = extract_wb_entry(raw_wb.get("FI.RES.TOTL.CD"))
             imf_data["Reserves (USD)"] = wb_entry or {"value": None, "date": None, "source": None}
 
+        # 5. Debt-to-GDP
+        debt_to_gdp = get_debt_to_gdp(raw_wb)
+
         return {
             "country": country,
             "iso_codes": codes,
             "imf_data": imf_data,
+            "debt_to_gdp": debt_to_gdp or {"value": None, "date": None, "source": None},
             "world_bank_data": raw_wb
         }
 
