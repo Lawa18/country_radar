@@ -227,22 +227,20 @@ def get_country_data(country: str = Query(..., description="Full country name, e
         if reserves_entry:
             imf_data["Reserves (USD)"] = reserves_entry
         else:
-            # Fallback to World Bank reserves (primary)
-            wb_reserve_entry = extract_wb_entry(raw_wb.get("FI.RES.TOTL.CD"))
+        # Fallback to World Bank reserves
+        wb_raw = raw_wb.get("FI.RES.TOTL.CD")
+        wb_entry = extract_wb_entry(wb_raw)
     
-            # Try alt World Bank fallback if needed
-            if not wb_reserve_entry:
-                wb_reserve_entry = extract_wb_entry(raw_wb.get("BX.TRF.PWKR.CD.DT"))  # alt placeholder fallback
-
-            imf_data["Reserves (USD)"] = wb_reserve_entry or {
-                "value": None,
+        if wb_entry:
+            imf_data["Reserves (USD)"] = wb_entry
+        else:
+            print(f"[WARN] Reserves missing: {country} - Raw:", wb_raw)
+            imf_data["Reserves (USD)"] = {
+                "value": "Not reported",
                 "date": None,
-                "source": None
-            }
-
-            if not wb_reserve_entry:
-                print(f"[WARN] No reserves found for {country} via IMF or WB")
-
+                "source": "World Bank"
+            }        
+            
         # 5. Debt-to-GDP
         debt_to_gdp = get_debt_to_gdp(raw_wb)
 
