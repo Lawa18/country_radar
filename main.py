@@ -38,8 +38,22 @@ WB_INDICATORS = {
     "SL.UEM.TOTL.ZS": "Unemployment (%)",
     "GC.DOD.TOTL.GD.ZS": "Debt to GDP (%)",
     "BN.CAB.XOKA.GD.ZS": "Current Account Balance (% of GDP)",
-    "FI.RES.TOTL.CD": "Reserves (USD)"
+    "FI.RES.TOTL.CD": "Reserves (USD)",
+    "NE.RSB.GNFS.CD": "Trade Balance",
+    "GC.BAL.CASH.GD.ZS": "Fiscal Balance",
+    "NY.GDP.MKTP.KD.ZG": "GDP Growth (%)",
+    "FS.AST.DOMS.GD.ZS": "Banking Assets",
+    "FS.AST.PRVT.GD.ZS": "Credit Growth"
 }
+
+ADDITIONAL_INDICATORS = [
+    "BN.CAB.XOKA.GD.ZS",  # Current Account
+    "NE.RSB.GNFS.CD",     # Trade Balance
+    "GC.BAL.CASH.GD.ZS",  # Fiscal Balance
+    "NY.GDP.MKTP.KD.ZG",  # GDP Growth
+    "FS.AST.DOMS.GD.ZS",  # Banking Assets
+    "FS.AST.PRVT.GD.ZS"    # Credit Growth
+]
 
 INTEREST_RATE_CODES = {
     "FIMM_PA": "Money Market Rate",
@@ -51,17 +65,6 @@ INTEREST_RATE_CODES = {
 }
 
 def get_interest_rate(country_code):
-    """
-    Attempts to fetch the latest interest rate for a given country using multiple IMF series.
-    Tries each code until one returns valid data.
-
-    Returns:
-        dict: {
-            "value": float,
-            "source": str  # Label for the type of interest rate
-        }
-        or None if no data found
-    """
     for code, label in INTEREST_RATE_CODES.items():
         series_key = f"M.{country_code}.{code}"
         try:
@@ -87,7 +90,9 @@ def fetch_imf_sdmx_series(iso_alpha_2: str) -> Dict[str, Dict[str, float]]:
     indicator_map = {
         "CPI": "PCPIPCH",
         "FX Rate": "ENDA_XDC_USD_RATE",
-        "Interest Rate": "FIMM_PA"
+        "Interest Rate": "FIMM_PA",
+        "Reserves (USD)": "TRESEGUSD",
+        "GDP Nominal": "NGDPD"
     }
 
     base_url = "http://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData/IFS"
@@ -197,61 +202,38 @@ def get_country_data(country: str = Query(..., description="Full country name, e
 
         imf_data = {}
 
-        # 1. CPI
+        # Existing indicators (CPI, FX Rate, Interest, Reserves)
         cpi_entry = extract_latest_numeric_entry(raw_imf.get("CPI", {}))
-        if cpi_entry:
-            imf_data["CPI"] = cpi_entry
-        else:
-            wb_entry = extract_wb_entry(raw_wb.get("FP.CPI.TOTL.ZG"))
-            imf_data["CPI"] = wb_entry or {"value": None, "date": None, "source": None}
+        imf_data["CPI"] = cpi_entry or extract_wb_entry(raw_wb.get("FP.CPI.TOTL.ZG")) or {"value": None, "date": None, "source": None}
 
-        # 2. FX Rate
         fx_entry = extract_latest_numeric_entry(raw_imf.get("FX Rate", {}))
-        if fx_entry:
-            imf_data["FX Rate"] = fx_entry
-        else:
-            wb_entry = extract_wb_entry(raw_wb.get("PA.NUS.FCRF"))
-            imf_data["FX Rate"] = wb_entry or {"value": None, "date": None, "source": None}
+        imf_data["FX Rate"] = fx_entry or extract_wb_entry(raw_wb.get("PA.NUS.FCRF")) or {"value": None, "date": None, "source": None}
 
-        # 3. Interest Rate – uses new get_interest_rate()
         interest_result = get_interest_rate(iso_alpha_2)
-        if interest_result:
-            imf_data["Interest Rate"] = {
-                "value": interest_result["value"],
-                "source": f"IMF ({interest_result['source']})"
-            }
-        else:
-            wb_entry = extract_wb_entry(raw_wb.get("FR.INR.RINR"))
-            imf_data["Interest Rate"] = wb_entry or {"value": None, "date": None, "source": None}
+        imf_data["Interest Rate"] = {"value": interest_result["value"], "source": f"IMF ({interest_result['source']})"} if interest_result else extract_wb_entry(raw_wb.get("FR.INR.RINR")) or {"value": None, "date": None, "source": None}
 
-        # 4. Reserves
         reserves_entry = extract_latest_numeric_entry(raw_imf.get("Reserves (USD)", {}))
-        if reserves_entry:
-            imf_data["Reserves (USD)"] = reserves_entry
-        else:
-            # Fallback to World Bank reserves
-            wb_raw = raw_wb.get("FI.RES.TOTL.CD")
-            wb_entry = extract_wb_entry(wb_raw)
+        imf_data["Reserves (USD)"] = reserves_entry or extract_wb_entry(raw_wb.get("FI.RES.TOTL.CD")) or {"value": "Not reported", "date": None, "source": "World Bank"}
 
-            if wb_entry:
-                imf_data["Reserves (USD)"] = wb_entry
-            else:
-                print(f"[WARN] Reserves missing: {country} - Raw:", wb_raw)
-                imf_data["Reserves (USD)"] = {
-                    "value": "Not reported",
-                    "date": None,
-                    "source": "World Bank"
-                }
-
-        # 5. Debt-to-GDP
+        # Debt-to-GDP
         debt_to_gdp = get_debt_to_gdp(raw_wb)
+
+        # Additional indicators (silent)
+        additional = {}
+        for code in ADDITIONAL_INDICATORS:
+            entries = raw_wb.get(code)
+            if entries:
+                parsed = extract_wb_entry(entries)
+                if parsed:
+                    additional[WB_INDICATORS.get(code, code)] = parsed
 
         return {
             "country": country,
             "iso_codes": codes,
             "imf_data": imf_data,
             "debt_to_gdp": debt_to_gdp or {"value": None, "date": None, "source": None},
-            "world_bank_data": raw_wb
+            "world_bank_data": raw_wb,
+            "additional_indicators": additional
         }
 
     except Exception as e:
