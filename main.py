@@ -25,11 +25,19 @@ def resolve_country_codes(name: str):
         return None
 
 IMF_INDICATORS = {
-    "CPI": "PCPI_IX",
-    "FX Rate": "ENDE_XDC_USD_RATE",
-    "Interest Rate": "FIDSR",
-    "Reserves (USD)": "TRESEGUSD",
-    "GDP Nominal": "NGDPD"
+    "CPI": ["PCPI_IX"],
+    "FX Rate": ["ENDE_XDC_USD_RATE"],
+    "Interest Rate": ["FIDSR"],
+    "Reserves (USD)": ["TRESEGUSD"],
+    "GDP Nominal": ["NGDPD", "NGDP_USD"],
+    "GDP Growth": ["NGDP_RPCH", "NGDPD_RPCH"],
+    "Current Account": ["BCA_BP6_USD", "BCA_BP6_PC"],
+    "Trade Balance": ["BTG_BP6_USD", "BX_USD", "BM_USD"],
+    "Government Debt": ["GGXWDG_NGDP", "GGXWDG_USD"],
+    "Fiscal Balance": ["GGR_NGDP", "GGXONLB_NGDP"],
+    "Banking Assets": ["ODCAL_GDP", "DCBBC_USD"],
+    "Credit Growth": ["ODCDC_PC", "DCBBC_PC"],
+    "Unemployment": ["LUR_PER", "LUR_PC"]
 }
 
 WB_INDICATORS = {
@@ -87,41 +95,51 @@ def get_interest_rate(country_code):
     return None
 
 def fetch_imf_sdmx_series(iso_alpha_2: str) -> Dict[str, Dict[str, float]]:
-    indicator_map = {
-        "CPI": "PCPIPCH",
-        "FX Rate": "ENDA_XDC_USD_RATE",
-        "Interest Rate": "FIMM_PA",
-        "Reserves (USD)": "TRESEGUSD",
-        "GDP Nominal": "NGDPD"
-    }
-
     base_url = "http://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData/IFS"
     results = {}
 
-    for label, code in indicator_map.items():
-        url = f"{base_url}/M.{iso_alpha_2}.{code}"
-        try:
-            r = requests.get(url, timeout=15)
-            r.raise_for_status()
-            data = r.json()
-            series = data.get("CompactData", {}).get("DataSet", {}).get("Series", {})
-            obs = series.get("Obs", [])
+    for label, codes in IMF_INDICATORS.items():
+        if isinstance(codes, str):
+            codes = [codes]
+        for code in codes:
+            url = f"{base_url}/M.{iso_alpha_2}.{code}"
+            try:
+                r = requests.get(url, timeout=15)
+                r.raise_for_status()
+                data = r.json()
+                series = data.get("CompactData", {}).get("DataSet", {}).get("Series", {})
+                obs = series.get("Obs", [])
+                parsed = {}
+                for entry in obs:
+                    try:
+                        date = entry["@TIME_PERIOD"]
+                        value = float(entry["@OBS_VALUE"])
+                        year = date.split("-")[0]
+                        parsed[year] = value
+                    except:
+                        continue
+                if parsed:
+                    results[label] = parsed
+                    break
+            except Exception as e:
+                print(f"[IMF SDMX ERROR] {label} ({code}): {e}")
+                continue
 
-            parsed = {}
-            for entry in obs:
-                try:
-                    date = entry["@TIME_PERIOD"]
-                    value = float(entry["@OBS_VALUE"])
-                    year = date.split("-")[0]
-                    parsed[year] = value
-                except:
-                    continue
-
-            results[label] = parsed
-
-        except Exception as e:
-            print(f"[IMF SDMX ERROR] {label}: {e}")
-            results[label] = {}
+        if label not in results:
+            try:
+                iso_alpha_3 = pycountry.countries.get(alpha_2=iso_alpha_2).alpha_3
+                dm_url = f"https://www.imf.org/external/datamapper/api/v1/IFS/{iso_alpha_3}/{codes[0]}"
+                r = requests.get(dm_url, timeout=10)
+                r.raise_for_status()
+                dm_data = r.json()
+                series = dm_data.get(iso_alpha_3, {}).get(codes[0], {})
+                if isinstance(series, dict):
+                    parsed = {str(k): float(v) for k, v in series.items() if isinstance(v, (int, float, str)) and str(v).replace('.', '', 1).isdigit()}
+                    if parsed:
+                        results[label] = parsed
+            except Exception as e:
+                print(f"[IMF DataMapper ERROR] {label}: {e}")
+                results[label] = {}
 
     return results
 
