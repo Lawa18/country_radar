@@ -33,11 +33,12 @@ IMF_INDICATORS = {
 }
 
 WB_INDICATORS = {
-    "GDP (USD)": "NY.GDP.MKTP.CD",
-    "Inflation (%)": "FP.CPI.TOTL.ZG",
-    "Unemployment (%)": "SL.UEM.TOTL.ZS",
-    "Debt to GDP (%)": "GC.DOD.TOTL.GD.ZS",
-    "Current Account Balance (% of GDP)": "BN.CAB.XOKA.GD.ZS"
+    "NY.GDP.MKTP.CD": "GDP (USD)",
+    "FP.CPI.TOTL.ZG": "Inflation (%)",
+    "SL.UEM.TOTL.ZS": "Unemployment (%)",
+    "GC.DOD.TOTL.GD.ZS": "Debt to GDP (%)",
+    "BN.CAB.XOKA.GD.ZS": "Current Account Balance (% of GDP)",
+    "FI.RES.TOTL.CD": "Reserves (USD)"
 }
 
 INTEREST_RATE_CODES = {
@@ -122,15 +123,16 @@ def fetch_imf_sdmx_series(iso_alpha_2: str) -> Dict[str, Dict[str, float]]:
 def fetch_worldbank_data(iso_alpha_2: str) -> Dict[str, Any]:
     base_url = "http://api.worldbank.org/v2/country"
     results = {}
-    for label, code in WB_INDICATORS.items():
+    for code, label in WB_INDICATORS.items():
         url = f"{base_url}/{iso_alpha_2}/indicator/{code}?format=json&per_page=100"
         try:
             r = requests.get(url, timeout=10)
             r.raise_for_status()
-            results[label] = r.json()
+            results[code] = r.json()
         except Exception as e:
             print(f"World Bank fetch error for {label}: {e}")
-            results[label] = {"error": str(e)}
+            results[code] = {"error": str(e)}
+
     return results
 
 @app.get("/country-data")
@@ -178,7 +180,7 @@ def get_country_data(country: str = Query(..., description="Full country name, e
 
         def get_debt_to_gdp(wb_data):
             try:
-                entries = wb_data.get("Debt to GDP (%)", [])
+                entries = wb_data.get("GC.DOD.TOTL.GD.ZS", [])
                 if isinstance(entries, list) and len(entries) > 1:
                     valid = [e for e in entries[1] if e.get("value") is not None]
                     if not valid:
@@ -200,7 +202,7 @@ def get_country_data(country: str = Query(..., description="Full country name, e
         if cpi_entry:
             imf_data["CPI"] = cpi_entry
         else:
-            wb_entry = extract_wb_entry(raw_wb.get("Inflation (%)"))
+            wb_entry = extract_wb_entry(raw_wb.get("FP.CPI.TOTL.ZG"))
             imf_data["CPI"] = wb_entry or {"value": None, "date": None, "source": None}
 
         # 2. FX Rate
@@ -240,7 +242,7 @@ def get_country_data(country: str = Query(..., description="Full country name, e
                     "date": None,
                     "source": "World Bank"
                 }
-            
+
         # 5. Debt-to-GDP
         debt_to_gdp = get_debt_to_gdp(raw_wb)
 
