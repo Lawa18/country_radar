@@ -105,6 +105,11 @@ def fetch_imf_sdmx_series(iso_alpha_2: str) -> Dict[str, Dict[str, float]]:
         try:
             r = requests.get(url, timeout=15)
             r.raise_for_status()
+
+            # 🚫 Ensure it's JSON
+            if "application/json" not in r.headers.get("Content-Type", ""):
+                raise ValueError(f"Non-JSON response from IMF for {label}")
+
             data = r.json()
             series = data.get("CompactData", {}).get("DataSet", {}).get("Series", {})
             obs = series.get("Obs", [])
@@ -113,9 +118,10 @@ def fetch_imf_sdmx_series(iso_alpha_2: str) -> Dict[str, Dict[str, float]]:
             for entry in obs:
                 try:
                     date = entry["@TIME_PERIOD"]
-                    value = float(entry["@OBS_VALUE"])
-                    year = date.split("-")[0]
-                    parsed[year] = value
+                    year = int(date.split("-")[0])
+                    if year >= datetime.today().year - 20:
+                        value = float(entry["@OBS_VALUE"])
+                        parsed[str(year)] = value
                 except:
                     continue
 
@@ -126,23 +132,7 @@ def fetch_imf_sdmx_series(iso_alpha_2: str) -> Dict[str, Dict[str, float]]:
             results[label] = {}
 
     return results
-
-@lru_cache(maxsize=128)
-def fetch_worldbank_data(iso_alpha_2: str) -> Dict[str, Any]:
-    base_url = "http://api.worldbank.org/v2/country"
-    results = {}
-    for code, label in WB_INDICATORS.items():
-        url = f"{base_url}/{iso_alpha_2}/indicator/{code}?format=json&per_page=100"
-        try:
-            r = requests.get(url, timeout=10)
-            r.raise_for_status()
-            results[code] = r.json()
-        except Exception as e:
-            print(f"World Bank fetch error for {label}: {e}")
-            results[code] = {"error": str(e)}
-
-    return results
-
+    
 def fetch_worldbank_data(iso_alpha_2: str) -> Dict[str, Any]:
     base_url = "http://api.worldbank.org/v2/country"
     results = {}
