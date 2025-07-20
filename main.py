@@ -235,14 +235,14 @@ def get_country_data(country: str = Query(..., description="Full country name, e
                 if parsed:
                     additional[WB_INDICATORS.get(code, code)] = parsed
 
-    return {
-        "country": country,
-        "iso_codes": codes,
-        "imf_data": imf_data,
-        "debt_to_gdp": debt_to_gdp or {"value": None, "date": None, "source": None},
-        # "world_bank_data": raw_wb,  # Removed to avoid connector crash
-        "additional_indicators": additional
-    }
+        return {
+            "country": country,
+            "iso_codes": codes,
+            "imf_data": imf_data,
+            "debt_to_gdp": debt_to_gdp or {"value": None, "date": None, "source": None},
+            # "world_bank_data": raw_wb,  # Removed to avoid connector crash
+            "additional_indicators": additional
+        }
 
     except Exception as e:
         print(f"/country-data endpoint error: {e}")
