@@ -259,20 +259,37 @@ def get_chart(country: str, type: str, years: int = 5):
     end_year = datetime.today().year
     start_year = end_year - years
 
+    # Expanded fallback indicators
     indicator_map = {
-        "inflation": [("PCPIPCH", "Inflation (%)"), ("PCPIEPCH", "Inflation (Alt)")],
+        "inflation": [
+            ("PCPIPCH", "Inflation (%)"), 
+            ("PCPIEPCH", "Inflation (Alt)"), 
+            ("PCPI_IX", "Inflation Index")
+        ],
         "fx_rate": [("ENDA_XDC_USD_RATE", "Exchange Rate (to USD)")],
-        "interest_rate": [("FIMM_PA", "Interest Rate (%)"), ("FIDSR", "Interest Rate (Alt)")]
+        "interest_rate": [
+            ("FIMM_PA", "Interest Rate (%)"),
+            ("FIDSR", "Discount Rate"),
+            ("FILR_PA", "Lending Rate"),
+            ("FIRR_PA", "Deposit Rate"),
+            ("FINT_PA", "Treasury Bill Rate"),
+            ("FISN_PA", "Interbank Rate")
+        ]
+    }
+
+    wb_fallback_map = {
+        "inflation": ("FP.CPI.TOTL.ZG", "Inflation (World Bank)"),
+        "interest_rate": ("FR.INR.RINR", "Interest Rate (World Bank)")
     }
 
     if type not in indicator_map:
         return Response(content="Invalid chart type", media_type="text/plain", status_code=400)
 
     fallback_list = indicator_map[type]
-
     records = []
     label = ""
 
+    # Try IMF fallback list first
     for indicator_code, candidate_label in fallback_list:
         sdmx_url = f"http://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData/IFS/M.{iso_alpha_2}.{indicator_code}"
         try:
@@ -304,6 +321,26 @@ def get_chart(country: str, type: str, years: int = 5):
             print(f"/chart error for {country} {indicator_code}: {e}")
             continue
 
+    # If IMF failed and World Bank fallback exists
+    if not records and type in wb_fallback_map:
+        wb_code, wb_label = wb_fallback_map[type]
+        wb_data = fetch_worldbank_data(iso_alpha_2)
+        entries = wb_data.get(wb_code, [])
+        if isinstance(entries, list) and len(entries) > 1:
+            try:
+                valid = [e for e in entries[1] if e.get("value") is not None]
+                for entry in valid:
+                    try:
+                        year = int(entry["date"])
+                        if year >= start_year:
+                            records.append((datetime(year, 1, 1), float(entry["value"])))
+                    except:
+                        continue
+                if records:
+                    label = wb_label
+            except Exception as e:
+                print(f"[World Bank fallback] parse error: {e}")
+
     if not records:
         return Response(content="No data available", media_type="text/plain", status_code=404)
 
@@ -323,7 +360,7 @@ def get_chart(country: str, type: str, years: int = 5):
     plt.close()
     img_bytes.seek(0)
     return Response(content=img_bytes.read(), media_type="image/png")
-
+    
 @app.get("/test-imf-series")
 def test_imf_series(country: str, indicator: str):
     codes = resolve_country_codes(country)
