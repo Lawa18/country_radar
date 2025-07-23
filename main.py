@@ -270,9 +270,11 @@ def get_chart(country: str, type: str, years: int = 5):
 
     fallback_list = indicator_map[type]
 
-    for indicator_code, label in fallback_list:
-        sdmx_url = f"http://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData/IFS/M.{iso_alpha_2}.{indicator_code}"
+    records = []
+    label = ""
 
+    for indicator_code, candidate_label in fallback_list:
+        sdmx_url = f"http://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData/IFS/M.{iso_alpha_2}.{indicator_code}"
         try:
             r = requests.get(sdmx_url, timeout=15)
             r.raise_for_status()
@@ -282,19 +284,21 @@ def get_chart(country: str, type: str, years: int = 5):
 
             print(f"[DEBUG] {country} {indicator_code} entries found: {len(obs)}")
 
-            records = []
+            temp_records = []
             for entry in obs:
                 try:
                     date_str = entry["@TIME_PERIOD"]
                     value = float(entry["@OBS_VALUE"])
                     date = datetime.strptime(date_str, "%Y-%m")
                     if date.year >= start_year:
-                        records.append((date, value))
+                        temp_records.append((date, value))
                 except:
                     continue
 
-            if records:
-                break  # Stop at first indicator with data
+            if temp_records:
+                records = temp_records
+                label = candidate_label
+                break  # Stop at first working series
 
         except Exception as e:
             print(f"/chart error for {country} {indicator_code}: {e}")
