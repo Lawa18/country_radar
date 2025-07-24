@@ -255,111 +255,62 @@ def get_chart(country: str, type: str, years: int = 5):
     if not codes:
         return Response(content="Invalid country name", media_type="text/plain", status_code=400)
 
-    iso_alpha_2 = codes["iso_alpha_2"]
+    iso_alpha_3 = codes["iso_alpha_3"]
     end_year = datetime.today().year
     start_year = end_year - years
 
-    # Expanded fallback indicators
-    indicator_map = {
-        "inflation": [
-            ("PCPIPCH", "Inflation (%)"), 
-            ("PCPIEPCH", "Inflation (Alt)"), 
-            ("PCPI_IX", "Inflation Index")
-        ],
-        "fx_rate": [("ENDA_XDC_USD_RATE", "Exchange Rate (to USD)")],
-        "interest_rate": [
-            ("FIMM_PA", "Interest Rate (%)"),
-            ("FIDSR", "Discount Rate"),
-            ("FILR_PA", "Lending Rate"),
-            ("FIRR_PA", "Deposit Rate"),
-            ("FINT_PA", "Treasury Bill Rate"),
-            ("FISN_PA", "Interbank Rate")
-        ]
+    datamapper_codes = {
+        "inflation": ["PCPIPCH", "PCPIEPCH"],
+        "fx_rate": ["ENDA_XDC_USD_RATE"],
+        "interest_rate": ["FIMM_PA", "FIDSR", "FILR_PA"]
     }
 
-    wb_fallback_map = {
-        "inflation": ("FP.CPI.TOTL.ZG", "Inflation (World Bank)"),
-        "interest_rate": ("FR.INR.RINR", "Interest Rate (World Bank)")
-    }
-
-    if type not in indicator_map:
+    if type not in datamapper_codes:
         return Response(content="Invalid chart type", media_type="text/plain", status_code=400)
 
-    fallback_list = indicator_map[type]
-    records = []
-    label = ""
-
-    # Try IMF fallback list first
-    for indicator_code, candidate_label in fallback_list:
-        sdmx_url = f"http://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData/IFS/M.{iso_alpha_2}.{indicator_code}"
+    for indicator_code in datamapper_codes[type]:
+        url = f"https://www.imf.org/external/datamapper/api/v1/IFS/{iso_alpha_3}/{indicator_code}"
         try:
-            r = requests.get(sdmx_url, timeout=15)
+            r = requests.get(url, timeout=10)
             r.raise_for_status()
             data = r.json()
-            series = data.get("CompactData", {}).get("DataSet", {}).get("Series", {})
-            obs = series.get("Obs", [])
 
-            print(f"[DEBUG] {country} {indicator_code} entries found: {len(obs)}")
+            values = data.get(indicator_code, {}).get(iso_alpha_3)
+            if not values:
+                continue
 
-            temp_records = []
-            for entry in obs:
+            records = []
+            for year_str, val in values.items():
                 try:
-                    date_str = entry["@TIME_PERIOD"]
-                    value = float(entry["@OBS_VALUE"])
-                    date = datetime.strptime(date_str, "%Y-%m")
-                    if date.year >= start_year:
-                        temp_records.append((date, value))
+                    year = int(year_str)
+                    if start_year <= year <= end_year and isinstance(val, (int, float, str)) and str(val).replace('.', '', 1).isdigit():
+                        records.append((datetime(year, 1, 1), float(val)))
                 except:
                     continue
 
-            if temp_records:
-                records = temp_records
-                label = candidate_label
-                break  # Stop at first working series
+            if records:
+                records.sort()
+                dates, values = zip(*records)
+
+                plt.figure(figsize=(10, 5))
+                plt.plot(dates, values, marker='o', linewidth=2)
+                plt.title(f"{indicator_code} – {country} ({dates[0].year}–{dates[-1].year})")
+                plt.xlabel("Date")
+                plt.ylabel(indicator_code)
+                plt.grid(True)
+                plt.tight_layout()
+
+                img_bytes = io.BytesIO()
+                plt.savefig(img_bytes, format="png")
+                plt.close()
+                img_bytes.seek(0)
+                return Response(content=img_bytes.read(), media_type="image/png")
 
         except Exception as e:
             print(f"/chart error for {country} {indicator_code}: {e}")
             continue
 
-    # If IMF failed and World Bank fallback exists
-    if not records and type in wb_fallback_map:
-        wb_code, wb_label = wb_fallback_map[type]
-        wb_data = fetch_worldbank_data(iso_alpha_2)
-        entries = wb_data.get(wb_code, [])
-        if isinstance(entries, list) and len(entries) > 1:
-            try:
-                valid = [e for e in entries[1] if e.get("value") is not None]
-                for entry in valid:
-                    try:
-                        year = int(entry["date"])
-                        if year >= start_year:
-                            records.append((datetime(year, 1, 1), float(entry["value"])))
-                    except:
-                        continue
-                if records:
-                    label = wb_label
-            except Exception as e:
-                print(f"[World Bank fallback] parse error: {e}")
-
-    if not records:
-        return Response(content="No data available", media_type="text/plain", status_code=404)
-
-    records.sort()
-    dates, values = zip(*records)
-
-    plt.figure(figsize=(10, 5))
-    plt.plot(dates, values, marker='o', linewidth=2)
-    plt.title(f"{label} – {country} ({dates[0].year}–{dates[-1].year})")
-    plt.xlabel("Date")
-    plt.ylabel(label)
-    plt.grid(True)
-    plt.tight_layout()
-
-    img_bytes = io.BytesIO()
-    plt.savefig(img_bytes, format="png")
-    plt.close()
-    img_bytes.seek(0)
-    return Response(content=img_bytes.read(), media_type="image/png")
+    return Response(content="No data available", media_type="text/plain", status_code=404)
     
 @app.get("/test-imf-series")
 def test_imf_series(country: str, indicator: str):
