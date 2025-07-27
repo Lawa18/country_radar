@@ -248,63 +248,11 @@ def get_country_data(country: str = Query(..., description="Full country name, e
         print(f"/country-data endpoint error: {e}")
         return {"error": f"Server error: {str(e)}"}
 
-@app.get("/chart")
-@app.head("/chart")
-def get_chart(country: str, type: str, years: int = 5):
-    codes = resolve_country_codes(country)
-    if not codes:
-        return Response(content="Invalid country name", media_type="text/plain", status_code=400)
+# Chart route temporarily disabled
+# 
 
-    iso_alpha_3 = codes["iso_alpha_3"]
-    end_year = datetime.today().year
-    start_year = end_year - years
-
-    datamapper_codes = {
-        "inflation": ["PCPIPCH", "PCPIEPCH"],
-        "fx_rate": ["ENDA_XDC_USD_RATE"],
-        "interest_rate": ["FIMM_PA", "FIDSR", "FILR_PA"]
-    }
-
-    if type not in datamapper_codes:
-        return Response(content="Invalid chart type", media_type="text/plain", status_code=400)
-
-    for indicator_code in datamapper_codes[type]:
-        url = f"https://www.imf.org/external/datamapper/api/v1/IFS/{iso_alpha_3}/{indicator_code}"
-        try:
-            r = requests.get(url, timeout=10)
-            r.raise_for_status()
-            data = r.json()
-
-            values = data.get(indicator_code, {}).get(iso_alpha_3)
-            if not values:
-                continue
-
-            records = []
-            for year_str, val in values.items():
-                try:
-                    year = int(year_str)
-                    if start_year <= year <= end_year and isinstance(val, (int, float, str)) and str(val).replace('.', '', 1).isdigit():
-                        records.append((datetime(year, 1, 1), float(val)))
-                except:
-                    continue
-
-            if records:
-                records.sort()
-                dates, values = zip(*records)
-
-                plt.figure(figsize=(10, 5))
-                plt.plot(dates, values, marker='o', linewidth=2)
-                plt.title(f"{indicator_code} – {country} ({dates[0].year}–{dates[-1].year})")
-                plt.xlabel("Date")
-                plt.ylabel(indicator_code)
-                plt.grid(True)
-                plt.tight_layout()
-
-                img_bytes = io.BytesIO()
-                plt.savefig(img_bytes, format="png")
-                plt.close()
-                img_bytes.seek(0)
-                return Response(content=img_bytes.read(), media_type="image/png")
+# 5
+# Chart logic removed for now.
 
         except Exception as e:
             print(f"/chart error for {country} {indicator_code}: {e}")
