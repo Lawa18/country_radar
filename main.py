@@ -249,14 +249,11 @@ def get_country_data(country: str = Query(..., description="Full country name, e
         return {"error": f"Server error: {str(e)}"}
 
 # Chart route temporarily disabled
-# 
-
-# 5
 # Chart logic removed for now.
 
-        except Exception as e:
-            print(f"/chart error for {country} {indicator_code}: {e}")
-            continue
+    except Exception as e:
+        print(f"/chart error for {country} {indicator_code}: {e}")
+        continue
 
     return Response(content="No data available", media_type="text/plain", status_code=404)
     
