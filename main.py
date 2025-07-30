@@ -75,6 +75,8 @@ def get_interest_rate(country_code):
             data = r.json()
             series = data.get("CompactData", {}).get("DataSet", {}).get("Series", {})
             obs = series.get("Obs", [])
+        except Exception as e:
+            print(f"Error: {e}")
 
             if obs:
                 latest_entry = sorted(obs, key=lambda x: x["@TIME_PERIOD"], reverse=True)[0]
@@ -105,6 +107,8 @@ def fetch_imf_sdmx_series(iso_alpha_2: str) -> Dict[str, Dict[str, float]]:
         try:
             r = requests.get(url, timeout=15)
             r.raise_for_status()
+        except Exception as e:
+            print(f"Error: {e}")
 
             # 🚫 Ensure it's JSON
             if "application/json" not in r.headers.get("Content-Type", ""):
@@ -141,6 +145,8 @@ def fetch_worldbank_data(iso_alpha_2: str) -> Dict[str, Any]:
             r.raise_for_status()
             results[code] = r.json()
             results[code] = {"error": str(e)}
+        except Exception as e:
+            print(f"Error: {e}")
 
     return results
 
@@ -151,6 +157,8 @@ def get_country_data(country: str = Query(..., description="Full country name, e
         codes = resolve_country_codes(country)
         if not codes:
             return {"error": "Invalid country name"}
+    except Exception as e:
+        print(f"Error: {e}")
 
         iso_alpha_2 = codes["iso_alpha_2"]
         iso_alpha_3 = codes["iso_alpha_3"]
@@ -200,6 +208,8 @@ def get_country_data(country: str = Query(..., description="Full country name, e
                         "date": latest["date"],
                         "source": "World Bank"
                     }
+            except Exception as e:
+                print(f"Error: {e}")
             return None
 
         imf_data = {}
@@ -259,6 +269,8 @@ def test_imf_series(country: str, indicator: str):
         series = data.get(iso_alpha_3, {}).get(indicator, {})
         return JSONResponse(content=series)
         return {"error": str(e)}
+    except Exception as e:
+        print(f"Error: {e}")
 
 if __name__ == "__main__":
     import uvicorn
