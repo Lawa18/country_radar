@@ -127,8 +127,6 @@ def fetch_imf_sdmx_series(iso_alpha_2: str) -> Dict[str, Dict[str, float]]:
 
             results[label] = parsed
 
-        except Exception as e:
-            print(f"[IMF SDMX ERROR] {label}: {e}")
             results[label] = {}
 
     return results
@@ -142,8 +140,6 @@ def fetch_worldbank_data(iso_alpha_2: str) -> Dict[str, Any]:
             r = requests.get(url, timeout=10)
             r.raise_for_status()
             results[code] = r.json()
-        except Exception as e:
-            print(f"World Bank fetch error for {label}: {e}")
             results[code] = {"error": str(e)}
 
     return results
@@ -204,8 +200,6 @@ def get_country_data(country: str = Query(..., description="Full country name, e
                         "date": latest["date"],
                         "source": "World Bank"
                     }
-            except Exception as e:
-                print(f"[Debt-to-GDP] Parsing error: {e}")
             return None
 
         imf_data = {}
@@ -244,16 +238,10 @@ def get_country_data(country: str = Query(..., description="Full country name, e
             "additional_indicators": additional
         }
 
-    except Exception as e:
-        print(f"/country-data endpoint error: {e}")
         return {"error": f"Server error: {str(e)}"}
 
 # Chart route temporarily disabled
 # Chart logic removed for now.
-
-    except Exception as e:
-        print(f"/chart error for {country} {indicator_code}: {e}")
-        continue
 
     return Response(content="No data available", media_type="text/plain", status_code=404)
     
@@ -270,7 +258,6 @@ def test_imf_series(country: str, indicator: str):
         data = r.json()
         series = data.get(iso_alpha_3, {}).get(indicator, {})
         return JSONResponse(content=series)
-    except Exception as e:
         return {"error": str(e)}
 
 if __name__ == "__main__":
