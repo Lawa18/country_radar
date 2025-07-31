@@ -65,6 +65,7 @@ INTEREST_RATE_CODES = {
     "FISN_PA": "Interbank Rate"
 }
 
+
 def get_interest_rate(country_code):
     for code, label in INTEREST_RATE_CODES.items():
         series_key = f"M.{country_code}.{code}"
@@ -75,9 +76,6 @@ def get_interest_rate(country_code):
             data = r.json()
             series = data.get("CompactData", {}).get("DataSet", {}).get("Series", {})
             obs = series.get("Obs", [])
-        except Exception as e:
-            print(f"Error: {e}")
-
             if obs:
                 latest_entry = sorted(obs, key=lambda x: x["@TIME_PERIOD"], reverse=True)[0]
                 value = float(latest_entry["@OBS_VALUE"])
@@ -85,9 +83,11 @@ def get_interest_rate(country_code):
                     "value": value,
                     "source": label
                 }
-        except Exception:
+        except Exception as e:
+            print(f"Error fetching interest rate for {series_key}: {e}")
             continue
     return None
+
 
 @lru_cache(maxsize=128)
 def fetch_imf_sdmx_series(iso_alpha_2: str) -> Dict[str, Dict[str, float]]:
