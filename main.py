@@ -65,7 +65,6 @@ INTEREST_RATE_CODES = {
     "FISN_PA": "Interbank Rate"
 }
 
-
 def get_interest_rate(country_code):
     for code, label in INTEREST_RATE_CODES.items():
         series_key = f"M.{country_code}.{code}"
@@ -76,6 +75,7 @@ def get_interest_rate(country_code):
             data = r.json()
             series = data.get("CompactData", {}).get("DataSet", {}).get("Series", {})
             obs = series.get("Obs", [])
+
             if obs:
                 latest_entry = sorted(obs, key=lambda x: x["@TIME_PERIOD"], reverse=True)[0]
                 value = float(latest_entry["@OBS_VALUE"])
@@ -83,11 +83,9 @@ def get_interest_rate(country_code):
                     "value": value,
                     "source": label
                 }
-        except Exception as e:
-            print(f"Error fetching interest rate for {series_key}: {e}")
+        except Exception:
             continue
     return None
-
 
 @lru_cache(maxsize=128)
 def fetch_imf_sdmx_series(iso_alpha_2: str) -> Dict[str, Dict[str, float]]:
@@ -107,8 +105,6 @@ def fetch_imf_sdmx_series(iso_alpha_2: str) -> Dict[str, Dict[str, float]]:
         try:
             r = requests.get(url, timeout=15)
             r.raise_for_status()
-        except Exception as e:
-            print(f"Error: {e}")
 
             # 🚫 Ensure it's JSON
             if "application/json" not in r.headers.get("Content-Type", ""):
@@ -131,6 +127,8 @@ def fetch_imf_sdmx_series(iso_alpha_2: str) -> Dict[str, Dict[str, float]]:
 
             results[label] = parsed
 
+        except Exception as e:
+            print(f"[IMF SDMX ERROR] {label}: {e}")
             results[label] = {}
 
     return results
@@ -144,9 +142,9 @@ def fetch_worldbank_data(iso_alpha_2: str) -> Dict[str, Any]:
             r = requests.get(url, timeout=10)
             r.raise_for_status()
             results[code] = r.json()
-            results[code] = {"error": str(e)}
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"World Bank fetch error for {label}: {e}")
+            results[code] = {"error": str(e)}
 
     return results
 
@@ -157,8 +155,6 @@ def get_country_data(country: str = Query(..., description="Full country name, e
         codes = resolve_country_codes(country)
         if not codes:
             return {"error": "Invalid country name"}
-    except Exception as e:
-        print(f"Error: {e}")
 
         iso_alpha_2 = codes["iso_alpha_2"]
         iso_alpha_3 = codes["iso_alpha_3"]
@@ -209,7 +205,7 @@ def get_country_data(country: str = Query(..., description="Full country name, e
                         "source": "World Bank"
                     }
             except Exception as e:
-                print(f"Error: {e}")
+                print(f"[Debt-to-GDP] Parsing error: {e}")
             return None
 
         imf_data = {}
@@ -248,13 +244,74 @@ def get_country_data(country: str = Query(..., description="Full country name, e
             "additional_indicators": additional
         }
 
+    except Exception as e:
+        print(f"/country-data endpoint error: {e}")
         return {"error": f"Server error: {str(e)}"}
 
-# Chart route temporarily disabled
-# Chart logic removed for now.
-
-    return Response(content="No data available", media_type="text/plain", status_code=404)
-    
+# @app.get("/chart")
+# @app.head("/chart")
+# def get_chart(country: str, type: str, years: int = 5):
+#     codes = resolve_country_codes(country)
+#     if not codes:
+#         return Response(content="Invalid country name", media_type="text/plain", status_code=400)
+# 
+#     iso_alpha_3 = codes["iso_alpha_3"]
+#     end_year = datetime.today().year
+#     start_year = end_year - years
+# 
+#     datamapper_codes = {
+#         "inflation": ["PCPIPCH", "PCPIEPCH"],
+#         "fx_rate": ["ENDA_XDC_USD_RATE"],
+#         "interest_rate": ["FIMM_PA", "FIDSR", "FILR_PA"]
+#     }
+# 
+#     if type not in datamapper_codes:
+#         return Response(content="Invalid chart type", media_type="text/plain", status_code=400)
+# 
+#     for indicator_code in datamapper_codes[type]:
+#         url = f"https://www.imf.org/external/datamapper/api/v1/IFS/{iso_alpha_3}/{indicator_code}"
+#         try:
+#             r = requests.get(url, timeout=10)
+#             r.raise_for_status()
+#             data = r.json()
+# 
+#             values = data.get(indicator_code, {}).get(iso_alpha_3)
+#             if not values:
+#                 continue
+# 
+#             records = []
+#             for year_str, val in values.items():
+#                 try:
+#                     year = int(year_str)
+#                     if start_year <= year <= end_year and isinstance(val, (int, float, str)) and str(val).replace('.', '', 1).isdigit():
+#                         records.append((datetime(year, 1, 1), float(val)))
+#                 except:
+#                     continue
+# 
+#             if records:
+#                 records.sort()
+#                 dates, values = zip(*records)
+# 
+#                 plt.figure(figsize=(10, 5))
+#                 plt.plot(dates, values, marker='o', linewidth=2)
+#                 plt.title(f"{indicator_code} – {country} ({dates[0].year}–{dates[-1].year})")
+#                 plt.xlabel("Date")
+#                 plt.ylabel(indicator_code)
+#                 plt.grid(True)
+#                 plt.tight_layout()
+# 
+#                 img_bytes = io.BytesIO()
+#                 plt.savefig(img_bytes, format="png")
+#                 plt.close()
+#                 img_bytes.seek(0)
+#                 return Response(content=img_bytes.read(), media_type="image/png")
+# 
+#         except Exception as e:
+#             print(f"/chart error for {country} {indicator_code}: {e}")
+#             continue
+# 
+#     return Response(content="No data available", media_type="text/plain", status_code=404)
+#     
 @app.get("/test-imf-series")
 def test_imf_series(country: str, indicator: str):
     codes = resolve_country_codes(country)
@@ -268,9 +325,8 @@ def test_imf_series(country: str, indicator: str):
         data = r.json()
         series = data.get(iso_alpha_3, {}).get(indicator, {})
         return JSONResponse(content=series)
-        return {"error": str(e)}
     except Exception as e:
-        print(f"Error: {e}")
+        return {"error": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
