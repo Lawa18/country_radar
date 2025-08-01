@@ -151,6 +151,7 @@ def fetch_worldbank_data(iso_alpha_2: str) -> Dict[str, Any]:
 @app.get("/country-data")
 @app.head("/country-data")
 def get_country_data(country: str = Query(..., description="Full country name, e.g., Sweden")):
+    historical = {}
     try:
         codes = resolve_country_codes(country)
         if not codes:
@@ -160,6 +161,7 @@ def get_country_data(country: str = Query(..., description="Full country name, e
         iso_alpha_3 = codes["iso_alpha_3"]
 
         raw_imf = fetch_imf_sdmx_series(iso_alpha_2)
+        historical.update(raw_imf)
         raw_wb = fetch_worldbank_data(iso_alpha_2)
 
         def extract_latest_numeric_entry(entry_dict):
@@ -228,15 +230,24 @@ def get_country_data(country: str = Query(..., description="Full country name, e
 
         # Additional indicators (silent)
         additional = {}
+                historical_wb = {}
         for code in ADDITIONAL_INDICATORS:
             entries = raw_wb.get(code)
             if entries:
                 parsed = extract_wb_entry(entries)
                 if parsed:
                     additional[WB_INDICATORS.get(code, code)] = parsed
+                # Add full historical values
+                try:
+                    historical_wb[WB_INDICATORS.get(code, code)] = {
+                        entry['date']: entry['value'] for entry in entries[1] if entry.get('value') is not None
+                    }
+                except Exception:
+                    pass
 
         return {
             "country": country,
+        "historical_indicators": {**historical, **historical_wb},
             "iso_codes": codes,
             "imf_data": imf_data,
             "debt_to_gdp": debt_to_gdp or {"value": None, "date": None, "source": None},
