@@ -230,7 +230,7 @@ def get_country_data(country: str = Query(..., description="Full country name, e
 
         # Additional indicators (silent)
         additional = {}
-                historical_wb = {}
+            historical_wb = {}
         for code in ADDITIONAL_INDICATORS:
             entries = raw_wb.get(code)
             if entries:
