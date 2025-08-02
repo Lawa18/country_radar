@@ -151,113 +151,97 @@ def fetch_worldbank_data(iso_alpha_2: str) -> Dict[str, Any]:
 @app.get("/country-data")
 @app.head("/country-data")
 def get_country_data(country: str = Query(..., description="Full country name, e.g., Sweden")):
-    historical = {}
     try:
         codes = resolve_country_codes(country)
         if not codes:
             return {"error": "Invalid country name"}
 
         iso_alpha_2 = codes["iso_alpha_2"]
-        iso_alpha_3 = codes["iso_alpha_3"]
-
         raw_imf = fetch_imf_sdmx_series(iso_alpha_2)
-        historical.update(raw_imf)
         raw_wb = fetch_worldbank_data(iso_alpha_2)
 
-        def extract_latest_numeric_entry(entry_dict):
+        def extract_latest_and_series(entry_dict):
             try:
-                pairs = [(int(year), float(val)) for year, val in entry_dict.items() if isinstance(val, (float, int, str)) and str(val).replace('.', '', 1).isdigit()]
+                pairs = [(int(year), float(val)) for year, val in entry_dict.items() if str(val).replace('.', '', 1).isdigit()]
                 if not pairs:
                     return None
                 latest = max(pairs, key=lambda x: x[0])
                 return {
-                    "value": latest[1],
-                    "date": str(latest[0]),
-                    "source": "IMF"
+                    "latest": {
+                        "value": latest[1],
+                        "date": str(latest[0]),
+                        "source": "IMF"
+                    },
+                    "series": {str(year): val for year, val in sorted(pairs, reverse=True)}
                 }
-            except Exception:
+            except:
                 return None
 
-        def extract_wb_entry(entries):
+        def extract_wb_series(entries):
             try:
                 if isinstance(entries, list) and len(entries) > 1:
-                    valid = [e for e in entries[1] if e.get("value") is not None]
-                    if not valid:
+                    series = {}
+                    for e in entries[1]:
+                        year = e.get("date")
+                        val = e.get("value")
+                        if year and val is not None:
+                            series[year] = val
+                    if not series:
                         return None
-                    latest = max(valid, key=lambda x: x["date"])
+                    latest_year = max(series.keys())
                     return {
-                        "value": latest["value"],
-                        "date": latest["date"],
-                        "source": "World Bank"
+                        "latest": {
+                            "value": series[latest_year],
+                            "date": latest_year,
+                            "source": "World Bank"
+                        },
+                        "series": dict(sorted(series.items(), reverse=True))
                     }
-            except Exception:
+            except:
                 return None
 
         def get_debt_to_gdp(wb_data):
             try:
                 entries = wb_data.get("GC.DOD.TOTL.GD.ZS", [])
-                if isinstance(entries, list) and len(entries) > 1:
-                    valid = [e for e in entries[1] if e.get("value") is not None]
-                    if not valid:
-                        return None
-                    latest = max(valid, key=lambda x: x["date"])
-                    return {
-                        "value": latest["value"],
-                        "date": latest["date"],
-                        "source": "World Bank"
-                    }
-            except Exception as e:
-                print(f"[Debt-to-GDP] Parsing error: {e}")
-            return None
+                return extract_wb_series(entries)
+            except:
+                return None
 
         imf_data = {}
+        indicators = {
+            "CPI": ("CPI", "FP.CPI.TOTL.ZG"),
+            "FX Rate": ("FX Rate", "PA.NUS.FCRF"),
+            "Interest Rate": ("Interest Rate", "FR.INR.RINR"),
+            "Reserves (USD)": ("Reserves (USD)", "FI.RES.TOTL.CD")
+        }
 
-        # Existing indicators (CPI, FX Rate, Interest, Reserves)
-        cpi_entry = extract_latest_numeric_entry(raw_imf.get("CPI", {}))
-        imf_data["CPI"] = cpi_entry or extract_wb_entry(raw_wb.get("FP.CPI.TOTL.ZG")) or {"value": None, "date": None, "source": None}
+        for key, (imf_key, wb_code) in indicators.items():
+            imf_entry = extract_latest_and_series(raw_imf.get(imf_key, {}))
+            wb_entry = extract_wb_series(raw_wb.get(wb_code))
+            imf_data[key] = imf_entry or wb_entry or {"latest": {"value": None, "date": None, "source": None}, "series": {}}
 
-        fx_entry = extract_latest_numeric_entry(raw_imf.get("FX Rate", {}))
-        imf_data["FX Rate"] = fx_entry or extract_wb_entry(raw_wb.get("PA.NUS.FCRF")) or {"value": None, "date": None, "source": None}
-
-        interest_result = get_interest_rate(iso_alpha_2)
-        imf_data["Interest Rate"] = {"value": interest_result["value"], "source": f"IMF ({interest_result['source']})"} if interest_result else extract_wb_entry(raw_wb.get("FR.INR.RINR")) or {"value": None, "date": None, "source": None}
-
-        reserves_entry = extract_latest_numeric_entry(raw_imf.get("Reserves (USD)", {}))
-        imf_data["Reserves (USD)"] = reserves_entry or extract_wb_entry(raw_wb.get("FI.RES.TOTL.CD")) or {"value": "Not reported", "date": None, "source": "World Bank"}
-
-        # Debt-to-GDP
         debt_to_gdp = get_debt_to_gdp(raw_wb)
 
-        # Additional indicators (silent)
         additional = {}
-        historical_wb = {}
         for code in ADDITIONAL_INDICATORS:
             entries = raw_wb.get(code)
             if entries:
-                parsed = extract_wb_entry(entries)
+                parsed = extract_wb_series(entries)
                 if parsed:
-                    additional[WB_INDICATORS.get(code, code)] = parsed
-                # Add full historical values
-                try:
-                    historical_wb[WB_INDICATORS.get(code, code)] = {
-                        entry['date']: entry['value'] for entry in entries[1] if entry.get('value') is not None
-                    }
-                except Exception:
-                    pass
+                    label = WB_INDICATORS.get(code, code)
+                    additional[label] = parsed
 
         return {
             "country": country,
-        "historical_indicators": {**historical, **historical_wb},
             "iso_codes": codes,
             "imf_data": imf_data,
-            "debt_to_gdp": debt_to_gdp or {"value": None, "date": None, "source": None},
-            # "world_bank_data": raw_wb,  # Removed to avoid connector crash
+            "debt_to_gdp": debt_to_gdp or {"latest": {"value": None, "date": None, "source": None}, "series": {}},
             "additional_indicators": additional
         }
 
     except Exception as e:
-        print(f"/country-data endpoint error: {e}")
-        return {"error": f"Server error: {str(e)}"}
+        print(f"/country-data error: {e}")
+        return {"error": str(e)}
 
 # @app.get("/chart")
 # @app.head("/chart")
