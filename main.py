@@ -30,7 +30,10 @@ IMF_INDICATORS = {
     "FX Rate": "ENDE_XDC_USD_RATE",
     "Interest Rate": "FIDSR",
     "Reserves (USD)": "TRESEGUSD",
-    "GDP Nominal": "NGDPD"
+    "GDP Nominal": "NGDPD",
+    "GDP Growth (%)": "NGDP_RPCH",
+    "Debt to GDP (%)": "GGXWDG_NGDP",
+    "Unemployment (%)": "LUR",
 }
 
 WB_INDICATORS = {
