@@ -26,7 +26,20 @@ def extract_latest_numeric_entry(entry_dict):
     except Exception:
         return None
 
-
+def extract_wb_entry(entries):
+    try:
+        if isinstance(entries, list) and len(entries) > 1:
+            valid = [e for e in entries[1] if e.get("value") is not None]
+            if not valid:
+                return None
+            latest = max(valid, key=lambda x: x["date"])
+            return {
+                "value": latest["value"],
+                "date": latest["date"],
+                "source": "World Bank"
+            }
+    except Exception:
+        return None
 
 @app.get("/ping")
 def ping():
