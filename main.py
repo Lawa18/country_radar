@@ -11,6 +11,23 @@ from functools import lru_cache
 
 app = FastAPI()
 
+def extract_latest_numeric_entry(entry_dict):
+    try:
+        pairs = [(int(year), float(val)) for year, val in entry_dict.items()
+                 if isinstance(val, (float, int, str)) and str(val).replace('.', '', 1).isdigit()]
+        if not pairs:
+            return None
+        latest = max(pairs, key=lambda x: x[0])
+        return {
+            "value": latest[1],
+            "date": str(latest[0]),
+            "source": "IMF"
+        }
+    except Exception:
+        return None
+
+
+
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
