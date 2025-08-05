@@ -234,7 +234,20 @@ def get_country_data(country: str = Query(..., description="Full country name, e
                     label = WB_INDICATORS.get(code, code)
                     additional[label] = parsed
 
-        return {
+        
+        # GDP Growth (%)
+        gdp_growth_entry = extract_latest_numeric_entry(raw_imf.get("GDP Growth (%)", {}))
+        imf_data["GDP Growth (%)"] = gdp_growth_entry or extract_wb_entry(raw_wb.get("NY.GDP.MKTP.KD.ZG")) or {"value": None, "date": None, "source": None}
+
+        # Debt to GDP (%)
+        debt_entry = extract_latest_numeric_entry(raw_imf.get("Debt to GDP (%)", {}))
+        imf_data["Debt to GDP (%)"] = debt_entry or extract_wb_entry(raw_wb.get("GC.DOD.TOTL.GD.ZS")) or {"value": None, "date": None, "source": None}
+
+        # Unemployment (%)
+        unemployment_entry = extract_latest_numeric_entry(raw_imf.get("Unemployment (%)", {}))
+        imf_data["Unemployment (%)"] = unemployment_entry or extract_wb_entry(raw_wb.get("SL.UEM.TOTL.ZS")) or {"value": None, "date": None, "source": None}
+
+return {
             "country": country,
             "iso_codes": codes,
             "imf_data": imf_data,
