@@ -11,6 +11,27 @@ from functools import lru_cache
 
 app = FastAPI()
 
+
+def is_recent_year(year_str, threshold=2020):
+    try:
+        return int(year_str) >= threshold
+    except:
+        return False
+
+def extract_latest_recent_entry(entry_dict):
+    try:
+        pairs = [(int(year), float(val)) for year, val in entry_dict.items()
+                 if is_recent_year(year) and str(val).replace('.', '', 1).isdigit()]
+        if pairs:
+            return max(pairs, key=lambda x: x[0])
+        # If no recent, fallback to oldest available
+        all_pairs = [(int(year), float(val)) for year, val in entry_dict.items()
+                     if str(val).replace('.', '', 1).isdigit()]
+        return max(all_pairs, key=lambda x: x[0]) if all_pairs else None
+    except:
+        return None
+
+
 def extract_latest_numeric_entry(entry_dict):
     try:
         pairs = [(int(year), float(val)) for year, val in entry_dict.items()
