@@ -32,23 +32,6 @@ def extract_latest_recent_entry(entry_dict):
         return None
 
 
-
-# Fallback extraction logic using World Bank indicators
-def extract_wb_entry(wb_data, indicator_code):
-    try:
-        series = wb_data.get(indicator_code, {})
-        if not series:
-            return None, None
-        sorted_years = sorted(series.keys(), reverse=True)
-        for year in sorted_years:
-            val = series[year]
-            if isinstance(val, (int, float, str)) and str(val).replace('.', '', 1).isdigit():
-                return float(val), year
-        return None, None
-    except:
-        return None, None
-
-
 def extract_latest_numeric_entry(entry_dict):
     try:
         pairs = [(int(year), float(val)) for year, val in entry_dict.items()
