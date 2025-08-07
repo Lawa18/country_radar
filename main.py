@@ -215,6 +215,50 @@ def get_country_data(country: str = Query(..., description="Full country name, e
         raw_imf = fetch_imf_sdmx_series(iso_alpha_2)
         raw_wb = fetch_worldbank_data(iso_alpha_2)
 
+        # --- Debt-to-GDP Calculation Patch ---
+        debt_gdp_result = {}
+
+        # Try IMF first
+        try:
+            debt_imf = raw_imf.get("GGXWDG", {})
+            gdp_imf = raw_imf.get("NGDP", {})
+            if debt_imf and gdp_imf:
+                debt_latest = extract_latest_recent_entry(debt_imf)
+                gdp_latest = extract_latest_recent_entry(gdp_imf)
+                if debt_latest and gdp_latest and debt_latest[0] == gdp_latest[0] and gdp_latest[1] != 0:
+                    ratio = (debt_latest[1] / gdp_latest[1]) * 100
+                    debt_gdp_result = {
+                        "debt_value": debt_latest[1],
+                        "gdp_value": gdp_latest[1],
+                        "year": debt_latest[0],
+                        "debt_to_gdp": round(ratio, 2),
+                        "source": "IMF WEO",
+                        "government_type": "General Government"
+                    }
+        except:
+            pass
+
+        # If IMF missing or mismatched, try WB
+        if not debt_gdp_result:
+            try:
+                debt_wb = raw_wb.get("GC.DOD.TOTL.CN", {})
+                gdp_wb = raw_wb.get("NY.GDP.MKTP.CN", {})
+                if debt_wb and gdp_wb:
+                    debt_latest = extract_latest_recent_entry(debt_wb)
+                    gdp_latest = extract_latest_recent_entry(gdp_wb)
+                    if debt_latest and gdp_latest and debt_latest[0] == gdp_latest[0] and gdp_latest[1] != 0:
+                        ratio = (debt_latest[1] / gdp_latest[1]) * 100
+                        debt_gdp_result = {
+                            "debt_value": debt_latest[1],
+                            "gdp_value": gdp_latest[1],
+                            "year": debt_latest[0],
+                            "debt_to_gdp": round(ratio, 2),
+                            "source": "World Bank WDI",
+                            "government_type": "Central Government"
+                        }
+            except:
+                pass
+
         def extract_latest_and_series(entry_dict):
             try:
                 pairs = [(int(year), float(val)) for year, val in entry_dict.items() if str(val).replace('.', '', 1).isdigit()]
