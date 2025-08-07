@@ -77,6 +77,7 @@ def resolve_country_codes(name: str):
         return None
 
 IMF_INDICATORS = {
+    "Unemployment": ["LUR_PT", "LUR_PER"],
     "CPI": "PCPI_IX",
     "FX Rate": "ENDE_XDC_USD_RATE",
     "Interest Rate": "FIDSR",
