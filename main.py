@@ -346,36 +346,9 @@ def get_country_data(country: str = Query(..., description="Full country name, e
             "country": country,
             "iso_codes": codes,
             "imf_data": imf_data,
-            "government_debt": ({
-                "value": debt_gdp_result.get("debt_value"),
-                "date": str(debt_gdp_result.get("year")),
-                "source": debt_gdp_result.get("source"),
-                "government_type": debt_gdp_result.get("government_type")
-            } if debt_gdp_result else {
-                "value": None, "date": None, "source": None, "government_type": None
-            }),
-            "nominal_gdp": ({
-                "value": debt_gdp_result.get("gdp_value"),
-                "date": str(debt_gdp_result.get("year")),
-                "source": debt_gdp_result.get("source")
-            } if debt_gdp_result else {
-                "value": None, "date": None, "source": None
-            }),
-            "debt_to_gdp": ({
-                "latest": {
-                    "value": debt_gdp_result.get("debt_to_gdp"),
-                    "date": str(debt_gdp_result.get("year")),
-                    "source": debt_gdp_result.get("source"),
-                    "government_type": debt_gdp_result.get("government_type")
-                },
-                "series": {}
-            } if debt_gdp_result else {
-                "latest": {"value": None, "date": None, "source": None},
-                "series": {}
-            }),
+            "debt_to_gdp": debt_to_gdp or {"latest": {"value": None, "date": None, "source": None}, "series": {}},
             "additional_indicators": additional
         }
-
 
     except Exception as e:
         print(f"/country-data error: {e}")
