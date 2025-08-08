@@ -405,63 +405,45 @@ def get_country_data(country: str = Query(..., description="Full country name, e
         imf_data["Unemployment (%)"] = unemployment_entry or extract_wb_entry(raw_wb.get("SL.UEM.TOTL.ZS")) or {"value": None, "date": None, "source": None}
 
         return {
-
-        "country": country,
-        "iso_codes": codes,
-        "imf_data": imf_data,
-        "government_debt": ({
-            "value": debt_bundle.get("debt_value"),
-            "date": str(debt_bundle.get("year")),
-            "source": debt_bundle.get("source"),
-            "government_type": debt_bundle.get("government_type")
-        } if debt_bundle else {
-            "value": None, "date": None, "source": None, "government_type": None
-        }),
-        "nominal_gdp": ({
-            "value": debt_bundle.get("gdp_value"),
-            "date": str(debt_bundle.get("year")),
-            "source": debt_bundle.get("source")
-        } if debt_bundle else {
-            "value": None, "date": None, "source": None
-        }),
+    "country": country,
+    "iso_codes": codes,
+    "imf_data": imf_data,
+    "government_debt": ({
+        "value": debt_bundle.get("debt_value"),
+        "date": str(debt_bundle.get("year")),
+        "source": debt_bundle.get("source"),
+        "government_type": debt_bundle.get("government_type")
+    } if debt_bundle else {
+        "value": None, "date": None, "source": None, "government_type": None
+    }),
+    "nominal_gdp": ({
+        "value": debt_bundle.get("gdp_value"),
+        "date": str(debt_bundle.get("year")),
+        "source": debt_bundle.get("source")
+    } if debt_bundle else {
+        "value": None, "date": None, "source": None
+    }),
     "debt_to_gdp": (
         {
             "latest": {
                 "value": debt_bundle.get("debt_to_gdp"),
                 "date": str(debt_bundle.get("year")),
                 "source": debt_bundle.get("source"),
-                "government_type": debt_bundle.get("government_type"),
-            },
-            "series": {},
-        }
-        if debt_bundle
-        else (
-            debt_to_gdp
-            or {
-                "latest": {"value": None, "date": None, "source": None},
-                "series": {},
-            }
-        )
-    ),
-                "date": str(debt_bundle.get("year")),
-                "source": debt_bundle.get("source"),
-                "government_type": debt_bundle.get("government_type"),
-            },
-            "series": {},
-        }
-        if debt_bundle
-        else (
-            debt_to_gdp
-            or {
-                "latest": {"value": None, "date": None, "source": None},
-                "series": {},
-            }
-        )
-    ),
-                "date": str(debt_bundle.get("year")),
-                "source": debt_bundle.get("source"),
                 "government_type": debt_bundle.get("government_type")
             },
+            "series": {}
+        }
+        if debt_bundle
+        else (
+            debt_to_gdp or {
+                "latest": {"value": None, "date": None, "source": None},
+                "series": {}
+            }
+        )
+    ),
+    "additional_indicators": additional
+}
+,
             "series": {}
         } if debt_bundle else (debt_to_gdp or {
             "latest": {"value": None, "date": None, "source": None},
