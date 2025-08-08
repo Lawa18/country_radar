@@ -436,8 +436,8 @@ def get_country_data(country: str = Query(..., description="Full country name, e
             "latest": {"value": None, "date": None, "source": None},
             "series": {}
         })),
- "date": str(debt_bundle.get("year")), "source": debt_bundle.get("source"), "government_type": debt_bundle.get("government_type")}, "series": {}} if debt_bundle else (debt_to_gdp or {"latest": {"value": None, "date": None, "source": None}, "series": {}})),
-        "additional_indicators": additional
+         "date": str(debt_bundle.get("year")), "source": debt_bundle.get("source"), "government_type": debt_bundle.get("government_type")}, "series": {}} if debt_bundle else (debt_to_gdp or {"latest": {"value": None, "date": None, "source": None}, "series": {}})),
+            "additional_indicators": additional
     
     }, "series": {}},
             "additional_indicators": additional
