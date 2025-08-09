@@ -205,6 +205,18 @@ def fetch_worldbank_data(iso_alpha_2: str) -> Dict[str, Any]:
 
 @app.get("/country-data")
 @app.head("/country-data")
+
+def latest_common_year_pair(series_a: dict, series_b: dict):
+    try:
+        ya = {int(y): float(v) for y, v in series_a.items() if isinstance(v, (int, float, str)) and str(v).replace('.', '', 1).isdigit()}
+        yb = {int(y): float(v) for y, v in series_b.items() if isinstance(v, (int, float, str)) and str(v).replace('.', '', 1).isdigit()}
+        common = sorted(set(ya) & set(yb))
+        if not common:
+            return None
+        y = common[-1]
+        return (y, ya[y], yb[y])
+    except:
+        return None
 def get_country_data(country: str = Query(..., description="Full country name, e.g., Sweden")):
     try:
         codes = resolve_country_codes(country)
@@ -215,10 +227,44 @@ def get_country_data(country: str = Query(..., description="Full country name, e
         raw_imf = fetch_imf_sdmx_series(iso_alpha_2)
         raw_wb = fetch_worldbank_data(iso_alpha_2)
 
-        # --- Debt-to-GDP Calculation Patch ---
-        debt_gdp_result = {}
+                
 
-        # Try IMF first
+        # --- Debt-to-GDP Calculation (IMF → WB using latest common year) ---
+        try:
+            debt_imf = raw_imf.get("GGXWDG", {})
+            gdp_imf  = raw_imf.get("NGDP", {})
+            pair_imf = latest_common_year_pair(debt_imf, gdp_imf)
+            if pair_imf and pair_imf[2] != 0:
+                y, debt_val, gdp_val = pair_imf
+                debt_gdp_result = {
+                    "debt_value": debt_val,
+                    "gdp_value": gdp_val,
+                    "year": y,
+                    "debt_to_gdp": round((debt_val / gdp_val) * 100, 2),
+                    "source": "IMF WEO",
+                    "government_type": "General Government",
+                }
+        except:
+            pass
+
+        if not debt_gdp_result:
+            try:
+                debt_wb = raw_wb.get("GC.DOD.TOTL.CN", {})
+                gdp_wb  = raw_wb.get("NY.GDP.MKTP.CN", {})
+                pair_wb = latest_common_year_pair(debt_wb, gdp_wb)
+                if pair_wb and pair_wb[2] != 0:
+                    y, debt_val, gdp_val = pair_wb
+                    debt_gdp_result = {
+                        "debt_value": debt_val,
+                        "gdp_value": gdp_val,
+                        "year": y,
+                        "debt_to_gdp": round((debt_val / gdp_val) * 100, 2),
+                        "source": "World Bank WDI",
+                        "government_type": "Central Government",
+                    }
+            except:
+                pass
+# Try IMF first
         try:
             debt_imf = raw_imf.get("GGXWDG", {})
             gdp_imf = raw_imf.get("NGDP", {})
@@ -342,50 +388,49 @@ def get_country_data(country: str = Query(..., description="Full country name, e
         unemployment_entry = extract_latest_numeric_entry(raw_imf.get("Unemployment (%)", {}))
         imf_data["Unemployment (%)"] = unemployment_entry or extract_wb_entry(raw_wb.get("SL.UEM.TOTL.ZS")) or {"value": None, "date": None, "source": None}
 
+        
         return {
             "country": country,
             "iso_codes": codes,
             "imf_data": imf_data,
-    "government_debt": ({
-        "latest": {
-            "value": debt_gdp_result.get("debt_value"),
-            "date": str(debt_gdp_result.get("year")),
-            "source": debt_gdp_result.get("source"),
-            "government_type": debt_gdp_result.get("government_type"),
-        },
-        "series": {},
-    } if debt_gdp_result else {
-        "latest": {"value": None, "date": None, "source": None, "government_type": None},
-        "series": {},
-    }),
-
-    "nominal_gdp": ({
-        "latest": {
-            "value": debt_gdp_result.get("gdp_value"),
-            "date": str(debt_gdp_result.get("year")),
-            "source": debt_gdp_result.get("source"),
-        },
-        "series": {},
-    } if debt_gdp_result else {
-        "latest": {"value": None, "date": None, "source": None},
-        "series": {},
-    }),
-
-    "debt_to_gdp": ({
-        "latest": {
-            "value": debt_gdp_result.get("debt_to_gdp"),
-            "date": str(debt_gdp_result.get("year")),
-            "source": debt_gdp_result.get("source"),
-            "government_type": debt_gdp_result.get("government_type"),
-        },
-        "series": {},
-    } if debt_gdp_result else {
-        "latest": {"value": None, "date": None, "source": None},
-        "series": {},
-    }),
-
+            "government_debt": ({
+                "latest": {
+                    "value": debt_gdp_result.get("debt_value"),
+                    "date": str(debt_gdp_result.get("year")),
+                    "source": debt_gdp_result.get("source"),
+                    "government_type": debt_gdp_result.get("government_type")
+                },
+                "series": {}
+            } if debt_gdp_result else {
+                "latest": {"value": None, "date": None, "source": None, "government_type": None},
+                "series": {}
+            }),
+            "nominal_gdp": ({
+                "latest": {
+                    "value": debt_gdp_result.get("gdp_value"),
+                    "date": str(debt_gdp_result.get("year")),
+                    "source": debt_gdp_result.get("source")
+                },
+                "series": {}
+            } if debt_gdp_result else {
+                "latest": {"value": None, "date": None, "source": None},
+                "series": {}
+            }),
+            "debt_to_gdp": ({
+                "latest": {
+                    "value": debt_gdp_result.get("debt_to_gdp"),
+                    "date": str(debt_gdp_result.get("year")),
+                    "source": debt_gdp_result.get("source"),
+                    "government_type": debt_gdp_result.get("government_type")
+                },
+                "series": {}
+            } if debt_gdp_result else {
+                "latest": {"value": None, "date": None, "source": None},
+                "series": {}
+            }),
             "additional_indicators": additional
         }
+
 
 
     except Exception as e:
