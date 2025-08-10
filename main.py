@@ -8,7 +8,6 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from datetime import datetime
 from functools import lru_cache
-import unicodedata
 
 app = FastAPI()
 
@@ -66,23 +65,6 @@ def extract_wb_entry(entries):
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
-
-# --- Country name normalization (aliases) ---
-ALIASES = {
-    "united mexican states": "mexico",
-    "u.s.": "united states",
-    "usa": "united states",
-    "u.s.a.": "united states",
-    "uk": "united kingdom",
-    "u.k.": "united kingdom",
-}
-
-def normalize_country_name(name: str) -> str:
-    if not isinstance(name, str):
-        return ""
-    s = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
-    s = s.strip().lower()
-    return ALIASES.get(s, s)
 
 def resolve_country_codes(name: str):
     try:
@@ -221,113 +203,55 @@ def fetch_worldbank_data(iso_alpha_2: str) -> Dict[str, Any]:
 
     return results
 
-@lru_cache(maxsize=256)
-def fetch_imf_weo_series(iso_alpha_3: str, indicators: list[str]) -> dict:
-    """
-    Fetch selected series from IMF DataMapper WEO dataset.
-    Returns {indicator: {year: value}} for the provided indicators.
-    """
-    results = {}
-    for code in indicators:
-        url = f"https://www.imf.org/external/datamapper/api/v1/WEO/{iso_alpha_3}/{code}"
-        try:
-            r = requests.get(url, timeout=10)
-            r.raise_for_status()
-            data = r.json()
-            series = data.get(iso_alpha_3, {}).get(code, {})
-            # normalize keys to string years with float values
-            parsed = {}
-            for y, v in series.items():
-                try:
-                    if v is None: 
-                        continue
-                    yr = int(y)
-                    if yr >= datetime.today().year - 25:
-                        parsed[str(yr)] = float(v)
-                except:
-                    continue
-            results[code] = parsed
-        except Exception:
-            results[code] = {}
-    return results
-
 @app.get("/country-data")
 @app.head("/country-data")
-
-def latest_common_year_pair(series_a: dict, series_b: dict):
-    try:
-        ya = {int(y): float(v) for y, v in series_a.items() if isinstance(v, (int, float, str)) and str(v).replace('.', '', 1).isdigit()}
-        yb = {int(y): float(v) for y, v in series_b.items() if isinstance(v, (int, float, str)) and str(v).replace('.', '', 1).isdigit()}
-        common = sorted(set(ya) & set(yb))
-        if not common:
-            return None
-        y = common[-1]
-        return (y, ya[y], yb[y])
-    except:
-        return None
 def get_country_data(country: str = Query(..., description="Full country name, e.g., Sweden")):
     try:
-
-        country_in = country
-        country = normalize_country_name(country_in)
         codes = resolve_country_codes(country)
         if not codes:
-            return {"error": "Invalid country name"}
+            return {
+    "country": country,
+    "iso_codes": codes,
+    "imf_data": imf_data,
+    "government_debt": ({
+        "value": debt_bundle.get("debt_value"),
+        "date": str(debt_bundle.get("year")),
+        "source": debt_bundle.get("source"),
+        "government_type": debt_bundle.get("government_type")
+    } if debt_bundle else {
+        "value": None, "date": None, "source": None, "government_type": None
+    }),
+    "nominal_gdp": ({
+        "value": debt_bundle.get("gdp_value"),
+        "date": str(debt_bundle.get("year")),
+        "source": debt_bundle.get("source")
+    } if debt_bundle else {
+        "value": None, "date": None, "source": None
+    }),
+    "debt_to_gdp": ({
+        "latest": {
+            "value": debt_bundle.get("debt_to_gdp"),
+            "date": str(debt_bundle.get("year")),
+            "source": debt_bundle.get("source"),
+            "government_type": debt_bundle.get("government_type")
+        },
+        "series": {}
+    } if debt_bundle else (debt_to_gdp or {
+        "latest": {"value": None, "date": None, "source": None},
+        "series": {}
+    })),
+    "additional_indicators": additional
+}
+
 
         iso_alpha_2 = codes["iso_alpha_2"]
         raw_imf = fetch_imf_sdmx_series(iso_alpha_2)
         raw_wb = fetch_worldbank_data(iso_alpha_2)
-        # Also fetch IMF WEO series for General Gov Debt (GGXWDG) and Nominal GDP (NGDP)
-        try:
-            iso_alpha_3 = codes["iso_alpha_3"]
-            weo = fetch_imf_weo_series(iso_alpha_3, ["GGXWDG", "NGDP"])
-            # merge into raw_imf namespace expected by downstream logic
-            if isinstance(weo, dict):
-                for k in ["GGXWDG", "NGDP"]:
-                    if weo.get(k):
-                        raw_imf[k] = weo[k]
-        except Exception:
-            pass
 
+        # --- Debt-to-GDP Calculation Patch ---
+        debt_gdp_result = {}
 
-                
-
-        # --- Debt-to-GDP Calculation (IMF → WB using latest common year) ---
-        try:
-            debt_imf = raw_imf.get("GGXWDG", {})
-            gdp_imf  = raw_imf.get("NGDP", {})
-            pair_imf = latest_common_year_pair(debt_imf, gdp_imf)
-            if pair_imf and pair_imf[2] != 0:
-                y, debt_val, gdp_val = pair_imf
-                debt_gdp_result = {
-                    "debt_value": debt_val,
-                    "gdp_value": gdp_val,
-                    "year": y,
-                    "debt_to_gdp": round((debt_val / gdp_val) * 100, 2),
-                    "source": "IMF WEO",
-                    "government_type": "General Government",
-                }
-        except:
-            pass
-
-        if not debt_gdp_result:
-            try:
-                debt_wb = raw_wb.get("GC.DOD.TOTL.CN", {})
-                gdp_wb  = raw_wb.get("NY.GDP.MKTP.CN", {})
-                pair_wb = latest_common_year_pair(debt_wb, gdp_wb)
-                if pair_wb and pair_wb[2] != 0:
-                    y, debt_val, gdp_val = pair_wb
-                    debt_gdp_result = {
-                        "debt_value": debt_val,
-                        "gdp_value": gdp_val,
-                        "year": y,
-                        "debt_to_gdp": round((debt_val / gdp_val) * 100, 2),
-                        "source": "World Bank WDI",
-                        "government_type": "Central Government",
-                    }
-            except:
-                pass
-# Try IMF first
+        # Try IMF first
         try:
             debt_imf = raw_imf.get("GGXWDG", {})
             gdp_imf = raw_imf.get("NGDP", {})
@@ -451,50 +375,13 @@ def get_country_data(country: str = Query(..., description="Full country name, e
         unemployment_entry = extract_latest_numeric_entry(raw_imf.get("Unemployment (%)", {}))
         imf_data["Unemployment (%)"] = unemployment_entry or extract_wb_entry(raw_wb.get("SL.UEM.TOTL.ZS")) or {"value": None, "date": None, "source": None}
 
-        
         return {
             "country": country,
             "iso_codes": codes,
             "imf_data": imf_data,
-            "government_debt": ({
-                "latest": {
-                    "value": debt_gdp_result.get("debt_value"),
-                    "date": str(debt_gdp_result.get("year")),
-                    "source": debt_gdp_result.get("source"),
-                    "government_type": debt_gdp_result.get("government_type")
-                },
-                "series": {}
-            } if debt_gdp_result else {
-                "latest": {"value": None, "date": None, "source": None, "government_type": None},
-                "series": {}
-            }),
-            "nominal_gdp": ({
-                "latest": {
-                    "value": debt_gdp_result.get("gdp_value"),
-                    "date": str(debt_gdp_result.get("year")),
-                    "source": debt_gdp_result.get("source")
-                },
-                "series": {}
-            } if debt_gdp_result else {
-                "latest": {"value": None, "date": None, "source": None},
-                "series": {}
-            }),
-            "debt_to_gdp": ({
-                "latest": {
-                    "value": debt_gdp_result.get("debt_to_gdp"),
-                    "date": str(debt_gdp_result.get("year")),
-                    "source": debt_gdp_result.get("source"),
-                    "government_type": debt_gdp_result.get("government_type")
-                },
-                "series": {}
-            } if debt_gdp_result else {
-                "latest": {"value": None, "date": None, "source": None},
-                "series": {}
-            }),
+            "debt_to_gdp": debt_to_gdp or {"latest": {"value": None, "date": None, "source": None}, "series": {}},
             "additional_indicators": additional
         }
-
-
 
     except Exception as e:
         print(f"/country-data error: {e}")
