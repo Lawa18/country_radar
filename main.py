@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from datetime import datetime
 from functools import lru_cache
+import unicodedata
 
 app = FastAPI()
 
@@ -65,6 +66,23 @@ def extract_wb_entry(entries):
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
+
+# --- Country name normalization (aliases) ---
+ALIASES = {
+    "united mexican states": "mexico",
+    "u.s.": "united states",
+    "usa": "united states",
+    "u.s.a.": "united states",
+    "uk": "united kingdom",
+    "u.k.": "united kingdom",
+}
+
+def normalize_country_name(name: str) -> str:
+    if not isinstance(name, str):
+        return ""
+    s = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode("ascii")
+    s = s.strip().lower()
+    return ALIASES.get(s, s)
 
 def resolve_country_codes(name: str):
     try:
@@ -203,6 +221,36 @@ def fetch_worldbank_data(iso_alpha_2: str) -> Dict[str, Any]:
 
     return results
 
+@lru_cache(maxsize=256)
+def fetch_imf_weo_series(iso_alpha_3: str, indicators: list[str]) -> dict:
+    """
+    Fetch selected series from IMF DataMapper WEO dataset.
+    Returns {indicator: {year: value}} for the provided indicators.
+    """
+    results = {}
+    for code in indicators:
+        url = f"https://www.imf.org/external/datamapper/api/v1/WEO/{iso_alpha_3}/{code}"
+        try:
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            series = data.get(iso_alpha_3, {}).get(code, {})
+            # normalize keys to string years with float values
+            parsed = {}
+            for y, v in series.items():
+                try:
+                    if v is None: 
+                        continue
+                    yr = int(y)
+                    if yr >= datetime.today().year - 25:
+                        parsed[str(yr)] = float(v)
+                except:
+                    continue
+            results[code] = parsed
+        except Exception:
+            results[code] = {}
+    return results
+
 @app.get("/country-data")
 @app.head("/country-data")
 
@@ -219,6 +267,9 @@ def latest_common_year_pair(series_a: dict, series_b: dict):
         return None
 def get_country_data(country: str = Query(..., description="Full country name, e.g., Sweden")):
     try:
+
+        country_in = country
+        country = normalize_country_name(country_in)
         codes = resolve_country_codes(country)
         if not codes:
             return {"error": "Invalid country name"}
@@ -226,6 +277,18 @@ def get_country_data(country: str = Query(..., description="Full country name, e
         iso_alpha_2 = codes["iso_alpha_2"]
         raw_imf = fetch_imf_sdmx_series(iso_alpha_2)
         raw_wb = fetch_worldbank_data(iso_alpha_2)
+        # Also fetch IMF WEO series for General Gov Debt (GGXWDG) and Nominal GDP (NGDP)
+        try:
+            iso_alpha_3 = codes["iso_alpha_3"]
+            weo = fetch_imf_weo_series(iso_alpha_3, ["GGXWDG", "NGDP"])
+            # merge into raw_imf namespace expected by downstream logic
+            if isinstance(weo, dict):
+                for k in ["GGXWDG", "NGDP"]:
+                    if weo.get(k):
+                        raw_imf[k] = weo[k]
+        except Exception:
+            pass
+
 
                 
 
