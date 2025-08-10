@@ -8,6 +8,10 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from datetime import datetime
 from functools import lru_cache
+from typing import Optional
+from fastapi import Query
+from fastapi import Request
+
 
 app = FastAPI()
 
@@ -62,6 +66,47 @@ def extract_wb_entry(entries):
     except Exception:
         return None
 
+
+# ---- Additive Debt-to-GDP helpers (safe patch) ----
+@lru_cache(maxsize=256)
+def _fetch_imf_weo_series(iso_alpha_3: str, indicators: list[str]) -> dict:
+    """
+    IMF DataMapper WEO fetch. Returns {indicator: {year: value}}.
+    """
+    results = {}
+    for code in indicators:
+        url = f"https://www.imf.org/external/datamapper/api/v1/WEO/{iso_alpha_3}/{code}"
+        try:
+            r = requests.get(url, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            series = data.get(iso_alpha_3, {}).get(code, {})
+            cleaned = {}
+            for y, v in series.items():
+                try:
+                    if v is None:
+                        continue
+                    yr = int(str(y))
+                    if yr >= datetime.today().year - 25:
+                        cleaned[str(yr)] = float(v)
+                except Exception:
+                    continue
+            results[code] = cleaned
+        except Exception:
+            results[code] = {}
+    return results
+
+def _latest_common_year_pair(a: dict, b: dict):
+    try:
+        ya = {int(y): float(v) for y, v in a.items() if isinstance(v, (int, float, str)) and str(v).replace('.', '', 1).isdigit()}
+        yb = {int(y): float(v) for y, v in b.items() if isinstance(v, (int, float, str)) and str(v).replace('.', '', 1).isdigit()}
+        common = sorted(set(ya) & set(yb))
+        if not common:
+            return None
+        y = common[-1]
+        return (y, ya[y], yb[y])
+    except Exception:
+        return None
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
@@ -473,3 +518,90 @@ if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", 8000))  # Use Render's assigned port or fallback to 8000
     uvicorn.run("main:app", host="0.0.0.0", port=port)
+
+
+@app.get("/v1/debt")
+def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexico")):
+    """
+    Additive endpoint: returns government_debt, nominal_gdp, and debt_to_gdp (%).
+    IMF WEO preferred (GGXWDG + NGDP), fallback to World Bank (GC.DOD.TOTL.CN + NY.GDP.MKTP.CN).
+    """
+    codes = resolve_country_codes(country)
+    if not codes:
+        return {"error": "Invalid country name", "country": country}
+
+    iso2 = codes["iso_alpha_2"]
+    iso3 = codes["iso_alpha_3"]
+
+    debt_bundle = None
+
+    # 1) IMF WEO preferred path
+    try:
+        weo = _fetch_imf_weo_series(iso3, ["GGXWDG", "NGDP"])
+        pair = _latest_common_year_pair(weo.get("GGXWDG", {}), weo.get("NGDP", {}))
+        if pair and pair[2] != 0:
+            y, debt_val, gdp_val = pair
+            debt_bundle = {
+                "debt_value": debt_val,
+                "gdp_value": gdp_val,
+                "year": y,
+                "debt_to_gdp": round((debt_val / gdp_val) * 100, 2),
+                "source": "IMF WEO",
+                "government_type": "General Government",
+            }
+    except Exception:
+        pass
+
+    # 2) World Bank fallback (LCU)
+    if not debt_bundle:
+        try:
+            wb = fetch_worldbank_data(iso2)
+            debt_wb = wb.get("GC.DOD.TOTL.CN", {})
+            gdp_wb  = wb.get("NY.GDP.MKTP.CN", {})
+
+            def _wb_series_to_dict(entries):
+                out = {}
+                if isinstance(entries, list) and len(entries) > 1:
+                    for e in entries[1]:
+                        year = e.get("date")
+                        val = e.get("value")
+                        if year and val is not None:
+                            try:
+                                out[str(year)] = float(val)
+                            except Exception:
+                                continue
+                return out
+
+            d = _wb_series_to_dict(debt_wb)
+            g = _wb_series_to_dict(gdp_wb)
+            pair = _latest_common_year_pair(d, g)
+            if pair and pair[2] != 0:
+                y, debt_val, gdp_val = pair
+                debt_bundle = {
+                    "debt_value": debt_val,
+                    "gdp_value": gdp_val,
+                    "year": y,
+                    "debt_to_gdp": round((debt_val / gdp_val) * 100, 2),
+                    "source": "World Bank WDI",
+                    "government_type": "Central Government",
+                }
+        except Exception:
+            pass
+
+    return {
+        "country": country,
+        "iso_codes": codes,
+        "government_debt": (
+            {"value": debt_bundle["debt_value"], "date": str(debt_bundle["year"]), "source": debt_bundle["source"], "government_type": debt_bundle["government_type"]}
+            if debt_bundle else {"value": None, "date": None, "source": None, "government_type": None}
+        ),
+        "nominal_gdp": (
+            {"value": debt_bundle["gdp_value"], "date": str(debt_bundle["year"]), "source": debt_bundle["source"]}
+            if debt_bundle else {"value": None, "date": None, "source": None}
+        ),
+        "debt_to_gdp": (
+            {"value": debt_bundle["debt_to_gdp"], "date": str(debt_bundle["year"]), "source": debt_bundle["source"], "government_type": debt_bundle["government_type"]}
+            if debt_bundle else {"value": None, "date": None, "source": None}
+        ),
+    }
+
