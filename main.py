@@ -247,6 +247,17 @@ def fetch_worldbank_data(iso_alpha_2: str) -> Dict[str, Any]:
             results[code] = {"error": str(e)}
 
     return results
+    # Ensure LCU component series for compute fallback are fetched too
+    for forced_code in ["GC.DOD.TOTL.CN", "NY.GDP.MKTP.CN"]:
+        if forced_code not in results:
+            url = f"{base_url}/{iso_alpha_2}/indicator/{forced_code}?format=json&per_page=100"
+            try:
+                r = requests.get(url, timeout=10)
+                r.raise_for_status()
+                results[forced_code] = r.json()
+            except Exception as e:
+                results[forced_code] = {"error": str(e)}
+
 
 @app.get("/country-data")
 @app.head("/country-data")
@@ -509,3 +520,4 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
             if debt_bundle else {"value": None, "date": None, "source": None}
         ),
     }
+
