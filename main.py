@@ -250,6 +250,9 @@ def fetch_worldbank_data(iso_alpha_2: str) -> Dict[str, Any]:
 
 @app.get("/country-data")
 @app.head("/country-data")
+
+@app.get("/country-data")
+@app.head("/country-data")
 def get_country_data(country: str = Query(..., description="Full country name, e.g., Sweden")):
     try:
         codes = resolve_country_codes(country)
@@ -311,7 +314,7 @@ def get_country_data(country: str = Query(..., description="Full country name, e
             except:
                 return None
 
-        def get_debt_to_gdp_ratio_series(wb_dict):
+        def get_wb_debt_ratio_series(wb_dict):
             try:
                 entries = wb_dict.get("GC.DOD.TOTL.GD.ZS", [])
                 return extract_wb_series(entries)
@@ -351,66 +354,46 @@ def get_country_data(country: str = Query(..., description="Full country name, e
             "value": None, "date": None, "source": None
         }
 
-        # Debt to GDP (%) (WB ratio series only used as fallback for display)
-        wb_debt_ratio_series = get_debt_to_gdp_ratio_series(raw_wb)
+        # WB ratio series for history
+        wb_debt_ratio_series = get_wb_debt_ratio_series(raw_wb)
 
-        # ---------- NEW: merge in computed Debt bundle from /v1/debt ----------
-        # This ensures government_debt, nominal_gdp, and the ratio are calculated from debt/GDP using latest common year.
+        # ---------- Merge in computed Debt bundle from /v1/debt ----------
+        gov_debt = {"value": None, "date": None, "source": None, "government_type": None}
+        nom_gdp  = {"value": None, "date": None, "source": None}
+        debt_pct = {"value": None, "date": None, "source": None, "government_type": None}
         try:
-            debt_payload = v1_debt(country)  # call the new endpoint's function directly
-        except Exception:
-            debt_payload = None
+            bundle = v1_debt(country)  # use same in-process computation
+            if isinstance(bundle, dict):
+                if isinstance(bundle.get("government_debt"), dict):
+                    gd = bundle["government_debt"]
+                    gov_debt.update({k: gd.get(k) for k in gov_debt.keys()})
+                if isinstance(bundle.get("nominal_gdp"), dict):
+                    ng = bundle["nominal_gdp"]
+                    nom_gdp.update({k: ng.get(k) for k in nom_gdp.keys() if k in ng})
+                if isinstance(bundle.get("debt_to_gdp"), dict):
+                    dp = bundle["debt_to_gdp"]
+                    debt_pct.update({k: dp.get(k) for k in debt_pct.keys()})
+        except Exception as e:
+            print(f"[country-data] v1_debt merge failed: {e}")
 
-        # Build three fields with preference: computed bundle → WB ratio fallback → None
-        if debt_payload and isinstance(debt_payload, dict):
-            gov_debt = debt_payload.get("government_debt") or {"value": None, "date": None, "source": None, "government_type": None}
-            nom_gdp  = debt_payload.get("nominal_gdp")     or {"value": None, "date": None, "source": None}
-            debt_pct = debt_payload.get("debt_to_gdp")     or {"value": None, "date": None, "source": None, "government_type": None}
+        # If computed ratio missing, use WB latest ratio for display & history
+        if (not debt_pct["value"]) and wb_debt_ratio_series:
+            debt_pct.update({
+                "value": wb_debt_ratio_series["latest"]["value"],
+                "date": wb_debt_ratio_series["latest"]["date"],
+                "source": wb_debt_ratio_series["latest"]["source"],
+            })
+            debt_series_out = wb_debt_ratio_series.get("series", {})
         else:
-            gov_debt = {"value": None, "date": None, "source": None, "government_type": None}
-            nom_gdp  = {"value": None, "date": None, "source": None}
-            if wb_debt_ratio_series:
-                debt_pct = {
-                    "value": wb_debt_ratio_series["latest"]["value"],
-                    "date": wb_debt_ratio_series["latest"]["date"],
-                    "source": wb_debt_ratio_series["latest"]["source"],
-                    "government_type": None,
-                }
-            else:
-                debt_pct = {"value": None, "date": None, "source": None, "government_type": None}
-        # ----------------------------------------------------------------------
+            debt_series_out = wb_debt_ratio_series.get("series", {}) if wb_debt_ratio_series else {}
 
-        # Final payload
         return {
             "country": country,
             "iso_codes": codes,
             "imf_data": imf_data,
-            "government_debt": {
-                "latest": {
-                    "value": gov_debt["value"],
-                    "date": gov_debt["date"],
-                    "source": gov_debt["source"],
-                    "government_type": gov_debt.get("government_type"),
-                },
-                "series": {}
-            },
-            "nominal_gdp": {
-                "latest": {
-                    "value": nom_gdp["value"],
-                    "date": nom_gdp["date"],
-                    "source": nom_gdp["source"],
-                },
-                "series": {}
-            },
-            "debt_to_gdp": {
-                "latest": {
-                    "value": debt_pct["value"],
-                    "date": debt_pct["date"],
-                    "source": debt_pct["source"],
-                    "government_type": debt_pct.get("government_type"),
-                },
-                "series": wb_debt_ratio_series["series"] if wb_debt_ratio_series and wb_debt_ratio_series.get("series") else {}
-            },
+            "government_debt": {"latest": {**gov_debt}, "series": {}},
+            "nominal_gdp":     {"latest": {**nom_gdp}, "series": {}},
+            "debt_to_gdp":     {"latest": {**debt_pct}, "series": debt_series_out},
             "additional_indicators": additional
         }
 
@@ -418,70 +401,6 @@ def get_country_data(country: str = Query(..., description="Full country name, e
         print(f"/country-data error: {e}")
         return {"error": str(e), "country": country}
 
-# @app.get("/chart")
-# @app.head("/chart")
-# def get_chart(country: str, type: str, years: int = 5):
-#     codes = resolve_country_codes(country)
-#     if not codes:
-#         return Response(content="Invalid country name", media_type="text/plain", status_code=400)
-# 
-#     iso_alpha_3 = codes["iso_alpha_3"]
-#     end_year = datetime.today().year
-#     start_year = end_year - years
-# 
-#     datamapper_codes = {
-#         "inflation": ["PCPIPCH", "PCPIEPCH"],
-#         "fx_rate": ["ENDA_XDC_USD_RATE"],
-#         "interest_rate": ["FIMM_PA", "FIDSR", "FILR_PA"]
-#     }
-# 
-#     if type not in datamapper_codes:
-#         return Response(content="Invalid chart type", media_type="text/plain", status_code=400)
-# 
-#     for indicator_code in datamapper_codes[type]:
-#         url = f"https://www.imf.org/external/datamapper/api/v1/IFS/{iso_alpha_3}/{indicator_code}"
-#         try:
-#             r = requests.get(url, timeout=10)
-#             r.raise_for_status()
-#             data = r.json()
-# 
-#             values = data.get(indicator_code, {}).get(iso_alpha_3)
-#             if not values:
-#                 continue
-# 
-#             records = []
-#             for year_str, val in values.items():
-#                 try:
-#                     year = int(year_str)
-#                     if start_year <= year <= end_year and isinstance(val, (int, float, str)) and str(val).replace('.', '', 1).isdigit():
-#                         records.append((datetime(year, 1, 1), float(val)))
-#                 except:
-#                     continue
-# 
-#             if records:
-#                 records.sort()
-#                 dates, values = zip(*records)
-# 
-#                 plt.figure(figsize=(10, 5))
-#                 plt.plot(dates, values, marker='o', linewidth=2)
-#                 plt.title(f"{indicator_code} – {country} ({dates[0].year}–{dates[-1].year})")
-#                 plt.xlabel("Date")
-#                 plt.ylabel(indicator_code)
-#                 plt.grid(True)
-#                 plt.tight_layout()
-# 
-#                 img_bytes = io.BytesIO()
-#                 plt.savefig(img_bytes, format="png")
-#                 plt.close()
-#                 img_bytes.seek(0)
-#                 return Response(content=img_bytes.read(), media_type="image/png")
-# 
-#         except Exception as e:
-#             print(f"/chart error for {country} {indicator_code}: {e}")
-#             continue
-# 
-#     return Response(content="No data available", media_type="text/plain", status_code=404)
-#     
 @app.get("/test-imf-series")
 def test_imf_series(country: str, indicator: str):
     codes = resolve_country_codes(country)
@@ -590,4 +509,3 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
             if debt_bundle else {"value": None, "date": None, "source": None}
         ),
     }
-
