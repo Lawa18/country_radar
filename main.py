@@ -254,102 +254,23 @@ def get_country_data(country: str = Query(..., description="Full country name, e
     try:
         codes = resolve_country_codes(country)
         if not codes:
-            return {
-    "country": country,
-    "iso_codes": codes,
-    "imf_data": imf_data,
-    "government_debt": ({
-        "value": debt_bundle.get("debt_value"),
-        "date": str(debt_bundle.get("year")),
-        "source": debt_bundle.get("source"),
-        "government_type": debt_bundle.get("government_type")
-    } if debt_bundle else {
-        "value": None, "date": None, "source": None, "government_type": None
-    }),
-    "nominal_gdp": ({
-        "value": debt_bundle.get("gdp_value"),
-        "date": str(debt_bundle.get("year")),
-        "source": debt_bundle.get("source")
-    } if debt_bundle else {
-        "value": None, "date": None, "source": None
-    }),
-    "debt_to_gdp": ({
-        "latest": {
-            "value": debt_bundle.get("debt_to_gdp"),
-            "date": str(debt_bundle.get("year")),
-            "source": debt_bundle.get("source"),
-            "government_type": debt_bundle.get("government_type")
-        },
-        "series": {}
-    } if debt_bundle else (debt_to_gdp or {
-        "latest": {"value": None, "date": None, "source": None},
-        "series": {}
-    })),
-    "additional_indicators": additional
-}
-
+            return {"error": "Invalid country name", "country": country}
 
         iso_alpha_2 = codes["iso_alpha_2"]
         raw_imf = fetch_imf_sdmx_series(iso_alpha_2)
         raw_wb = fetch_worldbank_data(iso_alpha_2)
 
-        # --- Debt-to-GDP Calculation Patch ---
-        debt_gdp_result = {}
-
-        # Try IMF first
-        try:
-            debt_imf = raw_imf.get("GGXWDG", {})
-            gdp_imf = raw_imf.get("NGDP", {})
-            if debt_imf and gdp_imf:
-                debt_latest = extract_latest_recent_entry(debt_imf)
-                gdp_latest = extract_latest_recent_entry(gdp_imf)
-                if debt_latest and gdp_latest and debt_latest[0] == gdp_latest[0] and gdp_latest[1] != 0:
-                    ratio = (debt_latest[1] / gdp_latest[1]) * 100
-                    debt_gdp_result = {
-                        "debt_value": debt_latest[1],
-                        "gdp_value": gdp_latest[1],
-                        "year": debt_latest[0],
-                        "debt_to_gdp": round(ratio, 2),
-                        "source": "IMF WEO",
-                        "government_type": "General Government"
-                    }
-        except:
-            pass
-
-        # If IMF missing or mismatched, try WB
-        if not debt_gdp_result:
-            try:
-                debt_wb = raw_wb.get("GC.DOD.TOTL.CN", {})
-                gdp_wb = raw_wb.get("NY.GDP.MKTP.CN", {})
-                if debt_wb and gdp_wb:
-                    debt_latest = extract_latest_recent_entry(debt_wb)
-                    gdp_latest = extract_latest_recent_entry(gdp_wb)
-                    if debt_latest and gdp_latest and debt_latest[0] == gdp_latest[0] and gdp_latest[1] != 0:
-                        ratio = (debt_latest[1] / gdp_latest[1]) * 100
-                        debt_gdp_result = {
-                            "debt_value": debt_latest[1],
-                            "gdp_value": gdp_latest[1],
-                            "year": debt_latest[0],
-                            "debt_to_gdp": round(ratio, 2),
-                            "source": "World Bank WDI",
-                            "government_type": "Central Government"
-                        }
-            except:
-                pass
-
+        # ---------- helpers (local to this route) ----------
         def extract_latest_and_series(entry_dict):
             try:
-                pairs = [(int(year), float(val)) for year, val in entry_dict.items() if str(val).replace('.', '', 1).isdigit()]
+                pairs = [(int(y), float(v)) for y, v in entry_dict.items()
+                         if isinstance(v, (float, int, str)) and str(v).replace('.', '', 1).isdigit()]
                 if not pairs:
                     return None
-                latest = max(pairs, key=lambda x: x[0])
+                latest_y, latest_v = max(pairs, key=lambda x: x[0])
                 return {
-                    "latest": {
-                        "value": latest[1],
-                        "date": str(latest[0]),
-                        "source": "IMF"
-                    },
-                    "series": {str(year): val for year, val in sorted(pairs, reverse=True)}
+                    "latest": {"value": latest_v, "date": str(latest_y), "source": "IMF"},
+                    "series": {str(y): v for y, v in sorted(pairs, reverse=True)}
                 }
             except:
                 return None
@@ -359,31 +280,46 @@ def get_country_data(country: str = Query(..., description="Full country name, e
                 if isinstance(entries, list) and len(entries) > 1:
                     series = {}
                     for e in entries[1]:
-                        year = e.get("date")
-                        val = e.get("value")
-                        if year and val is not None:
-                            series[year] = val
+                        y = e.get("date")
+                        v = e.get("value")
+                        if y and v is not None:
+                            series[str(y)] = float(v)
                     if not series:
                         return None
-                    latest_year = max(series.keys())
+                    latest_y = max(series.keys())
                     return {
-                        "latest": {
-                            "value": series[latest_year],
-                            "date": latest_year,
-                            "source": "World Bank"
-                        },
+                        "latest": {"value": series[latest_y], "date": latest_y, "source": "World Bank"},
                         "series": dict(sorted(series.items(), reverse=True))
                     }
             except:
                 return None
 
-        def get_debt_to_gdp(wb_data):
+        def extract_wb_entry(entries):
+            parsed = extract_wb_series(entries)
+            if not parsed:
+                return None
+            return {"value": parsed["latest"]["value"], "date": parsed["latest"]["date"], "source": parsed["latest"]["source"]}
+
+        def extract_latest_numeric_entry(entry_dict):
             try:
-                entries = wb_data.get("GC.DOD.TOTL.GD.ZS", [])
-                return extract_wb_series(entries)
+                pairs = [(int(y), float(v)) for y, v in entry_dict.items()
+                         if isinstance(v, (float, int, str)) and str(v).replace('.', '', 1).isdigit()]
+                if not pairs:
+                    return None
+                latest_y, latest_v = max(pairs, key=lambda x: x[0])
+                return {"value": latest_v, "date": str(latest_y), "source": "IMF"}
             except:
                 return None
 
+        def get_debt_to_gdp_ratio_series(wb_dict):
+            try:
+                entries = wb_dict.get("GC.DOD.TOTL.GD.ZS", [])
+                return extract_wb_series(entries)
+            except:
+                return None
+        # ---------------------------------------------------
+
+        # IMF-first indicators with WB fallbacks (unchanged)
         imf_data = {}
         indicators = {
             "CPI": ("CPI", "FP.CPI.TOTL.ZG"),
@@ -391,14 +327,15 @@ def get_country_data(country: str = Query(..., description="Full country name, e
             "Interest Rate": ("Interest Rate", "FR.INR.RINR"),
             "Reserves (USD)": ("Reserves (USD)", "FI.RES.TOTL.CD")
         }
-
         for key, (imf_key, wb_code) in indicators.items():
             imf_entry = extract_latest_and_series(raw_imf.get(imf_key, {}))
             wb_entry = extract_wb_series(raw_wb.get(wb_code))
-            imf_data[key] = imf_entry or wb_entry or {"latest": {"value": None, "date": None, "source": None}, "series": {}}
+            imf_data[key] = imf_entry or wb_entry or {
+                "latest": {"value": None, "date": None, "source": None},
+                "series": {}
+            }
 
-        debt_to_gdp = get_debt_to_gdp(raw_wb)
-
+        # Additional indicators (unchanged)
         additional = {}
         for code in ADDITIONAL_INDICATORS:
             entries = raw_wb.get(code)
@@ -408,29 +345,78 @@ def get_country_data(country: str = Query(..., description="Full country name, e
                     label = WB_INDICATORS.get(code, code)
                     additional[label] = parsed
 
-        # GDP Growth (%)
+        # GDP Growth (%) – prefer IMF, else WB
         gdp_growth_entry = extract_latest_numeric_entry(raw_imf.get("GDP Growth (%)", {}))
-        imf_data["GDP Growth (%)"] = gdp_growth_entry or extract_wb_entry(raw_wb.get("NY.GDP.MKTP.KD.ZG")) or {"value": None, "date": None, "source": None}
+        imf_data["GDP Growth (%)"] = gdp_growth_entry or extract_wb_entry(raw_wb.get("NY.GDP.MKTP.KD.ZG")) or {
+            "value": None, "date": None, "source": None
+        }
 
-        # Debt to GDP (%)
-        debt_entry = extract_latest_numeric_entry(raw_imf.get("Debt to GDP (%)", {}))
-        imf_data["Debt to GDP (%)"] = debt_entry or extract_wb_entry(raw_wb.get("GC.DOD.TOTL.GD.ZS")) or {"value": None, "date": None, "source": None}
+        # Debt to GDP (%) (WB ratio series only used as fallback for display)
+        wb_debt_ratio_series = get_debt_to_gdp_ratio_series(raw_wb)
 
-        # Unemployment (%)
-        unemployment_entry = extract_latest_numeric_entry(raw_imf.get("Unemployment (%)", {}))
-        imf_data["Unemployment (%)"] = unemployment_entry or extract_wb_entry(raw_wb.get("SL.UEM.TOTL.ZS")) or {"value": None, "date": None, "source": None}
+        # ---------- NEW: merge in computed Debt bundle from /v1/debt ----------
+        # This ensures government_debt, nominal_gdp, and the ratio are calculated from debt/GDP using latest common year.
+        try:
+            debt_payload = v1_debt(country)  # call the new endpoint's function directly
+        except Exception:
+            debt_payload = None
 
+        # Build three fields with preference: computed bundle → WB ratio fallback → None
+        if debt_payload and isinstance(debt_payload, dict):
+            gov_debt = debt_payload.get("government_debt") or {"value": None, "date": None, "source": None, "government_type": None}
+            nom_gdp  = debt_payload.get("nominal_gdp")     or {"value": None, "date": None, "source": None}
+            debt_pct = debt_payload.get("debt_to_gdp")     or {"value": None, "date": None, "source": None, "government_type": None}
+        else:
+            gov_debt = {"value": None, "date": None, "source": None, "government_type": None}
+            nom_gdp  = {"value": None, "date": None, "source": None}
+            if wb_debt_ratio_series:
+                debt_pct = {
+                    "value": wb_debt_ratio_series["latest"]["value"],
+                    "date": wb_debt_ratio_series["latest"]["date"],
+                    "source": wb_debt_ratio_series["latest"]["source"],
+                    "government_type": None,
+                }
+            else:
+                debt_pct = {"value": None, "date": None, "source": None, "government_type": None}
+        # ----------------------------------------------------------------------
+
+        # Final payload
         return {
             "country": country,
             "iso_codes": codes,
             "imf_data": imf_data,
-            "debt_to_gdp": debt_to_gdp or {"latest": {"value": None, "date": None, "source": None}, "series": {}},
+            "government_debt": {
+                "latest": {
+                    "value": gov_debt["value"],
+                    "date": gov_debt["date"],
+                    "source": gov_debt["source"],
+                    "government_type": gov_debt.get("government_type"),
+                },
+                "series": {}
+            },
+            "nominal_gdp": {
+                "latest": {
+                    "value": nom_gdp["value"],
+                    "date": nom_gdp["date"],
+                    "source": nom_gdp["source"],
+                },
+                "series": {}
+            },
+            "debt_to_gdp": {
+                "latest": {
+                    "value": debt_pct["value"],
+                    "date": debt_pct["date"],
+                    "source": debt_pct["source"],
+                    "government_type": debt_pct.get("government_type"),
+                },
+                "series": wb_debt_ratio_series["series"] if wb_debt_ratio_series and wb_debt_ratio_series.get("series") else {}
+            },
             "additional_indicators": additional
         }
 
     except Exception as e:
         print(f"/country-data error: {e}")
-        return {"error": str(e)}
+        return {"error": str(e), "country": country}
 
 # @app.get("/chart")
 # @app.head("/chart")
