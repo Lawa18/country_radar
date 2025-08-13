@@ -504,30 +504,29 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
         pass
 
     # 2) World Bank fallback (LCU)
-    # World Bank fallback (LCU)
     if not bundle:
-    try:
-        wb = fetch_worldbank_data(iso2)
+        try:
+            wb = fetch_worldbank_data(iso2)
 
-        debt_raw = wb.get("GC.DOD.TOTL.CN")    # raw WB payload (list)
-        gdp_raw  = wb.get("NY.GDP.MKTP.CN")    # raw WB payload (list)
+            debt_raw = wb.get("GC.DOD.TOTL.CN")    # raw WB payload (list)
+            gdp_raw  = wb.get("NY.GDP.MKTP.CN")    # raw WB payload (list)
 
-        debt_dict = wb_year_dict_from_raw(debt_raw)
-        gdp_dict  = wb_year_dict_from_raw(gdp_raw)
+            debt_dict = wb_year_dict_from_raw(debt_raw)
+            gdp_dict  = wb_year_dict_from_raw(gdp_raw)
 
-        pair = latest_common_year_pair(debt_dict, gdp_dict)
-        if pair and pair[2] != 0:
-            y, debt_v, gdp_v = pair
-            bundle = {
-                "debt_value": debt_v,
-                "gdp_value": gdp_v,
-                "year": y,
-                "debt_to_gdp": round((debt_v / gdp_v) * 100, 2),
-                "source": "World Bank WDI",
-                "government_type": "Central Government"
-            }
-    except:
-        pass
+            pair = latest_common_year_pair(debt_dict, gdp_dict)
+            if pair and pair[2] != 0:
+                y, debt_v, gdp_v = pair
+                bundle = {
+                    "debt_value": debt_v,
+                    "gdp_value": gdp_v,
+                    "year": y,
+                    "debt_to_gdp": round((debt_v / gdp_v) * 100, 2),
+                    "source": "World Bank WDI",
+                    "government_type": "Central Government"
+                }
+        except:
+            pass
 
             def _wb_series_to_dict(entries):
                 out = {}
