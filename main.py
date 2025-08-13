@@ -51,6 +51,25 @@ def extract_latest_numeric_entry(entry_dict):
     except Exception:
         return None
 
+def wb_year_dict_from_raw(entries):
+    """
+    Accepts the raw World Bank JSON payload your fetch_worldbank_data() returns
+    (which is typically a list: [metadata, [{date: 'YYYY', value: <num>}, ...]]).
+    Returns a { 'YYYY': float(value) } dict.
+    """
+    try:
+        if isinstance(entries, list) and len(entries) > 1:
+            out = {}
+            for row in entries[1]:
+                y = row.get("date")
+                v = row.get("value")
+                if y and v is not None:
+                    out[str(y)] = float(v)
+            return out
+    except:
+        pass
+    return {}
+
 def extract_wb_entry(entries):
     try:
         if isinstance(entries, list) and len(entries) > 1:
@@ -110,6 +129,23 @@ def _latest_common_year_pair(a: dict, b: dict):
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
+
+@app.get("/debug/debt")
+def debug_debt(country: str = Query(...)):
+    codes = resolve_country_codes(country)
+    if not codes:
+        return {"error": "invalid country"}
+    iso2 = codes["iso_alpha_2"]
+    wb = fetch_worldbank_data(iso2)
+    debt_years = sorted(map(int, wb_year_dict_from_raw(wb.get("GC.DOD.TOTL.CN")).keys()))
+    gdp_years  = sorted(map(int, wb_year_dict_from_raw(wb.get("NY.GDP.MKTP.CN")).keys()))
+    common = sorted(set(debt_years) & set(gdp_years))
+    return {
+        "iso2": iso2,
+        "debt_years": debt_years[-10:],
+        "gdp_years": gdp_years[-10:],
+        "latest_common_year": (common[-1] if common else None)
+    }
 
 def resolve_country_codes(name: str):
     try:
@@ -435,7 +471,6 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))  # Use Render's assigned port or fallback to 8000
     uvicorn.run("main:app", host="0.0.0.0", port=port)
 
-
 @app.get("/v1/debt")
 def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexico")):
     """
@@ -469,11 +504,30 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
         pass
 
     # 2) World Bank fallback (LCU)
-    if not debt_bundle:
-        try:
-            wb = fetch_worldbank_data(iso2)
-            debt_wb = wb.get("GC.DOD.TOTL.CN", {})
-            gdp_wb  = wb.get("NY.GDP.MKTP.CN", {})
+    # World Bank fallback (LCU)
+    if not bundle:
+    try:
+        wb = fetch_worldbank_data(iso2)
+
+        debt_raw = wb.get("GC.DOD.TOTL.CN")    # raw WB payload (list)
+        gdp_raw  = wb.get("NY.GDP.MKTP.CN")    # raw WB payload (list)
+
+        debt_dict = wb_year_dict_from_raw(debt_raw)
+        gdp_dict  = wb_year_dict_from_raw(gdp_raw)
+
+        pair = latest_common_year_pair(debt_dict, gdp_dict)
+        if pair and pair[2] != 0:
+            y, debt_v, gdp_v = pair
+            bundle = {
+                "debt_value": debt_v,
+                "gdp_value": gdp_v,
+                "year": y,
+                "debt_to_gdp": round((debt_v / gdp_v) * 100, 2),
+                "source": "World Bank WDI",
+                "government_type": "Central Government"
+            }
+    except:
+        pass
 
             def _wb_series_to_dict(entries):
                 out = {}
