@@ -270,9 +270,18 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
     # 2) World Bank fallback (LCU)
     if not bundle:
         try:
-            wb = fetch_worldbank_data(iso2)
-            debt_dict = wb_year_dict_from_raw(wb.get("GC.DOD.TOTL.CN"))
-            gdp_dict  = wb_year_dict_from_raw(wb.get("NY.GDP.MKTP.CN"))
+            # Try ISO-3 first for better coverage; fall back to ISO-2
+            wb = fetch_worldbank_data(codes["iso_alpha_3"]) or fetch_worldbank_data(iso2)
+
+            # Raw WB payloads (list-shaped)
+            debt_raw = wb.get("GC.DOD.TOTL.CN")
+            gdp_raw  = wb.get("NY.GDP.MKTP.CN")
+
+            # Parse into { 'YYYY': float(value) }
+            debt_dict = wb_year_dict_from_raw(debt_raw)
+            gdp_dict  = wb_year_dict_from_raw(gdp_raw)
+
+            # A) Pure compute from components (preferred)
             pair = latest_common_year_pair(debt_dict, gdp_dict)
             if pair and pair[2] != 0:
                 y, debt_v, gdp_v = pair
@@ -284,6 +293,22 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
                     "source": "World Bank WDI",
                     "government_type": "Central Government"
                 }
+            else:
+                # B) Ratio-assisted compute when LCU debt is missing
+                ratio_raw  = wb.get("GC.DOD.TOTL.GD.ZS")
+                ratio_dict = wb_year_dict_from_raw(ratio_raw)
+                pair_ratio = latest_common_year_pair(ratio_dict, gdp_dict)
+                if pair_ratio and pair_ratio[2] != 0:
+                    y, ratio_pct, gdp_v = pair_ratio
+                    debt_v = (ratio_pct / 100.0) * gdp_v
+                    bundle = {
+                        "debt_value": debt_v,
+                        "gdp_value": gdp_v,
+                        "year": y,
+                        "debt_to_gdp": round(ratio_pct, 2),
+                        "source": "World Bank WDI (ratio-assisted)",
+                        "government_type": "Central Government"
+                    }
         except Exception:
             pass
 
