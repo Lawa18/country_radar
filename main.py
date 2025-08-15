@@ -1,4 +1,3 @@
-
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from functools import lru_cache
