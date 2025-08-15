@@ -322,6 +322,30 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
             print(f"[v1_debt] WB step failed: {e}")
             # leave bundle as None
 
+    # 3) World Bank USD-components fallback (currency-invariant ratio)
+    if not bundle:
+        try:
+            debt_usd_raw = wb.get("GC.DOD.TOTL.CD")
+            gdp_usd_raw  = wb.get("NY.GDP.MKTP.CD")
+
+            debt_usd_dict = wb_year_dict_from_raw(debt_usd_raw)
+            gdp_usd_dict  = wb_year_dict_from_raw(gdp_usd_raw)
+
+            pair_usd = latest_common_year_pair(debt_usd_dict, gdp_usd_dict)
+            if pair_usd and pair_usd[2] != 0:
+                y, debt_v, gdp_v = pair_usd
+                bundle = {
+                    "debt_value": debt_v,
+                    "gdp_value": gdp_v,
+                    "year": y,
+                    "debt_to_gdp": round((debt_v / gdp_v) * 100, 2),
+                    "source": "World Bank WDI (USD components)",
+                    "government_type": "Central Government"
+                }
+        except Exception as e:
+            print(f"[Debt USD Fallback] Error: {e}")
+            pass
+    
     return {
         "country": country,
         "iso_codes": codes,
