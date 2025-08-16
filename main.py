@@ -578,22 +578,34 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
         "series": (wb_debt_ratio_hist.get("series") if wb_debt_ratio_hist else {})
     }
     
-    # 5) Use these in your final return:
+    
+# Ensure currency_code is filled if missing
+try:
+    if government_debt_out.get("currency") == "LCU" and not government_debt_out.get("currency_code"):
+        government_debt_out["currency_code"] = resolve_currency_code(iso2)
+    if nominal_gdp_out.get("currency") == "LCU" and not nominal_gdp_out.get("currency_code"):
+        nominal_gdp_out["currency_code"] = resolve_currency_code(iso2)
+    if government_debt_out.get("currency") == "USD" and not government_debt_out.get("currency_code"):
+        government_debt_out["currency_code"] = "USD"
+    if nominal_gdp_out.get("currency") == "USD" and not nominal_gdp_out.get("currency_code"):
+        nominal_gdp_out["currency_code"] = "USD"
+except Exception:
+    pass
+
+# 5) Use these in your final return:
+
     # "government_debt": {"latest": government_debt_out, "series": (es_gd if es_gd else {})},
     # "nominal_gdp": {"latest": nominal_gdp_out, "series": (es_gdp if es_gdp else {})},
     # "debt_to_gdp": debt_to_gdp_out,
         
     
-# If Eurostat series were produced in /v1/debt, attach them; else keep WB ratio series only
-try:
-    if 'eurostat_series_cache' in locals():
-        es_gd = eurostat_series_cache.get('government_debt_series') or {}
-        es_gdp = eurostat_series_cache.get('nominal_gdp_series') or {}
-    else:
-        es_gd, es_gdp = {}, {}
-except Exception:
-    es_gd, es_gdp = {}, {}
-return JSONResponse(content={
+
+# Attach Eurostat series from v1_debt (if present)
+eurostat_series = trio.get("eurostat_series", {}) if isinstance(trio, dict) else {}
+es_gd = eurostat_series.get("government_debt_series", {})
+es_gdp = eurostat_series.get("nominal_gdp_series", {})
+
+    return JSONResponse(content={
         "country": country,
         "iso_codes": codes,
         "imf_data": imf_data,
@@ -601,7 +613,7 @@ return JSONResponse(content={
         "nominal_gdp": {"latest": nominal_gdp_out, "series": (es_gdp if es_gdp else {})},
         "debt_to_gdp": {
             "path_used": (trio.get("path_used") if isinstance(trio, dict) else None),
-            "latest": debt_to_gdp_out,
+            "latest": {**debt_to_gdp_out, **({"path_used": trio.get("debt_to_gdp", {}).get("path_used")} if isinstance(trio, dict) else {})},
             "series": wb_debt_ratio_hist.get("series") if wb_debt_ratio_hist else {}
         },
         "additional_indicators": {}
