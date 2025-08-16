@@ -36,8 +36,15 @@ def normalize_country_name(name: str) -> str:
     s = s.strip().lower()
     return ALIASES.get(s, s)
 
-def resolve_country_codes(name: str) -> Optional[Dict[str, str]]:
 
+def resolve_country_codes(name: str) -> Optional[Dict[str, str]]:
+    """Normalize a human country name/alias to ISO-2/ISO-3 codes using pycountry."""
+    try:
+        nm = normalize_country_name(name)
+        country = pycountry.countries.lookup(nm or name)
+        return {"iso_alpha_2": country.alpha_2, "iso_alpha_3": country.alpha_3}
+    except LookupError:
+        return None
 
 # --- Dynamic currency code via World Bank country metadata (cached) ---
 @lru_cache(maxsize=512)
@@ -474,17 +481,11 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
     # 1) Define safe defaults for the 'latest' blocks
     gov_debt_latest = {
         "value": None, "date": None, "source": None,
-        "government_type": None, "currency": None
-    
-        "currency": None,
-        "currency_code": None,
+        "government_type": None, "currency": None, "currency_code": None,
     }
     nom_gdp_latest = {
         "value": None, "date": None, "source": None,
-        "currency": None
-    
-        "currency": None,
-        "currency_code": None,
+        "currency": None, "currency_code": None,
     }
     debt_pct_latest = {
         "value": None, "date": None, "source": None,
