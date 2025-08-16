@@ -468,27 +468,27 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
 
         # IMF + WB raw fetch
         raw_imf = fetch_imf_sdmx_series(iso_alpha_2)
-        raw_wb = fetch_worldbank_data(iso_alpha_2)
+        raw_wb  = fetch_worldbank_data(iso_alpha_2, iso_alpha_3)  # <-- fix: pass both iso2 & iso3
 
-        # Debt bundle (with Eurostat if available)
-        debt_bundle = fetch_debt_to_gdp(iso_alpha_2, iso_alpha_3)
+        # Debt bundle (uses your existing /v1/debt logic, incl. Eurostat when available)
+        debt_bundle = v1_debt(country)  # <-- fix: call v1_debt instead of fetch_debt_to_gdp
 
-        gov_debt_latest = debt_bundle.get("government_debt", {}).get("latest", {})
-        nom_gdp_latest = debt_bundle.get("nominal_gdp", {}).get("latest", {})
-        debt_pct_latest = debt_bundle.get("debt_to_gdp", {}).get("latest", {})
+        gov_debt_latest = debt_bundle.get("government_debt", {}).get("latest", {}) if isinstance(debt_bundle, dict) else {}
+        nom_gdp_latest  = debt_bundle.get("nominal_gdp", {}).get("latest", {})    if isinstance(debt_bundle, dict) else {}
+        debt_pct_latest = debt_bundle.get("debt_to_gdp",  {}).get("latest", {})   if isinstance(debt_bundle, dict) else {}
 
-        es_gd = debt_bundle.get("government_debt", {}).get("series", {})
-        es_gdp = debt_bundle.get("nominal_gdp", {}).get("series", {})
-        debt_ratio_series = debt_bundle.get("debt_to_gdp", {}).get("series", {})
+        es_gd = debt_bundle.get("government_debt", {}).get("series", {}) if isinstance(debt_bundle, dict) else {}
+        es_gdp = debt_bundle.get("nominal_gdp", {}).get("series", {})     if isinstance(debt_bundle, dict) else {}
+        debt_ratio_series = debt_bundle.get("debt_to_gdp", {}).get("series", {})  if isinstance(debt_bundle, dict) else {}
 
-        # Pack IMF/WB core indicators
+        # Pack IMF/WB core indicators (keep your existing keys/structure as-is)
         imf_data = {
-            "inflation": raw_imf.get("inflation"),
-            "interest_rate": raw_imf.get("interest_rate"),
-            "fx_rate": raw_imf.get("fx_rate"),
-            "gdp_growth": raw_imf.get("gdp_growth"),
-            "reserves": raw_imf.get("reserves"),
-            "unemployment": raw_imf.get("unemployment"),
+            "inflation":       raw_imf.get("inflation"),
+            "interest_rate":   raw_imf.get("interest_rate"),
+            "fx_rate":         raw_imf.get("fx_rate"),
+            "gdp_growth":      raw_imf.get("gdp_growth"),
+            "reserves":        raw_imf.get("reserves"),
+            "unemployment":    raw_imf.get("unemployment"),
             "current_account": raw_imf.get("current_account"),
         }
 
