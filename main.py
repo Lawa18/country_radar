@@ -37,15 +37,6 @@ def normalize_country_name(name: str) -> str:
     return ALIASES.get(s, s)
 
 def resolve_country_codes(name: str) -> Optional[Dict[str, str]]:
-    """Normalize a human country name/alias to ISO-2/ISO-3 codes using pycountry.
-    Returns dict like {"iso_alpha_2": "SE", "iso_alpha_3": "SWE"} or None if not found.
-    """
-    try:
-        nm = normalize_country_name(name)
-        country = pycountry.countries.lookup(nm or name)
-        return {"iso_alpha_2": country.alpha_2, "iso_alpha_3": country.alpha_3}
-    except LookupError:
-        return None
 
 
 # --- Dynamic currency code via World Bank country metadata (cached) ---
@@ -403,12 +394,11 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
             {"value": bundle["debt_value"], "date": str(bundle["year"]), 
              "source": bundle["source"], "government_type": bundle["government_type"],
              "currency": bundle.get("currency")} 
-            if bundle else {"value": None, "date": None, "source": None, "government_type": None "currency": None, "currency_code": None,}
+            if bundle else {"value": None, "date": None, "source": None, "government_type": None, "currency": None, "currency_code": None,}
         ),
         "nominal_gdp": (
-            {"value": bundle["gdp_value"], "date": str(bundle["year"]), "source": bundle["source"],
-             "source": bundle["source"], "currency": bundle.get("currency")} 
-            if bundle else {"value": None, "date": None, "source": None "currency": None, "currency_code": None,}
+            {"value": bundle["gdp_value"], "date": str(bundle["year"]), "source": bundle["source"], "currency": bundle.get("currency")} 
+            if bundle else {"value": None, "date": None, "source": None, "currency": None, "currency_code": None,}
         ),
         "debt_to_gdp": (
             {"value": bundle["debt_to_gdp"], "date": str(bundle["year"]), 
