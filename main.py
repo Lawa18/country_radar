@@ -547,6 +547,16 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
             # "government_type": "Central Government"
         })
     
+    # Ensure currency_code is filled if missing
+    if gov_debt_latest.get("currency") == "LCU" and not gov_debt_latest.get("currency_code"):
+        gov_debt_latest["currency_code"] = resolve_currency_code(iso2)
+    if nom_gdp_latest.get("currency") == "LCU" and not nom_gdp_latest.get("currency_code"):
+        nom_gdp_latest["currency_code"] = resolve_currency_code(iso2)
+    if gov_debt_latest.get("currency") == "USD" and not gov_debt_latest.get("currency_code"):
+        gov_debt_latest["currency_code"] = "USD"
+    if nom_gdp_latest.get("currency") == "USD" and not nom_gdp_latest.get("currency_code"):
+        nom_gdp_latest["currency_code"] = "USD"
+
     # 4) Build the exact schema your GPT expects (latest + series)
     government_debt_out = {"latest": gov_debt_latest, "series": {}}
     nominal_gdp_out     = {"latest": nom_gdp_latest, "series": {}}
