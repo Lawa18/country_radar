@@ -15,6 +15,24 @@ CURRENCY_CODE = {
     # "BR": "BRL", "IN": "INR", "ZA": "ZAR", "CN": "CNY",
 }
 
+# --- Currency code resolver via World Bank metadata (cached) ---
+@lru_cache(maxsize=512)
+def resolve_currency_code(iso_alpha_2: str) -> Optional[str]:
+    try:
+        url = f"http://api.worldbank.org/v2/country/{iso_alpha_2}?format=json"
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list) and len(data) > 1 and isinstance(data[1], list) and data[1]:
+            node = data[1][0]
+            # Prefer 3-letter code (e.g., SEK)
+            code = (node.get("currency") or {}).get("id") or node.get("currencyCode")
+            if code and isinstance(code, str) and len(code.strip()) == 3:
+                return code.strip().upper()
+    except Exception:
+        pass
+    return CURRENCY_CODE.get(iso_alpha_2)
+
 
 app = FastAPI()
 
@@ -318,7 +336,7 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
                 "debt_to_gdp": round((debt_v / gdp_v) * 100, 2),
                 "source": "IMF WEO",
                 "government_type": "General Government",
-                "currency": "LCU",
+                "currency": "LCU", "currency_code": resolve_currency_code(iso2),
             }
     except Exception as e:
         print(f"[v1_debt] IMF step failed: {e}")
@@ -346,7 +364,7 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
                     "debt_to_gdp": round((debt_v / gdp_v) * 100, 2),
                     "source": "World Bank WDI",
                     "government_type": "Central Government",
-                    "currency": "LCU",
+                    "currency": "LCU", "currency_code": resolve_currency_code(iso2),
                 }
             else:
                 # B) Ratio-assisted compute when LCU debt is missing
@@ -363,7 +381,7 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
                         "debt_to_gdp": round(ratio_pct, 2),
                         "source": "World Bank WDI (ratio-assisted)",
                         "government_type": "Central Government",
-                        "currency": "LCU",
+                        "currency": "LCU", "currency_code": resolve_currency_code(iso2),
                     }
         except Exception as e:
             print(f"[v1_debt] WB step failed: {e}")
@@ -388,7 +406,7 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
                     "debt_to_gdp": round((debt_v / gdp_v) * 100, 2),
                     "source": "World Bank WDI (USD components)",
                     "government_type": "Central Government",
-                    "currency": "USD", 
+                    "currency": "USD", "currency_code": "USD", 
                 }
         except Exception as e:
             print(f"[Debt USD Fallback] Error: {e}")
