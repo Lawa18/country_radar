@@ -341,7 +341,30 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
     except Exception as e:
         print(f"[v1_debt] IMF step failed: {e}")
 
-    # 2) World Bank fallback (LCU components, then ratio-assisted)
+    # 2) Eurostat quarterly (EU/EEA/UK)
+    if not bundle and iso3 in EU_ISO3:
+        try:
+            es = eurostat_debt_gdp_quarterly(iso3)
+            if es:
+                bundle = {
+                    'debt_value': es['debt_value'],
+                    'gdp_value': es['gdp_value'],
+                    'year': es.get('period', ''),
+                    'debt_to_gdp': es['debt_to_gdp'],
+                    'source': es['source'],
+                    'government_type': es['government_type'],
+                    'currency': 'LCU', 'currency_code': resolve_currency_code(iso2),
+                    'currency_code': resolve_currency_code(iso2),
+                    'path_used': es['path_used']
+                }
+                eurostat_series_cache = {
+                    'government_debt_series': es.get('government_debt_series', {}),
+                    'nominal_gdp_series': es.get('nominal_gdp_series', {})
+                }
+        except Exception as e:
+            print(f"[v1_debt] Eurostat step failed: {e}")
+
+    # 3) World Bank fallback (LCU components, then ratio-assisted)
     if not bundle:
         try:
             wb = fetch_worldbank_data(iso2, iso3)
@@ -547,16 +570,6 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
             # "government_type": "Central Government"
         })
     
-    # Ensure currency_code is filled if missing
-    if gov_debt_latest.get("currency") == "LCU" and not gov_debt_latest.get("currency_code"):
-        gov_debt_latest["currency_code"] = resolve_currency_code(iso2)
-    if nom_gdp_latest.get("currency") == "LCU" and not nom_gdp_latest.get("currency_code"):
-        nom_gdp_latest["currency_code"] = resolve_currency_code(iso2)
-    if gov_debt_latest.get("currency") == "USD" and not gov_debt_latest.get("currency_code"):
-        gov_debt_latest["currency_code"] = "USD"
-    if nom_gdp_latest.get("currency") == "USD" and not nom_gdp_latest.get("currency_code"):
-        nom_gdp_latest["currency_code"] = "USD"
-
     # 4) Build the exact schema your GPT expects (latest + series)
     government_debt_out = {"latest": gov_debt_latest, "series": {}}
     nominal_gdp_out     = {"latest": nom_gdp_latest, "series": {}}
@@ -566,19 +579,134 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
     }
     
     # 5) Use these in your final return:
-    # "government_debt": government_debt_out,
-    # "nominal_gdp": nominal_gdp_out,
+    # "government_debt": {"latest": government_debt_out, "series": (es_gd if es_gd else {})},
+    # "nominal_gdp": {"latest": nominal_gdp_out, "series": (es_gdp if es_gdp else {})},
     # "debt_to_gdp": debt_to_gdp_out,
         
-    return JSONResponse(content={
+    
+# If Eurostat series were produced in /v1/debt, attach them; else keep WB ratio series only
+try:
+    if 'eurostat_series_cache' in locals():
+        es_gd = eurostat_series_cache.get('government_debt_series') or {}
+        es_gdp = eurostat_series_cache.get('nominal_gdp_series') or {}
+    else:
+        es_gd, es_gdp = {}, {}
+except Exception:
+    es_gd, es_gdp = {}, {}
+return JSONResponse(content={
         "country": country,
         "iso_codes": codes,
         "imf_data": imf_data,
-        "government_debt": government_debt_out,
-        "nominal_gdp": nominal_gdp_out,
+        "government_debt": {"latest": government_debt_out, "series": (es_gd if es_gd else {})},
+        "nominal_gdp": {"latest": nominal_gdp_out, "series": (es_gdp if es_gdp else {})},
         "debt_to_gdp": {
+            "path_used": (trio.get("path_used") if isinstance(trio, dict) else None),
             "latest": debt_to_gdp_out,
             "series": wb_debt_ratio_hist.get("series") if wb_debt_ratio_hist else {}
         },
         "additional_indicators": {}
     })
+
+
+# ------------------ Eurostat (free) JSON-stat 2.0 helpers ------------------
+EUROSTAT_BASE = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data"
+
+@lru_cache(maxsize=256)
+def fetch_eurostat_jsonstat(dataset: str, **filters) -> Optional[dict]:
+    """
+    Fetch Eurostat JSON-stat 2.0 and return the raw JSON.
+    Example: fetch_eurostat_jsonstat("namq_10_gdp", geo="SWE", na_item="B1GQ", unit="CP_MNAC")
+    """
+    try:
+        params = "&".join([f"{k}={v}" for k, v in filters.items() if v is not None])
+        url = f"{EUROSTAT_BASE}/{dataset}?{params}" if params else f"{EUROSTAT_BASE}/{dataset}"
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"[eurostat] fetch failed {dataset} {filters}: {e}")
+        return None
+
+def parse_jsonstat_to_series(js: dict) -> dict:
+    """
+    Convert Eurostat JSON-stat to {period: value}. Supports single-series filters.
+    Periods look like '2025-Q1'.
+    """
+    try:
+        value = js.get("value")
+        dims = js.get("dimension", {})
+        # Find time dimension
+        time_key = None
+        for k, v in dims.items():
+            if isinstance(v, dict) and (v.get("role") == "time" or k.lower() == "time"):
+                time_key = k
+                break
+        if time_key is None:
+            keys = [k for k in dims.keys() if k not in ("id","size")]
+            if keys: time_key = keys[-1]
+        time_cat = dims.get(time_key, {}).get("category", {})
+        time_index = time_cat.get("index", {})
+        time_label = time_cat.get("label", {})
+        idx_to_period = {}
+        for k, idx in time_index.items():
+            idx_to_period[int(idx)] = time_label.get(k, k)
+        series = {}
+        if isinstance(value, list):
+            for i, v in enumerate(value):
+                if v is None: continue
+                period = idx_to_period.get(i)
+                if period is None: continue
+                series[str(period)] = float(v)
+        elif isinstance(value, dict):
+            for k, v in value.items():
+                try: i = int(k)
+                except: continue
+                if v is None: continue
+                period = idx_to_period.get(i)
+                if period is None: continue
+                series[str(period)] = float(v)
+        return series
+    except Exception as e:
+        print(f"[eurostat] parse failed: {e}")
+        return {}
+
+# EU / EEA / UK ISO-3 whitelist for Eurostat
+EU_ISO3 = {
+    "AUT","BEL","BGR","HRV","CYP","CZE","DNK","EST","FIN","FRA","DEU","GRC","HUN","IRL","ITA","LVA","LTU","LUX","MLT",
+    "NLD","POL","PRT","ROU","SVK","SVN","ESP","SWE","ISL","NOR","LIE","CHE","GBR"
+}
+
+def eurostat_debt_gdp_quarterly(iso3: str) -> Optional[dict]:
+    """
+    Return latest common quarter trio and full series for Eurostat countries.
+    Includes government_debt_series and nominal_gdp_series (all available quarters).
+    """
+    try:
+        geo = iso3
+        gdp_js = fetch_eurostat_jsonstat("namq_10_gdp", geo=geo, na_item="B1GQ", unit="CP_MNAC")
+        gdp_series = parse_jsonstat_to_series(gdp_js) if gdp_js else {}
+        debt_js = fetch_eurostat_jsonstat("gov_10q_ggdebt", geo=geo)
+        debt_series = parse_jsonstat_to_series(debt_js) if debt_js else {}
+        commons = sorted(set(gdp_series) & set(debt_series))
+        if not commons:
+            return None
+        period = commons[-1]
+        debt_v = float(debt_series[period])
+        gdp_v = float(gdp_series[period])
+        if gdp_v == 0:
+            return None
+        return {
+            "debt_value": debt_v,
+            "gdp_value": gdp_v,
+            "period": period,
+            "debt_to_gdp": round((debt_v / gdp_v) * 100, 2),
+            "source": "Eurostat",
+            "government_type": "General Government",
+            "currency": "LCU",
+            "path_used": "EUROSTAT_Q",
+            "government_debt_series": dict(sorted(debt_series.items(), key=lambda x: x[0], reverse=True)),
+            "nominal_gdp_series": dict(sorted(gdp_series.items(), key=lambda x: x[0], reverse=True)),
+        }
+    except Exception as e:
+        print(f"[eurostat] trio failed: {e}")
+        return None
