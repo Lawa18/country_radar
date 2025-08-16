@@ -273,7 +273,8 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
                 "year": y,
                 "debt_to_gdp": round((debt_v / gdp_v) * 100, 2),
                 "source": "IMF WEO",
-                "government_type": "General Government"
+                "government_type": "General Government",
+                "currency": "LCU",
             }
     except Exception as e:
         print(f"[v1_debt] IMF step failed: {e}")
@@ -301,6 +302,7 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
                     "debt_to_gdp": round((debt_v / gdp_v) * 100, 2),
                     "source": "World Bank WDI",
                     "government_type": "Central Government",
+                    "currency": "LCU",
                 }
             else:
                 # B) Ratio-assisted compute when LCU debt is missing
@@ -317,6 +319,7 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
                         "debt_to_gdp": round(ratio_pct, 2),
                         "source": "World Bank WDI (ratio-assisted)",
                         "government_type": "Central Government",
+                        "currency": "LCU",
                     }
         except Exception as e:
             print(f"[v1_debt] WB step failed: {e}")
@@ -340,7 +343,8 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
                     "year": y,
                     "debt_to_gdp": round((debt_v / gdp_v) * 100, 2),
                     "source": "World Bank WDI (USD components)",
-                    "government_type": "Central Government"
+                    "government_type": "Central Government",
+                    "currency": "USD", 
                 }
         except Exception as e:
             print(f"[Debt USD Fallback] Error: {e}")
@@ -350,15 +354,19 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
         "country": country,
         "iso_codes": codes,
         "government_debt": (
-            {"value": bundle["debt_value"], "date": str(bundle["year"]), "source": bundle["source"], "government_type": bundle["government_type"]}
+            {"value": bundle["debt_value"], "date": str(bundle["year"]), 
+             "source": bundle["source"], "government_type": bundle["government_type"],
+             "currency": bundle.get("currency")} 
             if bundle else {"value": None, "date": None, "source": None, "government_type": None}
         ),
         "nominal_gdp": (
-            {"value": bundle["gdp_value"], "date": str(bundle["year"]), "source": bundle["source"]}
+            {"value": bundle["gdp_value"], "date": str(bundle["year"]), "source": bundle["source"],
+             "source": bundle["source"], "currency": bundle.get("currency")} 
             if bundle else {"value": None, "date": None, "source": None}
         ),
         "debt_to_gdp": (
-            {"value": bundle["debt_to_gdp"], "date": str(bundle["year"]), "source": bundle["source"], "government_type": bundle["government_type"]}
+            {"value": bundle["debt_to_gdp"], "date": str(bundle["year"]), 
+             "source": bundle["source"], "government_type": bundle["government_type"]}
             if bundle else {"value": None, "date": None, "source": None, "government_type": None}
         ),
     }
@@ -424,12 +432,79 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
             "source": wb_debt_ratio_hist["latest"]["source"],
         })
 
+        # --- Merge computed trio from /v1/debt and preserve currency ---
+    debt_bundle = v1_debt(country)  # call the function directly; it returns a dict
+    
+    # 1) Define safe defaults for the 'latest' blocks
+    gov_debt_latest = {
+        "value": None, "date": None, "source": None,
+        "government_type": None, "currency": None
+    }
+    nom_gdp_latest = {
+        "value": None, "date": None, "source": None,
+        "currency": None
+    }
+    debt_pct_latest = {
+        "value": None, "date": None, "source": None,
+        "government_type": None
+    }
+    
+    # 2) Overlay values from the compute result, if present
+    try:
+        if isinstance(debt_bundle, dict):
+            gd = debt_bundle.get("government_debt")
+            if isinstance(gd, dict):
+                for k in gov_debt_latest.keys():
+                    if k in gd and gd[k] is not None:
+                        gov_debt_latest[k] = gd[k]
+    
+            ng = debt_bundle.get("nominal_gdp")
+            if isinstance(ng, dict):
+                for k in nom_gdp_latest.keys():
+                    if k in ng and ng[k] is not None:
+                        nom_gdp_latest[k] = ng[k]
+    
+            dp = debt_bundle.get("debt_to_gdp")
+            if isinstance(dp, dict):
+                for k in debt_pct_latest.keys():
+                    if k in dp and dp[k] is not None:
+                        debt_pct_latest[k] = dp[k]
+    except Exception as e:
+        print(f"[/country-data] merge debt bundle failed: {e}")
+    
+    # 3) If computed ratio is missing, fall back to WB ratio (for display only)
+    # You likely already built 'wb_debt_ratio_hist' earlier via wb_series(raw_wb.get("GC.DOD.TOTL.GD.ZS"))
+    # If not, compute it here:
+    #   wb_debt_ratio_hist = wb_series(wb.get("GC.DOD.TOTL.GD.ZS"))
+    
+    if (debt_pct_latest["value"] is None) and wb_debt_ratio_hist:
+        debt_pct_latest.update({
+            "value":  wb_debt_ratio_hist["latest"]["value"],
+            "date":   wb_debt_ratio_hist["latest"]["date"],
+            "source": wb_debt_ratio_hist["latest"]["source"],
+            # government_type remains as-is (None) since WB ratio % is central-gov; set if you want:
+            # "government_type": "Central Government"
+        })
+    
+    # 4) Build the exact schema your GPT expects (latest + series)
+    government_debt_out = {"latest": gov_debt_latest, "series": {}}
+    nominal_gdp_out     = {"latest": nom_gdp_latest, "series": {}}
+    debt_to_gdp_out     = {
+        "latest": debt_pct_latest,
+        "series": (wb_debt_ratio_hist.get("series") if wb_debt_ratio_hist else {})
+    }
+    
+    # 5) Use these in your final return:
+    # "government_debt": government_debt_out,
+    # "nominal_gdp": nominal_gdp_out,
+    # "debt_to_gdp": debt_to_gdp_out,
+        
     return JSONResponse(content={
         "country": country,
         "iso_codes": codes,
         "imf_data": imf_data,
-        "government_debt": {"latest": gov_debt, "series": {}},
-        "nominal_gdp": {"latest": nom_gdp, "series": {}},
-        "debt_to_gdp": {"latest": debt_pct, "series": (wb_debt_ratio_hist.get("series") if wb_debt_ratio_hist else {})},
+        "government_debt": government_debt_out,
+        "nominal_gdp": nominal_gdp_out,
+        "debt_to_gdp": debt_to_gdp_out, (wb_debt_ratio_hist.get("series") if wb_debt_ratio_hist else {})},
         "additional_indicators": {}
     })
