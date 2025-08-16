@@ -7,6 +7,15 @@ import unicodedata
 import requests
 import pycountry
 
+# --- ISO-2 -> currency code used for display when values are LCU ---
+CURRENCY_CODE = {
+    "MX": "MXN",
+    "NG": "NGN",
+    # Extend as needed: "US": "USD", "SE": "SEK", "GB": "GBP", "JP": "JPY",
+    # "BR": "BRL", "IN": "INR", "ZA": "ZAR", "CN": "CNY",
+}
+
+
 app = FastAPI()
 
 # ------------------ Country normalization ------------------
@@ -28,6 +37,34 @@ def normalize_country_name(name: str) -> str:
     return ALIASES.get(s, s)
 
 def resolve_country_codes(name: str) -> Optional[Dict[str, str]]:
+
+
+# --- Dynamic currency code via World Bank country metadata (cached) ---
+@lru_cache(maxsize=512)
+def get_currency_code_wb(iso2: str) -> str | None:
+    """
+    Returns a 2- or 3-letter currency code for the country (e.g., MXN, NGN).
+    Uses World Bank metadata and caches results in memory.
+    """
+    try:
+        url = f"http://api.worldbank.org/v2/country/{iso2}?format=json"
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, list) and len(data) > 1 and isinstance(data[1], list) and data[1]:
+            node = data[1][0]
+            cur = node.get("currency") or {}
+            code = (cur.get("id") or cur.get("iso2code") or
+                    node.get("currencyIso2") or node.get("currencyCode"))
+            if code and isinstance(code, str):
+                code = code.strip().upper()
+                if len(code) in (2, 3):
+                    return code
+    except Exception as e:
+        print(f"[currency] WB lookup failed for {iso2}: {e}")
+    return None
+
+
     try:
         nm = normalize_country_name(name)
         country = pycountry.countries.lookup(nm or name)
@@ -357,12 +394,12 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
             {"value": bundle["debt_value"], "date": str(bundle["year"]), 
              "source": bundle["source"], "government_type": bundle["government_type"],
              "currency": bundle.get("currency")} 
-            if bundle else {"value": None, "date": None, "source": None, "government_type": None}
+            if bundle else {"value": None, "date": None, "source": None, "government_type": None "currency": None, "currency_code": None,}
         ),
         "nominal_gdp": (
             {"value": bundle["gdp_value"], "date": str(bundle["year"]), "source": bundle["source"],
              "source": bundle["source"], "currency": bundle.get("currency")} 
-            if bundle else {"value": None, "date": None, "source": None}
+            if bundle else {"value": None, "date": None, "source": None "currency": None, "currency_code": None,}
         ),
         "debt_to_gdp": (
             {"value": bundle["debt_to_gdp"], "date": str(bundle["year"]), 
@@ -439,10 +476,16 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
     gov_debt_latest = {
         "value": None, "date": None, "source": None,
         "government_type": None, "currency": None
+    
+        "currency": None,
+        "currency_code": None,
     }
     nom_gdp_latest = {
         "value": None, "date": None, "source": None,
         "currency": None
+    
+        "currency": None,
+        "currency_code": None,
     }
     debt_pct_latest = {
         "value": None, "date": None, "source": None,
