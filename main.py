@@ -505,6 +505,9 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
         "imf_data": imf_data,
         "government_debt": government_debt_out,
         "nominal_gdp": nominal_gdp_out,
-        "debt_to_gdp": debt_to_gdp_out, (wb_debt_ratio_hist.get("series") if wb_debt_ratio_hist else {})},
+        "debt_to_gdp": {
+            "latest": debt_to_gdp_out,
+            "series": wb_debt_ratio_hist.get("series") if wb_debt_ratio_hist else {}
+        },
         "additional_indicators": {}
     })
