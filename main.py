@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query
+ from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from functools import lru_cache
 from typing import Dict, Any, Optional
@@ -498,17 +498,6 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
     # "government_debt": government_debt_out,
     # "nominal_gdp": nominal_gdp_out,
     # "debt_to_gdp": debt_to_gdp_out,
-
-    CURRENCY_CODE = {
-        "MX": "MXN",
-        "NG": "NGN",
-        # add more if you like
-    }
-    
-    # After you resolve codes:
-    code3 = CURRENCY_CODE.get(codes["iso_alpha_2"])
-    # When building gov_debt_latest / nom_gdp_latest:
-    "...", "currency_code": code3
         
     return JSONResponse(content={
         "country": country,
