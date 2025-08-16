@@ -1,4 +1,4 @@
- from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from functools import lru_cache
 from typing import Dict, Any, Optional
