@@ -37,6 +37,15 @@ def normalize_country_name(name: str) -> str:
     return ALIASES.get(s, s)
 
 def resolve_country_codes(name: str) -> Optional[Dict[str, str]]:
+    """Normalize a human country name/alias to ISO-2/ISO-3 codes using pycountry.
+    Returns dict like {"iso_alpha_2": "SE", "iso_alpha_3": "SWE"} or None if not found.
+    """
+    try:
+        nm = normalize_country_name(name)
+        country = pycountry.countries.lookup(nm or name)
+        return {"iso_alpha_2": country.alpha_2, "iso_alpha_3": country.alpha_3}
+    except LookupError:
+        return None
 
 
 # --- Dynamic currency code via World Bank country metadata (cached) ---
