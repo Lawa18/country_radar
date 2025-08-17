@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query
+afrom fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from functools import lru_cache
 from typing import Dict, Any, Optional
@@ -296,7 +296,7 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
     # 2) Eurostat quarterly (EU/EEA/UK)
     if not bundle and iso3 in EU_ISO3:
         try:
-            es = eurostat_debt_gdp_quarterly(iso3)
+            es = eurostat_debt_gdp_quarterly(iso2)
             if es:
                 bundle = {
                     'debt_value': es['debt_value'],
@@ -708,9 +708,9 @@ def parse_jsonstat_to_series(js: dict) -> Dict[str, float]:
         print(f"[Eurostat] parse failed: {e}")
         return {}
 
-def eurostat_debt_gdp_quarterly(iso3: str) -> Optional[dict]:
+def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
     try:
-        geo = iso3
+        geo = geo_code
 
         # GDP: current prices, national currency, million
         gdp_js = fetch_eurostat_jsonstat("namq_10_gdp", geo=geo, na_item="B1GQ", unit="CP_MNAC")
@@ -730,6 +730,14 @@ def eurostat_debt_gdp_quarterly(iso3: str) -> Optional[dict]:
         chosen = _es_filter_params(debt_probe, wants)
         debt_js = fetch_eurostat_jsonstat("gov_10q_ggdebt", geo=geo, **chosen) or debt_probe
         debt_series = parse_jsonstat_to_series(debt_js)
+
+        
+# If no overlap and country is in euro area, try EUR units explicitly
+if not commons and geo in {'AT','BE','CY','DE','EE','ES','FI','FR','GR','IE','IT','LT','LU','LV','MT','NL','PT','SI','SK'}:
+    debt_js_eur = fetch_eurostat_jsonstat("gov_10q_ggdebt", geo=geo, unit="MIO_EUR", sector="S13", consol="CONS")
+    if debt_js_eur:
+        debt_series = parse_jsonstat_to_series(debt_js_eur)
+        commons = sorted(set(gdp_series) & set(debt_series))
 
         commons = sorted(set(gdp_series) & set(debt_series))
         if not commons:
