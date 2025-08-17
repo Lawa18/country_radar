@@ -614,13 +614,123 @@ EU_ISO3 = {
     "NLD","POL","PRT","ROU","SVK","SVN","ESP","SWE","ISL","NOR","LIE","CHE","GBR"
 }
 
+@lru_cache(maxsize=256)
+def fetch_eurostat_jsonstat(dataset: str, **filters) -> Optional[dict]:
+    try:
+        qs = "&".join(f"{k}={v}" for k, v in filters.items() if v is not None)
+        url = f"{EUROSTAT_BASE}/{dataset}?{qs}" if qs else f"{EUROSTAT_BASE}/{dataset}"
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        print(f"[Eurostat] fetch failed {dataset} {filters}: {e}")
+        return None
+
+def _es_pick_first(dim: dict, preferred: list[str]) -> Optional[str]:
+    cat = (dim or {}).get("category", {})
+    idx = cat.get("index", {})
+    if not idx:
+        return None
+    codes = set(idx.keys())
+    for cand in preferred:
+        if cand in codes:
+            return cand
+    try:
+        rev = {v: k for k, v in idx.items()}
+        return rev[min(rev)]
+    except Exception:
+        return next(iter(codes))
+
+def _es_filter_params(js: dict, wants: dict[str, list[str]]) -> dict[str, str]:
+    dims = js.get("dimension", {})
+    time_dim = None
+    for k, v in dims.items():
+        if isinstance(v, dict) and (v.get("role") == "time" or k.lower() == "time"):
+            time_dim = k
+            break
+    out = {}
+    for dname, dim in dims.items():
+        if dname in ("id", "size") or dname == time_dim:
+            continue
+        prefs = wants.get(dname, [])
+        choice = _es_pick_first(dim, prefs)
+        if choice:
+            out[dname] = choice
+    return out
+
+def parse_jsonstat_to_series(js: dict) -> Dict[str, float]:
+    try:
+        dims = js.get("dimension", {})
+        time_key = None
+        for k, v in dims.items():
+            if isinstance(v, dict) and (v.get("role") == "time" or k.lower() == "time"):
+                time_key = k
+                break
+        if not time_key:
+            keys = [k for k in dims.keys() if k not in ("id", "size")]
+            if keys:
+                time_key = keys[-1]
+
+        tcat = dims.get(time_key, {}).get("category", {})
+        tidx = tcat.get("index", {})
+        tlab = tcat.get("label", {})
+        idx_to_period = {int(i): tlab.get(code, code) for code, i in tidx.items()}
+
+        values = js.get("value")
+        if not isinstance(values, list):
+            if isinstance(values, dict):
+                dense = []
+                for i in range(len(idx_to_period)):
+                    dense.append(values.get(str(i)))
+                values = dense
+            else:
+                return {}
+
+        ids = js.get("id") or [k for k in dims.keys() if k not in ("id", "size")]
+        if time_key in ids:
+            step = 1
+            for d in ids:
+                if d == time_key:
+                    continue
+                sz = dims.get(d, {}).get("size") if isinstance(dims.get(d), dict) else None
+                step *= int(sz or 1)
+        else:
+            step = 1
+
+        series: Dict[str, float] = {}
+        for i, v in enumerate(values[0::step]):
+            if v is None:
+                continue
+            if i in idx_to_period and _is_num(v):
+                series[str(idx_to_period[i])] = float(v)
+        return series
+    except Exception as e:
+        print(f"[Eurostat] parse failed: {e}")
+        return {}
+
 def eurostat_debt_gdp_quarterly(iso3: str) -> Optional[dict]:
     try:
         geo = iso3
+
+        # GDP: current prices, national currency, million
         gdp_js = fetch_eurostat_jsonstat("namq_10_gdp", geo=geo, na_item="B1GQ", unit="CP_MNAC")
-        gdp_series = parse_jsonstat_to_series(gdp_js) if gdp_js else {}
-        debt_js = fetch_eurostat_jsonstat("gov_10q_ggdebt", geo=geo)
-        debt_series = parse_jsonstat_to_series(debt_js) if debt_js else {}
+        if not gdp_js:
+            return None
+        gdp_series = parse_jsonstat_to_series(gdp_js)
+
+        # Debt: prefer national currency, million; S13; consolidated if possible
+        debt_probe = fetch_eurostat_jsonstat("gov_10q_ggdebt", geo=geo)
+        if not debt_probe:
+            return None
+        wants = {
+            "unit": ["MIO_NAC", "MIO_CU", "MIO_EUR"],
+            "sector": ["S13"],
+            "consol": ["CONS", "C"],
+        }
+        chosen = _es_filter_params(debt_probe, wants)
+        debt_js = fetch_eurostat_jsonstat("gov_10q_ggdebt", geo=geo, **chosen) or debt_probe
+        debt_series = parse_jsonstat_to_series(debt_js)
+
         commons = sorted(set(gdp_series) & set(debt_series))
         if not commons:
             return None
@@ -629,6 +739,7 @@ def eurostat_debt_gdp_quarterly(iso3: str) -> Optional[dict]:
         gdp_v = float(gdp_series[period])
         if gdp_v == 0:
             return None
+
         return {
             "debt_value": debt_v,
             "gdp_value": gdp_v,
@@ -642,5 +753,5 @@ def eurostat_debt_gdp_quarterly(iso3: str) -> Optional[dict]:
             "nominal_gdp_series": dict(sorted(gdp_series.items(), key=lambda x: x[0], reverse=True)),
         }
     except Exception as e:
-        print(f"[eurostat] trio failed: {e}")
+        print(f"[Eurostat] trio failed: {e}")
         return None
