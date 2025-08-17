@@ -398,7 +398,7 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
     }
 
 @app.get("/country-data")
-def country_data(country: str = Query(..., description="Full country name, e.g., Mexico")):
+def country_data(country: str = Query(..., description="Full country name, e.g., Germany")):
     codes = resolve_country_codes(country)
     if not codes:
         return {"error": "Invalid country name", "country": country}
@@ -440,8 +440,8 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
     imf_data["Government Effectiveness"] = wb_entry(wb.get("GE.EST")) or {"value": None, "date": None, "source": None}
 
     wb_debt_ratio_hist = wb_series(wb.get("GC.DOD.TOTL.GD.ZS"))
-
     debt_bundle = v1_debt(country)
+
     gov_debt_latest = {
         "value": None, "date": None, "source": None,
         "government_type": None, "currency": None, "currency_code": None,
@@ -475,20 +475,65 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
     except Exception as e:
         print(f"[/country-data] merge debt bundle failed: {e}")
 
-    if (debt_pct_latest["value"] is None) and wb_debt_ratio_hist:
-        debt_pct_latest.update({
-            "value":  wb_debt_ratio_hist["latest"]["value"],
-            "date":   wb_debt_ratio_hist["latest"]["date"],
-            "source": wb_debt_ratio_hist["latest"]["source"],
-        })
+    # --- Eurostat: Prefer Eurostat series for eligible EU/EEA/UK countries ---
+    # v1_debt now attaches 'eurostat_series' for these.
+    eurostat_series = debt_bundle.get("eurostat_series", {}) if isinstance(debt_bundle, dict) else {}
+    es_gd = eurostat_series.get("government_debt_series", {})
+    es_gdp = eurostat_series.get("nominal_gdp_series", {})
 
-    government_debt_out = {"latest": gov_debt_latest, "series": {}}
-    nominal_gdp_out     = {"latest": nom_gdp_latest, "series": {}}
-    debt_to_gdp_out     = {
+    # If we have Eurostat series, use for history and prefer for "latest" if most recent
+    if es_gd and es_gdp:
+        # Find latest common Eurostat period
+        common_periods = sorted(set(es_gd) & set(es_gdp), reverse=True)
+        if common_periods:
+            latest_period = common_periods[0]
+            try:
+                gov_debt_latest.update({
+                    "value": es_gd[latest_period],
+                    "date": latest_period,
+                    "source": "Eurostat",
+                    "government_type": "General Government",
+                    "currency": "LCU",
+                    "currency_code": resolve_currency_code(iso2),
+                })
+                nom_gdp_latest.update({
+                    "value": es_gdp[latest_period],
+                    "date": latest_period,
+                    "source": "Eurostat",
+                    "currency": "LCU",
+                    "currency_code": resolve_currency_code(iso2),
+                })
+                # Calculate Eurostat ratio
+                if es_gdp[latest_period]:
+                    eurostat_debt_pct = round(es_gd[latest_period] / es_gdp[latest_period] * 100, 2)
+                    debt_pct_latest.update({
+                        "value": eurostat_debt_pct,
+                        "date": latest_period,
+                        "source": "Eurostat",
+                        "government_type": "General Government",
+                    })
+            except Exception as e:
+                print(f"[Eurostat merge] failed: {e}")
+
+    # Eurostat historical series for charts (if available)
+    government_debt_out = {"latest": gov_debt_latest, "series": es_gd if es_gd else {}}
+    nominal_gdp_out     = {"latest": nom_gdp_latest, "series": es_gdp if es_gdp else {}}
+
+    # Historical ratio series (Eurostat if available, fallback WB)
+    debt_to_gdp_series = {}
+    if es_gd and es_gdp:
+        for period in set(es_gd) & set(es_gdp):
+            gdp = es_gdp[period]
+            if gdp:
+                debt_to_gdp_series[period] = round(es_gd[period] / gdp * 100, 2)
+    if not debt_to_gdp_series and wb_debt_ratio_hist:
+        debt_to_gdp_series = wb_debt_ratio_hist.get("series", {})
+    debt_to_gdp_out = {
         "latest": debt_pct_latest,
-        "series": (wb_debt_ratio_hist.get("series") if wb_debt_ratio_hist else {})
+        "series": debt_to_gdp_series
     }
 
+    # Fill in currency_code if missing
     try:
         if government_debt_out["latest"].get("currency") == "LCU" and not government_debt_out["latest"].get("currency_code"):
             government_debt_out["latest"]["currency_code"] = resolve_currency_code(iso2)
