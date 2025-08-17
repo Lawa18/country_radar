@@ -15,7 +15,6 @@ CURRENCY_CODE = {
     # "BR": "BRL", "IN": "INR", "ZA": "ZAR", "CN": "CNY",
 }
 
-# --- Currency code resolver via World Bank metadata (cached) ---
 @lru_cache(maxsize=512)
 def resolve_currency_code(iso_alpha_2: str) -> Optional[str]:
     try:
@@ -25,14 +24,12 @@ def resolve_currency_code(iso_alpha_2: str) -> Optional[str]:
         data = r.json()
         if isinstance(data, list) and len(data) > 1 and isinstance(data[1], list) and data[1]:
             node = data[1][0]
-            # Prefer 3-letter code (e.g., SEK)
             code = (node.get("currency") or {}).get("id") or node.get("currencyCode")
             if code and isinstance(code, str) and len(code.strip()) == 3:
                 return code.strip().upper()
     except Exception:
         pass
     return CURRENCY_CODE.get(iso_alpha_2)
-
 
 app = FastAPI()
 
@@ -54,9 +51,7 @@ def normalize_country_name(name: str) -> str:
     s = s.strip().lower()
     return ALIASES.get(s, s)
 
-
 def resolve_country_codes(name: str) -> Optional[Dict[str, str]]:
-    """Normalize a human country name/alias to ISO-2/ISO-3 codes using pycountry."""
     try:
         nm = normalize_country_name(name)
         country = pycountry.countries.lookup(nm or name)
@@ -64,13 +59,8 @@ def resolve_country_codes(name: str) -> Optional[Dict[str, str]]:
     except LookupError:
         return None
 
-# --- Dynamic currency code via World Bank country metadata (cached) ---
 @lru_cache(maxsize=512)
 def get_currency_code_wb(iso2: str) -> str | None:
-    """
-    Returns a 2- or 3-letter currency code for the country (e.g., MXN, NGN).
-    Uses World Bank metadata and caches results in memory.
-    """
     try:
         url = f"http://api.worldbank.org/v2/country/{iso2}?format=json"
         r = requests.get(url, timeout=10)
@@ -89,18 +79,9 @@ def get_currency_code_wb(iso2: str) -> str | None:
         print(f"[currency] WB lookup failed for {iso2}: {e}")
     return None
 
-
-    try:
-        nm = normalize_country_name(name)
-        country = pycountry.countries.lookup(nm or name)
-        return {"iso_alpha_2": country.alpha_2, "iso_alpha_3": country.alpha_3}
-    except LookupError:
-        return None
-
 # ------------------ Helpers ------------------
 
 def latest_common_year_pair(a: dict, b: dict) -> Optional[tuple[int, float, float]]:
-    """Return (year, a_val, b_val) for the latest common year between two {year: value} dicts."""
     try:
         ya = {int(y): float(v) for y, v in a.items()
               if isinstance(v, (float, int, str)) and str(v).replace('.', '', 1).replace('-', '', 1).isdigit()}
@@ -115,7 +96,6 @@ def latest_common_year_pair(a: dict, b: dict) -> Optional[tuple[int, float, floa
         return None
 
 def extract_latest_numeric_entry(entry_dict: dict, source_label: str = "IMF") -> Optional[Dict[str, Any]]:
-    """Convert a {year: value} dict to {value, date, source} using latest year."""
     try:
         pairs = [(int(y), float(v)) for y, v in entry_dict.items()
                  if isinstance(v, (float, int, str)) and str(v).replace('.', '', 1).replace('-', '', 1).isdigit()]
@@ -127,10 +107,6 @@ def extract_latest_numeric_entry(entry_dict: dict, source_label: str = "IMF") ->
         return None
 
 def wb_year_dict_from_raw(entries) -> Dict[str, float]:
-    """
-    Parse raw World Bank JSON [metadata, [{date, value}, ...]] into { 'YYYY': float(value) }.
-    Safe if entries is None or not list-shaped.
-    """
     try:
         if isinstance(entries, list) and len(entries) > 1:
             out = {}
@@ -148,7 +124,6 @@ def wb_year_dict_from_raw(entries) -> Dict[str, float]:
     return {}
 
 def wb_series(entries) -> Optional[Dict[str, Any]]:
-    """Return {'latest': {...}, 'series': {...}} from raw WB list response."""
     d = wb_year_dict_from_raw(entries)
     if not d:
         return None
@@ -167,10 +142,6 @@ def wb_entry(entries) -> Optional[Dict[str, Any]]:
 # ------------------ External fetchers ------------------
 
 def _wb_fetch_code_any_iso(iso2: str, code: str, iso3: Optional[str] = None):
-    """
-    Try ISO-3 first (if provided), then ISO-2 for a given World Bank indicator code.
-    Returns raw WB JSON ([metadata, data...]) or {"error": "..."} if nothing succeeded.
-    """
     base = "http://api.worldbank.org/v2/country"
     for iso in ([iso3] if iso3 else []) + [iso2]:
         if not iso:
@@ -188,48 +159,35 @@ def _wb_fetch_code_any_iso(iso2: str, code: str, iso3: Optional[str] = None):
 
 @lru_cache(maxsize=256)
 def fetch_worldbank_data(iso_alpha_2: str, iso_alpha_3: Optional[str] = None) -> Dict[str, Any]:
-    """
-    World Bank WDI fetch for the indicators we need.
-    Ensures LCU component series exist: GC.DOD.TOTL.CN (debt), NY.GDP.MKTP.CN (GDP).
-    Returns {indicator_code: raw_json_payload}
-    """
     WB_CODES = [
-        "FP.CPI.TOTL.ZG",     # Inflation (%)
-        "PA.NUS.FCRF",        # FX Rate (LCU per USD)
-        "FR.INR.RINR",        # Interest Rate
-        "FI.RES.TOTL.CD",     # Reserves (USD)
-        "NY.GDP.MKTP.KD.ZG",  # GDP Growth (%)
-        "GC.DOD.TOTL.GD.ZS",  # Debt to GDP (%) ratio (display/ratio-assisted)
-        "SL.UEM.TOTL.ZS",     # Unemployment (%)
-        "BN.CAB.XOKA.GD.ZS",  # Current Account Balance (% of GDP)
-        "GE.EST",             # Government Effectiveness (WGI)
-        # LCU components for compute fallback:
-        "GC.DOD.TOTL.CN",     # Central Gov Debt (LCU)
-        "NY.GDP.MKTP.CN",     # Nominal GDP (LCU)
+        "FP.CPI.TOTL.ZG",
+        "PA.NUS.FCRF",
+        "FR.INR.RINR",
+        "FI.RES.TOTL.CD",
+        "NY.GDP.MKTP.KD.ZG",
+        "GC.DOD.TOTL.GD.ZS",
+        "SL.UEM.TOTL.ZS",
+        "BN.CAB.XOKA.GD.ZS",
+        "GE.EST",
+        "GC.DOD.TOTL.CN",
+        "NY.GDP.MKTP.CN",
     ]
     results: Dict[str, Any] = {}
     for code in WB_CODES:
         results[code] = _wb_fetch_code_any_iso(iso_alpha_2, code, iso_alpha_3)
-
-    # Redundant safety for LCU components
     for forced_code in ["GC.DOD.TOTL.CN", "NY.GDP.MKTP.CN"]:
         if forced_code not in results or not (isinstance(results[forced_code], list) and len(results[forced_code]) > 1):
             results[forced_code] = _wb_fetch_code_any_iso(iso_alpha_2, forced_code, iso_alpha_3)
-
     return results
 
 @lru_cache(maxsize=256)
 def fetch_imf_sdmx_series(iso_alpha_2: str) -> Dict[str, Dict[str, float]]:
-    """
-    IMF IFS SDMX (CompactData) monthly series aggregated to yearly latest.
-    Returns a dict of label -> {year: value}.
-    """
     indicator_map = {
-        "CPI": "PCPIPCH",                  # CPI inflation, % yoy
-        "FX Rate": "ENDA_XDC_USD_RATE",    # End-of-period LCU per USD
-        "Interest Rate": "FIMM_PA",        # Money market rate, % pa
-        "Reserves (USD)": "TRESEGUSD",     # International reserves, USD
-        "GDP Growth (%)": "NGDP_RPCH",     # Real GDP growth %, proxy
+        "CPI": "PCPIPCH",
+        "FX Rate": "ENDA_XDC_USD_RATE",
+        "Interest Rate": "FIMM_PA",
+        "Reserves (USD)": "TRESEGUSD",
+        "GDP Growth (%)": "NGDP_RPCH",
     }
     base = "http://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData/IFS"
     out: Dict[str, Dict[str, float]] = {}
@@ -260,7 +218,6 @@ def fetch_imf_sdmx_series(iso_alpha_2: str) -> Dict[str, Dict[str, float]]:
 
 @lru_cache(maxsize=256)
 def fetch_imf_weo_series(iso_alpha_3: str, indicators: list[str]) -> dict:
-    """IMF DataMapper WEO series: returns {indicator: {year: value}}."""
     res = {}
     for code in indicators:
         url = f"https://www.imf.org/external/datamapper/api/v1/WEO/{iso_alpha_3}/{code}"
@@ -290,7 +247,6 @@ def fetch_imf_weo_series(iso_alpha_3: str, indicators: list[str]) -> dict:
 def ping():
     return {"status": "ok"}
 
-# Debug helper to inspect WB component coverage & common year
 @app.get("/debug/debt")
 def debug_debt(country: str = Query(...)):
     codes = resolve_country_codes(country)
@@ -312,10 +268,6 @@ def debug_debt(country: str = Query(...)):
 
 @app.get("/v1/debt")
 def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexico")):
-    """
-    Compute Debt-to-GDP from components (same currency) using latest common year.
-    Priority: IMF WEO (GGXWDG + NGDP) -> WB LCU (GC.DOD.TOTL.CN + NY.GDP.MKTP.CN) -> WB ratio-assisted.
-    """
     codes = resolve_country_codes(country)
     if not codes:
         return {"error": "Invalid country name", "country": country}
@@ -354,7 +306,6 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
                     'source': es['source'],
                     'government_type': es['government_type'],
                     'currency': 'LCU', 'currency_code': resolve_currency_code(iso2),
-                    'currency_code': resolve_currency_code(iso2),
                     'path_used': es['path_used']
                 }
                 eurostat_series_cache = {
@@ -368,15 +319,10 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
     if not bundle:
         try:
             wb = fetch_worldbank_data(iso2, iso3)
-            # Raw WB payloads (list-shaped)
             debt_raw = wb.get("GC.DOD.TOTL.CN")
             gdp_raw  = wb.get("NY.GDP.MKTP.CN")
-
-            # Parse into { 'YYYY': float(value) }
             debt_dict = wb_year_dict_from_raw(debt_raw)
             gdp_dict  = wb_year_dict_from_raw(gdp_raw)
-
-            # A) Pure compute from components (preferred)
             pair = latest_common_year_pair(debt_dict, gdp_dict)
             if pair and pair[2] != 0:
                 y, debt_v, gdp_v = pair
@@ -390,7 +336,6 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
                     "currency": "LCU", "currency_code": resolve_currency_code(iso2),
                 }
             else:
-                # B) Ratio-assisted compute when LCU debt is missing
                 ratio_raw  = wb.get("GC.DOD.TOTL.GD.ZS")
                 ratio_dict = wb_year_dict_from_raw(ratio_raw)
                 pair_ratio = latest_common_year_pair(ratio_dict, gdp_dict)
@@ -408,17 +353,14 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
                     }
         except Exception as e:
             print(f"[v1_debt] WB step failed: {e}")
-            # leave bundle as None
 
-    # 3) World Bank USD-components fallback (currency-invariant ratio)
+    # 3) World Bank USD-components fallback
     if not bundle:
         try:
             debt_usd_raw = wb.get("GC.DOD.TOTL.CD")
             gdp_usd_raw  = wb.get("NY.GDP.MKTP.CD")
-
             debt_usd_dict = wb_year_dict_from_raw(debt_usd_raw)
             gdp_usd_dict  = wb_year_dict_from_raw(gdp_usd_raw)
-
             pair_usd = latest_common_year_pair(debt_usd_dict, gdp_usd_dict)
             if pair_usd and pair_usd[2] != 0:
                 y, debt_v, gdp_v = pair_usd
@@ -429,135 +371,41 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
                     "debt_to_gdp": round((debt_v / gdp_v) * 100, 2),
                     "source": "World Bank WDI (USD components)",
                     "government_type": "Central Government",
-                    "currency": "USD", "currency_code": "USD", 
+                    "currency": "USD", "currency_code": "USD",
                 }
         except Exception as e:
             print(f"[Debt USD Fallback] Error: {e}")
-            pass
-    
+
     return {
         "country": country,
         "iso_codes": codes,
         "government_debt": (
-            {"value": bundle["debt_value"], "date": str(bundle["year"]), 
+            {"value": bundle["debt_value"], "date": str(bundle["year"]),
              "source": bundle["source"], "government_type": bundle["government_type"],
-             "currency": bundle.get("currency")} 
-            if bundle else {"value": None, "date": None, "source": None, "government_type": None, "currency": None, "currency_code": None,}
+             "currency": bundle.get("currency"), "currency_code": bundle.get("currency_code")}
+            if bundle else {"value": None, "date": None, "source": None, "government_type": None, "currency": None, "currency_code": None}
         ),
         "nominal_gdp": (
-            {"value": bundle["gdp_value"], "date": str(bundle["year"]), "source": bundle["source"], "currency": bundle.get("currency")} 
-            if bundle else {"value": None, "date": None, "source": None, "currency": None, "currency_code": None,}
+            {"value": bundle["gdp_value"], "date": str(bundle["year"]), "source": bundle["source"],
+             "currency": bundle.get("currency"), "currency_code": bundle.get("currency_code")}
+            if bundle else {"value": None, "date": None, "source": None, "currency": None, "currency_code": None}
         ),
         "debt_to_gdp": (
-            {"value": bundle["debt_to_gdp"], "date": str(bundle["year"]), 
+            {"value": bundle["debt_to_gdp"], "date": str(bundle["year"]),
              "source": bundle["source"], "government_type": bundle["government_type"]}
             if bundle else {"value": None, "date": None, "source": None, "government_type": None}
         ),
     }
-
 
 @app.get("/country-data")
 def country_data(country: str = Query(..., description="Full country name, e.g., Mexico")):
     codes = resolve_country_codes(country)
     if not codes:
         return {"error": "Invalid country name", "country": country}
-
     iso2, iso3 = codes["iso_alpha_2"], codes["iso_alpha_3"]
     imf = fetch_imf_sdmx_series(iso2)
     wb  = fetch_worldbank_data(iso2, iso3)
 
-    # IMF-first indicators with WB fallback
-    def imf_series_block(label: str, wb_code: str):
-        imf_block = None
-        try:
-            imf_block = imf.get(label, {})
-        except Exception:
-            imf_block = {}
-        latest = extract_latest(imf_block, "IMF") if imf_block else None
-        series = dict(sorted({k: v for k, v in (imf_block or {}).items() if _is_num(v)}.items(), reverse=True)) if imf_block else {}
-        if latest:
-            return {"latest": latest, "series": series}
-        wb_block = wb_series(wb.get(wb_code))
-        return wb_block or {"latest": {"value": None, "date": None, "source": None}, "series": {}}
-
-    imf_data = {
-        "CPI": imf_series_block("CPI", "FP.CPI.TOTL.ZG"),
-        "FX Rate": imf_series_block("FX Rate", "PA.NUS.FCRF"),
-        "Interest Rate": imf_series_block("Interest Rate", "FR.INR.RINR"),
-        "Reserves (USD)": imf_series_block("Reserves (USD)", "FI.RES.TOTL.CD"),
-        "GDP Growth (%)": imf_series_block("GDP Growth (%)", "NY.GDP.MKTP.KD.ZG"),
-        "Unemployment (%)": wb_series(wb.get("SL.UEM.TOTL.ZS")) or {"latest": {"value": None, "date": None, "source": None}, "series": {}},
-        "Current Account Balance (% of GDP)": wb_series(wb.get("BN.CAB.XOKA.GD.ZS")) or {"latest": {"value": None, "date": None, "source": None}, "series": {}},
-        "Government Effectiveness": wb_series(wb.get("GE.EST")) or {"latest": {"value": None, "date": None, "source": None}, "series": {}},
-    }
-
-    # WB Debt/GDP ratio series (for history)
-    wb_debt_ratio_hist = wb_series(wb.get("GC.DOD.TOTL.GD.ZS"))
-
-    # Merge computed trio from /v1/debt
-    debt_bundle = v1_debt(country)
-
-    # Safe defaults for 'latest' blocks
-    gov_debt_latest = {"value": None, "date": None, "source": None, "government_type": None, "currency": None, "currency_code": None}
-    nom_gdp_latest  = {"value": None, "date": None, "source": None, "currency": None, "currency_code": None}
-    debt_pct_latest = {"value": None, "date": None, "source": None, "government_type": None, "path_used": None}
-
-    # Fill from computed bundle if present
-    if isinstance(debt_bundle, dict):
-        gov_debt_latest.update(debt_bundle.get("government_debt", {}))
-        nom_gdp_latest.update(debt_bundle.get("nominal_gdp", {}))
-        debt_pct_latest.update(debt_bundle.get("debt_to_gdp", {}))
-
-    # If computed ratio missing, use WB latest ratio
-    if (not debt_pct_latest.get("value")) and wb_debt_ratio_hist:
-        debt_pct_latest.update({
-            "value": wb_debt_ratio_hist["latest"]["value"],
-            "date": wb_debt_ratio_hist["latest"]["date"],
-            "source": wb_debt_ratio_hist["latest"]["source"],
-        })
-
-    # Ensure currency_code is filled
-    try:
-        if gov_debt_latest.get("currency") == "LCU" and not gov_debt_latest.get("currency_code"):
-            gov_debt_latest["currency_code"] = resolve_currency_code(iso2)
-        if nom_gdp_latest.get("currency") == "LCU" and not nom_gdp_latest.get("currency_code"):
-            nom_gdp_latest["currency_code"] = resolve_currency_code(iso2)
-        if gov_debt_latest.get("currency") == "USD" and not gov_debt_latest.get("currency_code"):
-            gov_debt_latest["currency_code"] = "USD"
-        if nom_gdp_latest.get("currency") == "USD" and not nom_gdp_latest.get("currency_code"):
-            nom_gdp_latest["currency_code"] = "USD"
-    except Exception:
-        pass
-
-    # Attach Eurostat series from v1_debt (if present)
-    eurostat_series = debt_bundle.get("eurostat_series", {}) if isinstance(debt_bundle, dict) else {}
-    es_gd = eurostat_series.get("government_debt_series", {})
-    es_gdp = eurostat_series.get("nominal_gdp_series", {})
-
-    # Build response
-    return JSONResponse(content={
-        "country": country,
-        "iso_codes": codes,
-        "imf_data": imf_data,
-        "government_debt": {"latest": gov_debt_latest, "series": es_gd},
-        "nominal_gdp":     {"latest": nom_gdp_latest,  "series": es_gdp},
-        "debt_to_gdp":     {
-            "latest": debt_pct_latest,
-            "series": (wb_debt_ratio_hist.get("series") if wb_debt_ratio_hist else {})
-        },
-        "additional_indicators": {}
-    })
-
-def country_data(country: str = Query(..., description="Full country name, e.g., Mexico")):
-    codes = resolve_country_codes(country)
-    if not codes:
-        return {"error": "Invalid country name", "country": country}
-
-    iso2, iso3 = codes["iso_alpha_2"], codes["iso_alpha_3"]
-    imf = fetch_imf_sdmx_series(iso2)
-    wb  = fetch_worldbank_data(iso2, iso3)
-
-    # IMF-first indicators with WB fallback
     def imf_series_block(label: str, wb_code: str):
         imf_block = None
         try:
@@ -591,27 +439,9 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
     imf_data["Current Account Balance (% of GDP)"] = wb_entry(wb.get("BN.CAB.XOKA.GD.ZS")) or {"value": None, "date": None, "source": None}
     imf_data["Government Effectiveness"] = wb_entry(wb.get("GE.EST")) or {"value": None, "date": None, "source": None}
 
-    # WB ratio series for historical charting
     wb_debt_ratio_hist = wb_series(wb.get("GC.DOD.TOTL.GD.ZS"))
 
-    # Merge computed trio from /v1/debt
     debt_bundle = v1_debt(country)
-    gov_debt = debt_bundle.get("government_debt", {"value": None, "date": None, "source": None, "government_type": None})
-    nom_gdp  = debt_bundle.get("nominal_gdp", {"value": None, "date": None, "source": None})
-    debt_pct = debt_bundle.get("debt_to_gdp", {"value": None, "date": None, "source": None, "government_type": None})
-
-    # If computed ratio missing, use WB latest ratio; keep WB series for charts
-    if (not debt_pct.get("value")) and wb_debt_ratio_hist:
-        debt_pct.update({
-            "value": wb_debt_ratio_hist["latest"]["value"],
-            "date": wb_debt_ratio_hist["latest"]["date"],
-            "source": wb_debt_ratio_hist["latest"]["source"],
-        })
-
-        # --- Merge computed trio from /v1/debt and preserve currency ---
-    debt_bundle = v1_debt(country)  # call the function directly; it returns a dict
-    
-    # 1) Define safe defaults for the 'latest' blocks
     gov_debt_latest = {
         "value": None, "date": None, "source": None,
         "government_type": None, "currency": None, "currency_code": None,
@@ -624,8 +454,7 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
         "value": None, "date": None, "source": None,
         "government_type": None
     }
-    
-    # 2) Overlay values from the compute result, if present
+
     try:
         if isinstance(debt_bundle, dict):
             gd = debt_bundle.get("government_debt")
@@ -633,13 +462,11 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
                 for k in gov_debt_latest.keys():
                     if k in gd and gd[k] is not None:
                         gov_debt_latest[k] = gd[k]
-    
             ng = debt_bundle.get("nominal_gdp")
             if isinstance(ng, dict):
                 for k in nom_gdp_latest.keys():
                     if k in ng and ng[k] is not None:
                         nom_gdp_latest[k] = ng[k]
-    
             dp = debt_bundle.get("debt_to_gdp")
             if isinstance(dp, dict):
                 for k in debt_pct_latest.keys():
@@ -647,80 +474,48 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
                         debt_pct_latest[k] = dp[k]
     except Exception as e:
         print(f"[/country-data] merge debt bundle failed: {e}")
-    
-    # 3) If computed ratio is missing, fall back to WB ratio (for display only)
-    # You likely already built 'wb_debt_ratio_hist' earlier via wb_series(raw_wb.get("GC.DOD.TOTL.GD.ZS"))
-    # If not, compute it here:
-    #   wb_debt_ratio_hist = wb_series(wb.get("GC.DOD.TOTL.GD.ZS"))
-    
+
     if (debt_pct_latest["value"] is None) and wb_debt_ratio_hist:
         debt_pct_latest.update({
             "value":  wb_debt_ratio_hist["latest"]["value"],
             "date":   wb_debt_ratio_hist["latest"]["date"],
             "source": wb_debt_ratio_hist["latest"]["source"],
-            # government_type remains as-is (None) since WB ratio % is central-gov; set if you want:
-            # "government_type": "Central Government"
         })
-    
-    # 4) Build the exact schema your GPT expects (latest + series)
+
     government_debt_out = {"latest": gov_debt_latest, "series": {}}
     nominal_gdp_out     = {"latest": nom_gdp_latest, "series": {}}
     debt_to_gdp_out     = {
         "latest": debt_pct_latest,
         "series": (wb_debt_ratio_hist.get("series") if wb_debt_ratio_hist else {})
     }
-    
-    
-# Ensure currency_code is filled if missing
-try:
-    if government_debt_out.get("currency") == "LCU" and not government_debt_out.get("currency_code"):
-        government_debt_out["currency_code"] = resolve_currency_code(iso2)
-    if nominal_gdp_out.get("currency") == "LCU" and not nominal_gdp_out.get("currency_code"):
-        nominal_gdp_out["currency_code"] = resolve_currency_code(iso2)
-    if government_debt_out.get("currency") == "USD" and not government_debt_out.get("currency_code"):
-        government_debt_out["currency_code"] = "USD"
-    if nominal_gdp_out.get("currency") == "USD" and not nominal_gdp_out.get("currency_code"):
-        nominal_gdp_out["currency_code"] = "USD"
-except Exception:
-    pass
 
-# 5) Use these in your final return:
-
-    # "government_debt": {"latest": government_debt_out, "series": (es_gd if es_gd else {})},
-    # "nominal_gdp": {"latest": nominal_gdp_out, "series": (es_gdp if es_gdp else {})},
-    # "debt_to_gdp": debt_to_gdp_out,
-        
-    
-
-# Attach Eurostat series from v1_debt (if present)
-eurostat_series = trio.get("eurostat_series", {}) if isinstance(trio, dict) else {}
-es_gd = eurostat_series.get("government_debt_series", {})
-es_gdp = eurostat_series.get("nominal_gdp_series", {})
+    try:
+        if government_debt_out["latest"].get("currency") == "LCU" and not government_debt_out["latest"].get("currency_code"):
+            government_debt_out["latest"]["currency_code"] = resolve_currency_code(iso2)
+        if nominal_gdp_out["latest"].get("currency") == "LCU" and not nominal_gdp_out["latest"].get("currency_code"):
+            nominal_gdp_out["latest"]["currency_code"] = resolve_currency_code(iso2)
+        if government_debt_out["latest"].get("currency") == "USD" and not government_debt_out["latest"].get("currency_code"):
+            government_debt_out["latest"]["currency_code"] = "USD"
+        if nominal_gdp_out["latest"].get("currency") == "USD" and not nominal_gdp_out["latest"].get("currency_code"):
+            nominal_gdp_out["latest"]["currency_code"] = "USD"
+    except Exception:
+        pass
 
     return JSONResponse(content={
         "country": country,
         "iso_codes": codes,
         "imf_data": imf_data,
-        "government_debt": {"latest": government_debt_out, "series": (es_gd if es_gd else {})},
-        "nominal_gdp": {"latest": nominal_gdp_out, "series": (es_gdp if es_gdp else {})},
-        "debt_to_gdp": {
-            "path_used": (trio.get("path_used") if isinstance(trio, dict) else None),
-            "latest": {**debt_to_gdp_out, **({"path_used": trio.get("debt_to_gdp", {}).get("path_used")} if isinstance(trio, dict) else {})},
-            "series": wb_debt_ratio_hist.get("series") if wb_debt_ratio_hist else {}
-        },
+        "government_debt": government_debt_out,
+        "nominal_gdp": nominal_gdp_out,
+        "debt_to_gdp": debt_to_gdp_out,
         "additional_indicators": {}
     })
-
 
 # ------------------ Eurostat (free) JSON-stat 2.0 helpers ------------------
 EUROSTAT_BASE = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data"
 
 @lru_cache(maxsize=256)
 def fetch_eurostat_jsonstat(dataset: str, **filters) -> Optional[dict]:
-    """
-    Fetch Eurostat JSON-stat 2.0 and return the raw JSON.
-    Example: fetch_eurostat_jsonstat("namq_10_gdp", geo="SWE", na_item="B1GQ", unit="CP_MNAC")
-    """
     try:
         params = "&".join([f"{k}={v}" for k, v in filters.items() if v is not None])
         url = f"{EUROSTAT_BASE}/{dataset}?{params}" if params else f"{EUROSTAT_BASE}/{dataset}"
@@ -732,14 +527,9 @@ def fetch_eurostat_jsonstat(dataset: str, **filters) -> Optional[dict]:
         return None
 
 def parse_jsonstat_to_series(js: dict) -> dict:
-    """
-    Convert Eurostat JSON-stat to {period: value}. Supports single-series filters.
-    Periods look like '2025-Q1'.
-    """
     try:
         value = js.get("value")
         dims = js.get("dimension", {})
-        # Find time dimension
         time_key = None
         for k, v in dims.items():
             if isinstance(v, dict) and (v.get("role") == "time" or k.lower() == "time"):
@@ -774,17 +564,12 @@ def parse_jsonstat_to_series(js: dict) -> dict:
         print(f"[eurostat] parse failed: {e}")
         return {}
 
-# EU / EEA / UK ISO-3 whitelist for Eurostat
 EU_ISO3 = {
     "AUT","BEL","BGR","HRV","CYP","CZE","DNK","EST","FIN","FRA","DEU","GRC","HUN","IRL","ITA","LVA","LTU","LUX","MLT",
     "NLD","POL","PRT","ROU","SVK","SVN","ESP","SWE","ISL","NOR","LIE","CHE","GBR"
 }
 
 def eurostat_debt_gdp_quarterly(iso3: str) -> Optional[dict]:
-    """
-    Return latest common quarter trio and full series for Eurostat countries.
-    Includes government_debt_series and nominal_gdp_series (all available quarters).
-    """
     try:
         geo = iso3
         gdp_js = fetch_eurostat_jsonstat("namq_10_gdp", geo=geo, na_item="B1GQ", unit="CP_MNAC")
