@@ -731,15 +731,15 @@ def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
         debt_js = fetch_eurostat_jsonstat("gov_10q_ggdebt", geo=geo, **chosen) or debt_probe
         debt_series = parse_jsonstat_to_series(debt_js)
 
-        
-# If no overlap and country is in euro area, try EUR units explicitly
-if not commons and geo in {'AT','BE','CY','DE','EE','ES','FI','FR','GR','IE','IT','LT','LU','LV','MT','NL','PT','SI','SK'}:
-    debt_js_eur = fetch_eurostat_jsonstat("gov_10q_ggdebt", geo=geo, unit="MIO_EUR", sector="S13", consol="CONS")
-    if debt_js_eur:
-        debt_series = parse_jsonstat_to_series(debt_js_eur)
+        # Find common periods
         commons = sorted(set(gdp_series) & set(debt_series))
+        # If no overlap and country is in euro area, try EUR units explicitly
+        if not commons and geo in {'AT','BE','CY','DE','EE','ES','FI','FR','GR','IE','IT','LT','LU','LV','MT','NL','PT','SI','SK'}:
+            debt_js_eur = fetch_eurostat_jsonstat("gov_10q_ggdebt", geo=geo, unit="MIO_EUR", sector="S13", consol="CONS")
+            if debt_js_eur:
+                debt_series = parse_jsonstat_to_series(debt_js_eur)
+                commons = sorted(set(gdp_series) & set(debt_series))
 
-        commons = sorted(set(gdp_series) & set(debt_series))
         if not commons:
             return None
         period = commons[-1]
