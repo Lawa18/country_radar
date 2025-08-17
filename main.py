@@ -709,18 +709,24 @@ def parse_jsonstat_to_series(js: dict) -> Dict[str, float]:
         return {}
 
 def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
+    def normalize_period(p):
+        # Normalize keys such as "2024-Q2" and "2024Q2", remove spaces
+        return p.replace(" ", "").replace("_", "").replace("-", "").upper()
     try:
         geo = geo_code
 
         # GDP: current prices, national currency, million
         gdp_js = fetch_eurostat_jsonstat("namq_10_gdp", geo=geo, na_item="B1GQ", unit="CP_MNAC")
         if not gdp_js:
+            print(f"[Eurostat][{geo}] No GDP JSONStat returned")
             return None
-        gdp_series = parse_jsonstat_to_series(gdp_js)
+        gdp_series_raw = parse_jsonstat_to_series(gdp_js)
+        gdp_series = {normalize_period(k): v for k, v in gdp_series_raw.items()}
 
         # Debt: prefer national currency, million; S13; consolidated if possible
         debt_probe = fetch_eurostat_jsonstat("gov_10q_ggdebt", geo=geo)
         if not debt_probe:
+            print(f"[Eurostat][{geo}] No Debt probe returned")
             return None
         wants = {
             "unit": ["MIO_NAC", "MIO_CU", "MIO_EUR"],
@@ -729,36 +735,48 @@ def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
         }
         chosen = _es_filter_params(debt_probe, wants)
         debt_js = fetch_eurostat_jsonstat("gov_10q_ggdebt", geo=geo, **chosen) or debt_probe
-        debt_series = parse_jsonstat_to_series(debt_js)
+        debt_series_raw = parse_jsonstat_to_series(debt_js)
+        debt_series = {normalize_period(k): v for k, v in debt_series_raw.items()}
 
-        # Find common periods
+        # Find normalized common periods
         commons = sorted(set(gdp_series) & set(debt_series))
+        print(f"[Eurostat][{geo}] GDP periods (norm): {list(gdp_series.keys())}")
+        print(f"[Eurostat][{geo}] Debt periods (norm): {list(debt_series.keys())}")
+        print(f"[Eurostat][{geo}] Overlap periods: {commons}")
+
         # If no overlap and country is in euro area, try EUR units explicitly
         if not commons and geo in {'AT','BE','CY','DE','EE','ES','FI','FR','GR','IE','IT','LT','LU','LV','MT','NL','PT','SI','SK'}:
             debt_js_eur = fetch_eurostat_jsonstat("gov_10q_ggdebt", geo=geo, unit="MIO_EUR", sector="S13", consol="CONS")
             if debt_js_eur:
-                debt_series = parse_jsonstat_to_series(debt_js_eur)
+                debt_series_raw = parse_jsonstat_to_series(debt_js_eur)
+                debt_series = {normalize_period(k): v for k, v in debt_series_raw.items()}
                 commons = sorted(set(gdp_series) & set(debt_series))
+                print(f"[Eurostat][{geo}] Retried EUR units. New overlap: {commons}")
 
         if not commons:
+            print(f"[Eurostat][{geo}] No overlap between GDP and Debt periods after normalization.")
             return None
         period = commons[-1]
         debt_v = float(debt_series[period])
         gdp_v = float(gdp_series[period])
         if gdp_v == 0:
+            print(f"[Eurostat][{geo}] GDP value for period {period} is zero.")
             return None
+
+        # Un-normalize period for output if desired (e.g., match to original key)
+        output_period = next((k for k in gdp_series_raw if normalize_period(k) == period), period)
 
         return {
             "debt_value": debt_v,
             "gdp_value": gdp_v,
-            "period": period,
+            "period": output_period,
             "debt_to_gdp": round((debt_v / gdp_v) * 100, 2),
             "source": "Eurostat",
             "government_type": "General Government",
             "currency": "LCU",
             "path_used": "EUROSTAT_Q",
-            "government_debt_series": dict(sorted(debt_series.items(), key=lambda x: x[0], reverse=True)),
-            "nominal_gdp_series": dict(sorted(gdp_series.items(), key=lambda x: x[0], reverse=True)),
+            "government_debt_series": dict(sorted(debt_series_raw.items(), key=lambda x: x[0], reverse=True)),
+            "nominal_gdp_series": dict(sorted(gdp_series_raw.items(), key=lambda x: x[0], reverse=True)),
         }
     except Exception as e:
         print(f"[Eurostat] trio failed: {e}")
