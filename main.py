@@ -769,7 +769,8 @@ def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
 
         # ---- 1. Try quarterly government debt ----
         debt_series_raw = None
-        tried = []
+        debt_source = None
+        debt_path = None
         queries = [
             {"unit": "MIO_NAC", "sector": "S13", "consol": "CONS"},
             {"unit": "MIO_EUR", "sector": "S13", "consol": "CONS"},
@@ -781,10 +782,13 @@ def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
         ]
         for q in queries:
             try:
+                print(f"[Eurostat][{geo}] Trying gov_10q_ggdebt with: {', '.join([f'{k}={v}' for k, v in q.items()]) or 'no filters'}")
                 debt_js = fetch_eurostat_jsonstat("gov_10q_ggdebt", geo=geo, **q)
                 if debt_js:
                     debt_series_raw = parse_jsonstat_to_series(debt_js)
                     if debt_series_raw:
+                        debt_source = "Eurostat"
+                        debt_path = "EUROSTAT_Q"
                         break
             except Exception as e:
                 print(f"[Eurostat][{geo}] Debt fetch failed for {q}: {e}")
@@ -792,19 +796,15 @@ def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
         # ---- 2. If quarterly fails, try annual government debt ----
         if not debt_series_raw:
             print(f"[Eurostat][{geo}] Trying annual government debt dataset gov_10_dd_edpt1 as fallback.")
-            annual_debt_js = fetch_eurostat_jsonstat("gov_10_dd_edpt1", geo=geo, unit="MIO_EUR", sector="S13")
-            if annual_debt_js:
-                debt_series_raw = parse_jsonstat_to_series(annual_debt_js)
-                if debt_series_raw:
-                    debt_source = "Eurostat (annual)"
-                    debt_path = "EUROSTAT_ANNUAL"
-                else:
-                    debt_series_raw = None
-            else:
-                debt_series_raw = None
-        else:
-            debt_source = "Eurostat"
-            debt_path = "EUROSTAT_Q"
+            try:
+                annual_debt_js = fetch_eurostat_jsonstat("gov_10_dd_edpt1", geo=geo, unit="MIO_EUR", sector="S13")
+                if annual_debt_js:
+                    debt_series_raw = parse_jsonstat_to_series(annual_debt_js)
+                    if debt_series_raw:
+                        debt_source = "Eurostat (annual)"
+                        debt_path = "EUROSTAT_ANNUAL"
+            except Exception as e:
+                print(f"[Eurostat][{geo}] Annual debt fetch failed: {e}")
 
         if not debt_series_raw:
             print(f"[Eurostat][{geo}] No Debt series found after all attempts.")
