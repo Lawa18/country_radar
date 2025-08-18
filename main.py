@@ -746,9 +746,15 @@ def parse_jsonstat_to_series(js: dict) -> Dict[str, float]:
         print(f"[Eurostat] parse failed: {e}")
         return {}
 
+def _is_num(x):
+    try:
+        float(x)
+        return True
+    except Exception:
+        return False
+
 def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
     def normalize_period(p):
-        # Normalize keys such as "2024-Q2" and "2024Q2", remove spaces
         return p.replace(" ", "").replace("_", "").replace("-", "").upper()
     try:
         geo = geo_code
@@ -772,7 +778,9 @@ def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
             "consol": ["CONS", "C"],
         }
         chosen = _es_filter_params(debt_probe, wants)
-        debt_js = fetch_eurostat_jsonstat("gov_10q_ggdebt", geo=geo, **chosen) or debt_probe
+        # Remove geo from chosen if present to avoid multiple values error
+        chosen_filtered = {k: v for k, v in chosen.items() if k != "geo"}
+        debt_js = fetch_eurostat_jsonstat("gov_10q_ggdebt", geo=geo, **chosen_filtered) or debt_probe
         debt_series_raw = parse_jsonstat_to_series(debt_js)
         debt_series = {normalize_period(k): v for k, v in debt_series_raw.items()}
 
@@ -801,7 +809,6 @@ def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
             print(f"[Eurostat][{geo}] GDP value for period {period} is zero.")
             return None
 
-        # Un-normalize period for output if desired (e.g., match to original key)
         output_period = next((k for k in gdp_series_raw if normalize_period(k) == period), period)
 
         return {
