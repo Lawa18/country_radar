@@ -767,21 +767,33 @@ def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
         gdp_series_raw = parse_jsonstat_to_series(gdp_js)
         gdp_series = {normalize_period(k): v for k, v in gdp_series_raw.items()}
 
-        # Debt: prefer national currency, million; S13; consolidated if possible
-        debt_probe = fetch_eurostat_jsonstat("gov_10q_ggdebt", geo=geo)
-        if not debt_probe:
-            print(f"[Eurostat][{geo}] No Debt probe returned")
+        # Debt: try with most strict filters, then relax
+        debt_series_raw = None
+        tried = []
+        queries = [
+            {"unit": "MIO_NAC", "sector": "S13", "consol": "CONS"},
+            {"unit": "MIO_EUR", "sector": "S13", "consol": "CONS"},
+            {"sector": "S13", "consol": "CONS"},
+            {"unit": "MIO_NAC", "sector": "S13"},
+            {"unit": "MIO_EUR", "sector": "S13"},
+            {"sector": "S13"},
+            {},  # completely unfiltered
+        ]
+        for q in queries:
+            try:
+                qstr = ", ".join([f"{k}={v}" for k, v in q.items()])
+                print(f"[Eurostat][{geo}] Trying gov_10q_ggdebt with: {qstr or 'no filters'}")
+                debt_js = fetch_eurostat_jsonstat("gov_10q_ggdebt", geo=geo, **q)
+                if debt_js:
+                    debt_series_raw = parse_jsonstat_to_series(debt_js)
+                    if debt_series_raw:
+                        break
+            except Exception as e:
+                print(f"[Eurostat][{geo}] Debt fetch failed for {q}: {e}")
+
+        if not debt_series_raw:
+            print(f"[Eurostat][{geo}] No Debt series found after all attempts.")
             return None
-        wants = {
-            "unit": ["MIO_NAC", "MIO_CU", "MIO_EUR"],
-            "sector": ["S13"],
-            "consol": ["CONS", "C"],
-        }
-        chosen = _es_filter_params(debt_probe, wants)
-        # Remove geo from chosen if present to avoid multiple values error
-        chosen_filtered = {k: v for k, v in chosen.items() if k != "geo"}
-        debt_js = fetch_eurostat_jsonstat("gov_10q_ggdebt", geo=geo, **chosen_filtered) or debt_probe
-        debt_series_raw = parse_jsonstat_to_series(debt_js)
         debt_series = {normalize_period(k): v for k, v in debt_series_raw.items()}
 
         # Find normalized common periods
@@ -789,15 +801,6 @@ def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
         print(f"[Eurostat][{geo}] GDP periods (norm): {list(gdp_series.keys())}")
         print(f"[Eurostat][{geo}] Debt periods (norm): {list(debt_series.keys())}")
         print(f"[Eurostat][{geo}] Overlap periods: {commons}")
-
-        # If no overlap and country is in euro area, try EUR units explicitly
-        if not commons and geo in {'AT','BE','CY','DE','EE','ES','FI','FR','GR','IE','IT','LT','LU','LV','MT','NL','PT','SI','SK'}:
-            debt_js_eur = fetch_eurostat_jsonstat("gov_10q_ggdebt", geo=geo, unit="MIO_EUR", sector="S13", consol="CONS")
-            if debt_js_eur:
-                debt_series_raw = parse_jsonstat_to_series(debt_js_eur)
-                debt_series = {normalize_period(k): v for k, v in debt_series_raw.items()}
-                commons = sorted(set(gdp_series) & set(debt_series))
-                print(f"[Eurostat][{geo}] Retried EUR units. New overlap: {commons}")
 
         if not commons:
             print(f"[Eurostat][{geo}] No overlap between GDP and Debt periods after normalization.")
