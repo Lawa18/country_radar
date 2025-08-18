@@ -759,7 +759,7 @@ def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
     try:
         geo = geo_code
 
-        # GDP: current prices, national currency, million
+        # GDP: current prices, national currency, million (quarterly)
         gdp_js = fetch_eurostat_jsonstat("namq_10_gdp", geo=geo, na_item="B1GQ", unit="CP_MNAC")
         if not gdp_js:
             print(f"[Eurostat][{geo}] No GDP JSONStat returned")
@@ -767,7 +767,7 @@ def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
         gdp_series_raw = parse_jsonstat_to_series(gdp_js)
         gdp_series = {normalize_period(k): v for k, v in gdp_series_raw.items()}
 
-        # Debt: try with most strict filters, then relax
+        # ---- 1. Try quarterly government debt ----
         debt_series_raw = None
         tried = []
         queries = [
@@ -777,12 +777,10 @@ def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
             {"unit": "MIO_NAC", "sector": "S13"},
             {"unit": "MIO_EUR", "sector": "S13"},
             {"sector": "S13"},
-            {},  # completely unfiltered
+            {},
         ]
         for q in queries:
             try:
-                qstr = ", ".join([f"{k}={v}" for k, v in q.items()])
-                print(f"[Eurostat][{geo}] Trying gov_10q_ggdebt with: {qstr or 'no filters'}")
                 debt_js = fetch_eurostat_jsonstat("gov_10q_ggdebt", geo=geo, **q)
                 if debt_js:
                     debt_series_raw = parse_jsonstat_to_series(debt_js)
@@ -791,12 +789,28 @@ def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
             except Exception as e:
                 print(f"[Eurostat][{geo}] Debt fetch failed for {q}: {e}")
 
+        # ---- 2. If quarterly fails, try annual government debt ----
+        if not debt_series_raw:
+            print(f"[Eurostat][{geo}] Trying annual government debt dataset gov_10_dd_edpt1 as fallback.")
+            annual_debt_js = fetch_eurostat_jsonstat("gov_10_dd_edpt1", geo=geo, unit="MIO_EUR", sector="S13")
+            if annual_debt_js:
+                debt_series_raw = parse_jsonstat_to_series(annual_debt_js)
+                if debt_series_raw:
+                    debt_source = "Eurostat (annual)"
+                    debt_path = "EUROSTAT_ANNUAL"
+                else:
+                    debt_series_raw = None
+            else:
+                debt_series_raw = None
+        else:
+            debt_source = "Eurostat"
+            debt_path = "EUROSTAT_Q"
+
         if not debt_series_raw:
             print(f"[Eurostat][{geo}] No Debt series found after all attempts.")
             return None
-        debt_series = {normalize_period(k): v for k, v in debt_series_raw.items()}
 
-        # Find normalized common periods
+        debt_series = {normalize_period(k): v for k, v in debt_series_raw.items()}
         commons = sorted(set(gdp_series) & set(debt_series))
         print(f"[Eurostat][{geo}] GDP periods (norm): {list(gdp_series.keys())}")
         print(f"[Eurostat][{geo}] Debt periods (norm): {list(debt_series.keys())}")
@@ -805,6 +819,7 @@ def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
         if not commons:
             print(f"[Eurostat][{geo}] No overlap between GDP and Debt periods after normalization.")
             return None
+
         period = commons[-1]
         debt_v = float(debt_series[period])
         gdp_v = float(gdp_series[period])
@@ -819,10 +834,10 @@ def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
             "gdp_value": gdp_v,
             "period": output_period,
             "debt_to_gdp": round((debt_v / gdp_v) * 100, 2),
-            "source": "Eurostat",
+            "source": debt_source,
             "government_type": "General Government",
             "currency": "LCU",
-            "path_used": "EUROSTAT_Q",
+            "path_used": debt_path,
             "government_debt_series": dict(sorted(debt_series_raw.items(), key=lambda x: x[0], reverse=True)),
             "nominal_gdp_series": dict(sorted(gdp_series_raw.items(), key=lambda x: x[0], reverse=True)),
         }
