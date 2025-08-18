@@ -294,13 +294,15 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
     except Exception as e:
         print(f"[v1_debt] IMF step failed: {e}")
 
-    # 2) Eurostat quarterly (EU/EEA/UK)
+       # 2) Eurostat quarterly (EU/EEA/UK)
     eurostat_result = None
     if iso3 in EU_ISO3:
         try:
             eurostat_result = eurostat_debt_gdp_quarterly(iso2)
+            print(f"[DEBUG][{country}] iso2: {iso2}, iso3: {iso3}, EU_ISO3: {EU_ISO3}")
+            print(f"[DEBUG][{country}] Eurostat result: {eurostat_result}")
             if eurostat_result:
-                print(f"[v1_debt][{country}] Using Eurostat result: {eurostat_result}")
+                print(f"[DEBUG][{country}] Forcing Eurostat as source")
                 bundle = {
                     'debt_value': eurostat_result['debt_value'],
                     'gdp_value': eurostat_result['gdp_value'],
@@ -315,9 +317,36 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
                     'government_debt_series': eurostat_result.get('government_debt_series', {}),
                     'nominal_gdp_series': eurostat_result.get('nominal_gdp_series', {})
                 }
+                # FOR DEBUGGING: return immediately if Eurostat found
+                return {
+                    "country": country,
+                    "iso_codes": codes,
+                    "government_debt": {
+                        "value": bundle["debt_value"],
+                        "date": str(bundle["year"]),
+                        "source": bundle["source"],
+                        "government_type": bundle["government_type"],
+                        "currency": bundle.get("currency"),
+                        "currency_code": bundle.get("currency_code")
+                    },
+                    "nominal_gdp": {
+                        "value": bundle["gdp_value"],
+                        "date": str(bundle["year"]),
+                        "source": bundle["source"],
+                        "currency": bundle.get("currency"),
+                        "currency_code": bundle.get("currency_code")
+                    },
+                    "debt_to_gdp": {
+                        "value": bundle["debt_to_gdp"],
+                        "date": str(bundle["year"]),
+                        "source": bundle["source"],
+                        "government_type": bundle["government_type"]
+                    },
+                    "eurostat_series": eurostat_series_cache
+                }
         except Exception as e:
             print(f"[v1_debt] Eurostat step failed: {e}")
-
+            
     # 3) World Bank fallback (LCU components, then ratio-assisted)
     if not bundle:
         try:
