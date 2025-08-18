@@ -274,6 +274,7 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
     iso2, iso3 = codes["iso_alpha_2"], codes["iso_alpha_3"]
 
     bundle = None
+    eurostat_series_cache = {}
 
     # 1) IMF WEO preferred
     try:
@@ -294,23 +295,25 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
         print(f"[v1_debt] IMF step failed: {e}")
 
     # 2) Eurostat quarterly (EU/EEA/UK)
-    if not bundle and iso3 in EU_ISO3:
+    eurostat_result = None
+    if iso3 in EU_ISO3:
         try:
-            es = eurostat_debt_gdp_quarterly(iso2)
-            if es:
+            eurostat_result = eurostat_debt_gdp_quarterly(iso2)
+            if eurostat_result:
+                print(f"[v1_debt][{country}] Using Eurostat result: {eurostat_result}")
                 bundle = {
-                    'debt_value': es['debt_value'],
-                    'gdp_value': es['gdp_value'],
-                    'year': es.get('period', ''),
-                    'debt_to_gdp': es['debt_to_gdp'],
-                    'source': es['source'],
-                    'government_type': es['government_type'],
+                    'debt_value': eurostat_result['debt_value'],
+                    'gdp_value': eurostat_result['gdp_value'],
+                    'year': eurostat_result.get('period', ''),
+                    'debt_to_gdp': eurostat_result['debt_to_gdp'],
+                    'source': eurostat_result['source'],
+                    'government_type': eurostat_result['government_type'],
                     'currency': 'LCU', 'currency_code': resolve_currency_code(iso2),
-                    'path_used': es['path_used']
+                    'path_used': eurostat_result['path_used']
                 }
                 eurostat_series_cache = {
-                    'government_debt_series': es.get('government_debt_series', {}),
-                    'nominal_gdp_series': es.get('nominal_gdp_series', {})
+                    'government_debt_series': eurostat_result.get('government_debt_series', {}),
+                    'nominal_gdp_series': eurostat_result.get('nominal_gdp_series', {})
                 }
         except Exception as e:
             print(f"[v1_debt] Eurostat step failed: {e}")
@@ -354,7 +357,7 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
         except Exception as e:
             print(f"[v1_debt] WB step failed: {e}")
 
-    # 3) World Bank USD-components fallback
+    # 4) World Bank USD-components fallback
     if not bundle:
         try:
             debt_usd_raw = wb.get("GC.DOD.TOTL.CD")
@@ -376,7 +379,7 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
         except Exception as e:
             print(f"[Debt USD Fallback] Error: {e}")
 
-    return {
+    result = {
         "country": country,
         "iso_codes": codes,
         "government_debt": (
@@ -396,6 +399,12 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
             if bundle else {"value": None, "date": None, "source": None, "government_type": None}
         ),
     }
+
+    # Attach Eurostat series for country-data route if available
+    if eurostat_series_cache:
+        result["eurostat_series"] = eurostat_series_cache
+
+    return result
 
 @app.get("/country-data")
 def country_data(country: str = Query(..., description="Full country name, e.g., Germany")):
