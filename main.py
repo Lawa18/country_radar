@@ -266,10 +266,6 @@ def debug_debt(country: str = Query(...)):
         "latest_common_ratio": (common_ratio[-1] if common_ratio else None),
     }
 
-<full file, with only the /v1/debt endpoint updated to use best-of logic, all else preserved>
-
-# --- [All your code from lines 1-299 unchanged above] ---
-
 @app.get("/v1/debt")
 def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexico")):
     codes = resolve_country_codes(country)
