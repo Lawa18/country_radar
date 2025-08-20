@@ -280,7 +280,7 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
 
     # 1. Eurostat ratio (annual, if available)
     try:
-        ratio_js = fetch_eurostat_jsonstat("gov_10_dd_edpt1", geo=iso2, unit="PC_GDP", sector="S13")
+        ratio_js = fetch_eurostat_jsonstat("gov_10dd_edpt1", geo=iso2, unit="PC_GDP", sector="S13")
         ratio_series = parse_jsonstat_to_series(ratio_js) if ratio_js else {}
         if ratio_series:
             years = sorted([y for y in ratio_series if ratio_series[y] is not None], reverse=True)
@@ -712,9 +712,9 @@ def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
 
         # ---- 2. If quarterly fails, try annual government debt ----
         if not debt_series_raw:
-            print(f"[Eurostat][{geo}] Trying annual government debt dataset gov_10_dd_edpt1 as fallback.")
+            print(f"[Eurostat][{geo}] Trying annual government debt dataset gov_10dd_edpt1 as fallback.")
             try:
-                annual_debt_js = fetch_eurostat_jsonstat("gov_10_dd_edpt1", geo=geo, unit="MIO_EUR", sector="S13")
+                annual_debt_js = fetch_eurostat_jsonstat("gov_10dd_edpt1", geo=geo, unit="MIO_EUR", sector="S13")
                 if annual_debt_js:
                     debt_series_raw = parse_jsonstat_to_series(annual_debt_js)
                     if debt_series_raw:
