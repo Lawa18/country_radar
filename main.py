@@ -395,6 +395,8 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
     imf_data["Government Effectiveness"] = wb_entry(wb.get("GE.EST")) or {"value": None, "date": None, "source": None}
 
     wb_debt_ratio_hist = wb_series(wb.get("GC.DOD.TOTL.GD.ZS"))
+    # Eurostat annual ratio
+    ratio_es = eurostat_debt_to_gdp_annual(iso2)
     debt_bundle = v1_debt(country)
 
     gov_debt_latest = {
@@ -526,43 +528,78 @@ def fetch_eurostat_jsonstat(dataset: str, **filters) -> Optional[dict]:
         print(f"[eurostat] fetch failed {dataset} {filters}: {e}")
         return None
 
-def parse_jsonstat_to_series(js: dict) -> dict:
+
+def parse_jsonstat_to_series(js: dict) -> Dict[str, float]:
+    """Parse Eurostat JSON‑stat into {period: value} with correct handling of multi‑dimensional arrays.
+    We vary only the time dimension and hold all other dimensions at index 0.
+    """
     try:
-        value = js.get("value")
         dims = js.get("dimension", {})
+        ids = js.get("id") or [k for k in dims.keys() if k not in ("id", "size")]
+        sizes = js.get("size")
+        if not sizes:
+            sizes = []
+            for d in ids:
+                dd = dims.get(d, {})
+                sz = dd.get("size") if isinstance(dd, dict) else None
+                sizes.append(int(sz or 1))
+
+        # Identify time dimension and its position
         time_key = None
-        for k, v in dims.items():
-            if isinstance(v, dict) and (v.get("role") == "time" or k.lower() == "time"):
+        for k in ids:
+            d = dims.get(k, {})
+            if isinstance(d, dict) and (d.get("role") == "time" or k.lower() == "time"):
                 time_key = k
                 break
-        if time_key is None:
-            keys = [k for k in dims.keys() if k not in ("id","size")]
-            if keys: time_key = keys[-1]
-        time_cat = dims.get(time_key, {}).get("category", {})
-        time_index = time_cat.get("index", {})
-        time_label = time_cat.get("label", {})
-        idx_to_period = {}
-        for k, idx in time_index.items():
-            idx_to_period[int(idx)] = time_label.get(k, k)
-        series = {}
-        if isinstance(value, list):
-            for i, v in enumerate(value):
-                if v is None: continue
-                period = idx_to_period.get(i)
-                if period is None: continue
-                series[str(period)] = float(v)
-        elif isinstance(value, dict):
-            for k, v in value.items():
-                try: i = int(k)
-                except: continue
-                if v is None: continue
-                period = idx_to_period.get(i)
-                if period is None: continue
-                series[str(period)] = float(v)
+        if not time_key and ids:
+            time_key = ids[-1]
+        tpos = ids.index(time_key)
+
+        # Build time positions -> labels
+        tcat = dims.get(time_key, {}).get("category", {})
+        tidx = tcat.get("index", {})  # {'2024-Q1': 0, ...}
+        tlab = tcat.get("label", {})
+        if not tidx:
+            return {}
+        maxpos = max(int(v) for v in tidx.values())
+        time_labels = [None] * (maxpos + 1)
+        for code, pos in tidx.items():
+            time_labels[int(pos)] = tlab.get(code, code)
+
+        # Compute strides for flat array
+        strides = [1] * len(ids)
+        running = 1
+        for i in range(len(ids)-1, -1, -1):
+            strides[i] = running
+            running *= int(sizes[i] or 1)
+
+        values = js.get("value")
+        if isinstance(values, dict):
+            dense = [None] * running
+            for k, v in values.items():
+                dense[int(k)] = v
+            values = dense
+        if not isinstance(values, list):
+            return {}
+
+        series: Dict[str, float] = {}
+        tstride = strides[tpos]
+        for t, label in enumerate(time_labels):
+            if label is None:
+                continue
+            idx = t * tstride  # other dims at index 0
+            if idx >= len(values):
+                continue
+            v = values[idx]
+            if v is None:
+                continue
+            if _is_num(v):
+                series[str(label)] = float(v)
         return series
     except Exception as e:
-        print(f"[eurostat] parse failed: {e}")
+        print(f"[Eurostat] parse failed: {e}")
         return {}
+
 
 EU_ISO3 = {
     "AUT","BEL","BGR","HRV","CYP","CZE","DNK","EST","FIN","FRA","DEU","GRC","HUN","IRL","ITA","LVA","LTU","LUX","MLT",
@@ -669,6 +706,21 @@ def _is_num(x):
         return True
     except Exception:
         return False
+
+
+@lru_cache(maxsize=256)
+def eurostat_debt_to_gdp_annual(iso2: str) -> Dict[str, float]:
+    """Annual General Government Debt-to-GDP (%) from Eurostat (gov_10dd_edpt1).
+    Filters: unit=PC_GDP, sector=S13. Returns {YYYY: pct}.
+    """
+    try:
+        js = fetch_eurostat_jsonstat("gov_10dd_edpt1", geo=iso2, unit="PC_GDP", sector="S13")
+        if not js:
+            return {}
+        return parse_jsonstat_to_series(js)
+    except Exception as e:
+        print(f"[Eurostat] ratio annual failed {iso2}: {e}")
+        return {}
 
 def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
     def normalize_period(p):
