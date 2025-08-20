@@ -761,3 +761,113 @@ def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
     except Exception as e:
         print(f"[Eurostat] trio failed: {e}")
         return None
+
+
+
+def parse_jsonstat_to_series(js: dict) -> dict:
+    """
+    Robust JSON-stat 2.0 flattener.
+    Returns {period: value} for a single "slice" across non-time dimensions (index 0 for each).
+    Time axis is taken according to the dataset's "id"/"size" order.
+    """
+    try:
+        dims = js.get("dimension", {}) or {}
+        ids = js.get("id") or [k for k in dims.keys() if k not in ("id","size")]
+        sizes = js.get("size")
+        if sizes is None:
+            sizes = []
+            for d in ids:
+                sz = dims.get(d, {}).get("size") if isinstance(dims.get(d), dict) else None
+                sizes.append(int(sz or 1))
+
+        # Find the time dimension key
+        time_key = None
+        for k, v in dims.items():
+            if isinstance(v, dict) and (v.get("role") == "time" or k.lower() == "time"):
+                time_key = k
+                break
+        if time_key is None and ids:
+            time_key = ids[-1]  # fallback: last dim
+
+        # Build time index->label mapping
+        tcat = dims.get(time_key, {}).get("category", {})
+        tidx = tcat.get("index", {})  # {"2024-Q1": 0, ...}
+        tlab = tcat.get("label", {})
+        idx_to_period = {}
+        for code, i in tidx.items():
+            try:
+                ii = int(i)
+            except Exception:
+                continue
+            idx_to_period[ii] = tlab.get(code, code)
+
+        # Normalize values to dense list
+        values = js.get("value", [])
+        total_size = 1
+        for s in sizes:
+            total_size *= int(s or 1)
+        if isinstance(values, dict):
+            dense = [None] * total_size
+            for k, v in values.items():
+                try:
+                    pos = int(k)
+                except Exception:
+                    continue
+                if 0 <= pos < total_size:
+                    dense[pos] = v
+            values = dense
+        elif not isinstance(values, list):
+            return {}
+
+        # Compute stride for each dimension (row-major with ids order)
+        # index = sum(coord[d] * stride[d])
+        strides = []
+        acc = 1
+        for s in reversed(sizes[1:] + [1]):  # build strides from the right
+            strides.insert(0, acc)
+            acc *= s if isinstance(s, int) else int(s or 1)
+        # Ensure strides length matches ids length
+        if len(strides) != len(ids):
+            strides = [0]*len(ids)
+            acc = 1
+            for i in range(len(ids)-1, -1, -1):
+                strides[i] = acc
+                acc *= int(sizes[i] or 1)
+
+        # Coordinates: choose 0 for all non-time dims
+        coords = [0]*len(ids)
+        try:
+            tpos = ids.index(time_key)
+        except ValueError:
+            tpos = len(ids)-1  # fallback
+        tsize = int(sizes[tpos] or 0)
+
+        # For dims AFTER time, coords already 0; For dims BEFORE time, coords also 0.
+        # Offset for the fixed "slice":
+        offset = 0  # all other coords are 0
+
+        # Build series by walking along time axis
+        series = {}
+        for t in range(tsize):
+            coords[tpos] = t
+            # compute flat index
+            flat = offset
+            for i, c in enumerate(coords):
+                flat += int(c) * int(strides[i])
+            if flat < 0 or flat >= len(values):
+                continue
+            v = values[flat]
+            if v is None:
+                continue
+            if not isinstance(v, (int, float)):
+                try:
+                    v = float(v)
+                except Exception:
+                    continue
+            # map time index -> period label
+            period = idx_to_period.get(t, str(t))
+            series[str(period)] = float(v)
+        return series
+    except Exception as e:
+        print(f"[Eurostat] parse failed: {e}")
+        return {}
