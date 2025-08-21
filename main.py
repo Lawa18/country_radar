@@ -828,15 +828,43 @@ def _is_num(x):
 
 
 @lru_cache(maxsize=256)
-def eurostat_debt_to_gdp_annual(iso2: str) -> Dict[str, float]:
-    """Annual General Government Debt-to-GDP (%) from Eurostat (gov_10dd_edpt1).
-    Filters: unit=PC_GDP, sector=S13. Returns {YYYY: pct}.
+def eurostat_debt_to_gdp_annual(iso2: str) -> dict:
+    """
+    Annual General Government Debt-to-GDP (%) from Eurostat.
+    Dataset: gov_10dd_edpt1 (NOTE: no underscore between 10 and dd)
+    Filters: na_item=GD (gross debt), unit=PC_GDP, sector=S13
+    Returns: { 'YYYY': float }
     """
     try:
-        js = fetch_eurostat_jsonstat("gov_10dd_edpt1", geo=iso2, unit="PC_GDP", sector="S13")
+        js = fetch_eurostat_jsonstat(
+            "gov_10dd_edpt1",     # <-- correct dataset id (NO extra underscore)
+            geo=iso2,             # ISO-2, e.g., 'DE'
+            na_item="GD",         # <-- REQUIRED: gross debt (not deficit/surplus)
+            unit="PC_GDP",
+            sector="S13"
+        )
         if not js:
             return {}
-        return parse_jsonstat_to_series(js)
+
+        # Use your JSON-stat parser that preserves the time axis
+        series = parse_jsonstat_to_series(js) or {}
+        # Keep only clean annual years as strings
+        out = {}
+        for k, v in series.items():
+            ks = str(k)
+            if len(ks) == 4 and ks.isdigit() and v is not None:
+                try:
+                    out[ks] = float(v)
+                except Exception:
+                    pass
+
+        # Optional guard (logs if a deficit-like number sneaks in)
+        if out:
+            y = max(out.keys())
+            val = out[y]
+            if -5.0 < val < 5.0:
+                print(f"[Guard] Eurostat GD ratio suspiciously small ({val}) for {iso2} {y}. Check filters.")
+        return out
     except Exception as e:
         print(f"[Eurostat] ratio annual failed {iso2}: {e}")
         return {}
