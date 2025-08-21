@@ -534,6 +534,56 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
     except Exception as e:
         print(f"[/country-data] merge debt bundle failed: {e}")
 
+        # Prefer the ratio series already selected by /v1/debt (Eurostat -> IMF -> WB)
+    ratio_series_from_v1 = {}
+    try:
+        if isinstance(debt_bundle, dict):
+            ratio_series_from_v1 = debt_bundle.get("debt_to_gdp_series") or {}
+    except Exception:
+        ratio_series_from_v1 = {}
+
+    # Fallback series if v1/debt didn’t include one
+    if not ratio_series_from_v1:
+        # Use Eurostat annual % (GD) if available, else WB ratio series
+        try:
+            es_ratio_series = ratio_es or {}
+        except Exception:
+            es_ratio_series = {}
+        try:
+            wb_ratio_series = wb_debt_ratio_hist.get("series") if wb_debt_ratio_hist else {}
+            wb_ratio_series = wb_ratio_series or {}
+        except Exception:
+            wb_ratio_series = {}
+        ratio_series_from_v1 = es_ratio_series or wb_ratio_series or {}
+
+    # Ensure currency_code is present when LCU/USD flagged
+    try:
+        if gov_debt_latest.get("currency") == "LCU" and not gov_debt_latest.get("currency_code"):
+            gov_debt_latest["currency_code"] = resolve_currency_code(iso2)
+        if nom_gdp_latest.get("currency") == "LCU" and not nom_gdp_latest.get("currency_code"):
+            nom_gdp_latest["currency_code"] = resolve_currency_code(iso2)
+        if gov_debt_latest.get("currency") == "USD" and not gov_debt_latest.get("currency_code"):
+            gov_debt_latest["currency_code"] = "USD"
+        if nom_gdp_latest.get("currency") == "USD" and not nom_gdp_latest.get("currency_code"):
+            nom_gdp_latest["currency_code"] = "USD"
+    except Exception:
+        pass
+
+    # Build response (keeps your shapes the same)
+    return {
+        "country": country,
+        "iso_codes": codes,
+        "imf_data": imf_data,
+        "government_debt": {"latest": gov_debt_latest, "series": {}},  # series optional/empty here
+        "nominal_gdp":     {"latest": nom_gdp_latest, "series": {}},   # series optional/empty here
+        "debt_to_gdp": {
+            "latest": debt_pct_latest,           # whatever /v1/debt picked as latest
+            "series": ratio_series_from_v1       # <- now Eurostat for DE (not WB 1990)
+        },
+        "additional_indicators": {}
+    }
+
+
     # --- Eurostat: Prefer Eurostat series for eligible EU/EEA/UK countries ---
     # v1_debt now attaches 'eurostat_series' for these.
     eurostat_series = debt_bundle.get("eurostat_series", {}) if isinstance(debt_bundle, dict) else {}
