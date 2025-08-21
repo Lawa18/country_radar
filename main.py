@@ -268,49 +268,77 @@ def debug_debt(country: str = Query(...)):
 
 @app.get("/v1/debt")
 def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexico")):
+    # Resolve codes
     codes = resolve_country_codes(country)
     if not codes:
         return {"error": "Invalid country name", "country": country}
     iso2, iso3 = codes["iso_alpha_2"], codes["iso_alpha_3"]
 
-    # Unified "best-of" logic
-    eurostat_best = None
-    imf_best = None
-    wb_best = None
+    # Initialize outputs
+    path_used = None
+    government_debt = None
+    nominal_gdp = None
 
-    
-# 1. Eurostat ratio (annual, if available)
-try:
-    ratio_es = eurostat_debt_to_gdp_annual(iso2)
-    if ratio_es:
-        ly = max(int(y) for y in ratio_es.keys() if str(y).isdigit())
-        eurostat_best = {
-            "debt_to_gdp": round(float(ratio_es[str(ly)]), 2),
-            "period": str(ly),
-            "source": "Eurostat (debt-to-GDP ratio)",
-            "government_type": "General Government"
-        }
-except Exception:
-    pass
-
-# 2. IMF WEO ratio
+    # 1) Try Eurostat quarterly levels (LCU or EUR)
+    es = None
     try:
-        weo = fetch_imf_weo_series(iso3, ["GGXWDG", "NGDP"])
-        ggxwdg = weo.get("GGXWDG", {})
-        if ggxwdg:
-            years = sorted([y for y in ggxwdg if ggxwdg[y] is not None], reverse=True)
-            if years:
-                period = years[0]
-                imf_best = {
-                    "debt_to_gdp": round(float(ggxwdg[period]), 2),
-                    "period": period,
-                    "source": "IMF WEO (ratio)",
-                    "government_type": "General Government"
-                }
+        try:
+            es = eurostat_debt_gdp_quarterly(iso2)  # prefer ISO-2 for Eurostat
+        except Exception:
+            es = eurostat_debt_gdp_quarterly(iso3)
     except Exception:
-        pass
+        es = None
+    if es:
+        try:
+            government_debt = {
+                "value": es["debt_value"],
+                "date": es.get("period"),
+                "source": "Eurostat",
+                "government_type": "General Government",
+                "currency": "LCU",
+                "currency_code": resolve_currency_code(iso2)
+            }
+            nominal_gdp = {
+                "value": es["gdp_value"],
+                "date": es.get("period"),
+                "source": "Eurostat",
+                "currency": "LCU",
+                "currency_code": resolve_currency_code(iso2)
+            }
+            path_used = "EUROSTAT_Q"
+        except Exception:
+            pass
 
-    # 3. World Bank ratio
+    # 2) Annual Eurostat ratio series (always attempt; used for latest ratio and history)
+    ratio_es = {}
+    try:
+        ratio_es = eurostat_debt_to_gdp_annual(iso2)
+    except Exception:
+        ratio_es = {}
+
+    eurostat_best = None
+    if ratio_es:
+        try:
+            latest_year = max(int(y) for y in ratio_es.keys() if str(y).isdigit())
+            eurostat_best = {
+                "debt_to_gdp": round(float(ratio_es[str(latest_year)]), 2),
+                "period": str(latest_year),
+                "source": "Eurostat (debt-to-GDP ratio)",
+                "government_type": "General Government"
+            }
+        except Exception:
+            eurostat_best = None
+
+    # 3) IMF ratio (optional, keep if you have helper; otherwise leave None)
+    imf_best = None
+    try:
+        # If you have an IMF ratio available in your codebase, populate it here.
+        pass
+    except Exception:
+        imf_best = None
+
+    # 4) World Bank ratio fallback
+    wb_best = None
     try:
         wb = fetch_worldbank_data(iso2, iso3)
         ratio_raw = wb.get("GC.DOD.TOTL.GD.ZS")
@@ -321,47 +349,57 @@ except Exception:
                 year = years[0]
                 wb_best = {
                     "debt_to_gdp": round(float(ratio_dict[year]), 2),
-                    "period": year,
+                    "period": str(year),
                     "source": "World Bank WDI (ratio)",
-                    "government_type": "Central Government"
+                    "government_type": "General Government"
                 }
     except Exception:
-        pass
+        wb_best = None
 
-# Pick the best/latest — prefer Eurostat > IMF > WB if same period
-candidates = [
-    r for r in [eurostat_best, imf_best, wb_best]
-    if r and (r.get("debt_to_gdp") is not None) and (r.get("period") is not None)
-]
+    # 5) Pick best/latest — prefer Eurostat > IMF > WB on same year
+    candidates = [r for r in [eurostat_best, imf_best, wb_best] if r and r.get("debt_to_gdp") is not None and r.get("period") is not None]
+    if not candidates:
+        return {
+            "country": country,
+            "iso_codes": codes,
+            "debt_to_gdp": {"value": None, "date": None, "source": None, "government_type": None},
+            "debt_to_gdp_series": (ratio_es if isinstance(ratio_es, dict) else {}),
+            "path_used": path_used,
+            **({"government_debt": government_debt} if government_debt else {}),
+            **({"nominal_gdp": nominal_gdp} if nominal_gdp else {}),
+        }
 
-if not candidates:
-    return {
+    _pref = {"Eurostat": 3, "IMF": 2, "World": 1, "WB": 1}
+    def _rank(r: dict):
+        period = str(r.get("period", ""))
+        try:
+            year = int(period[:4])
+        except Exception:
+            year = -1
+        first = (r.get("source") or "").split()[0]
+        return (year, _pref.get(first, 0))
+
+    best = sorted(candidates, key=_rank, reverse=True)[0]
+
+    # Build final response
+    out = {
         "country": country,
         "iso_codes": codes,
-        # include levels if you’ve built them above; otherwise remove these two lines
-        # "government_debt": government_debt,
-        # "nominal_gdp": nominal_gdp,
-        "debt_to_gdp": {"value": None, "date": None, "source": None, "government_type": None},
-        "debt_to_gdp_series": (ratio_es if isinstance(locals().get("ratio_es"), dict) else {}),
-        "path_used": locals().get("path_used"),
+        "debt_to_gdp": {
+            "value": best["debt_to_gdp"],
+            "date": best["period"],
+            "source": best["source"],
+            "government_type": best.get("government_type"),
+        },
+        "debt_to_gdp_series": (ratio_es if isinstance(ratio_es, dict) else {}),
+        "path_used": (path_used or ("EUROSTAT_Q" if best.get("source","").startswith("Eurostat") else best.get("source"))),
     }
+    if government_debt:
+        out["government_debt"] = government_debt
+    if nominal_gdp:
+        out["nominal_gdp"] = nominal_gdp
+    return out
 
-# ranking: higher year wins; if same year → Eurostat > IMF > World/ WB
-_pref = {"Eurostat": 3, "IMF": 2, "World": 1, "WB": 1}
-
-def _rank(r: dict):
-    # year can be "YYYY" or "YYYY-Qn": use the first 4 chars safely
-    period = str(r.get("period", ""))
-    try:
-        year = int(period[:4])
-    except Exception:
-        year = -1
-    first_word = (r.get("source") or "").split()[0]  # "Eurostat", "IMF", "World", "WB", etc.
-    return (year, _pref.get(first_word, 0))
-
-best = sorted(candidates, key=_rank, reverse=True)[0]
-
-# --- [all your code from /country-data and helpers onwards preserved unchanged] ---
 @app.get("/country-data")
 def country_data(country: str = Query(..., description="Full country name, e.g., Germany")):
     codes = resolve_country_codes(country)
