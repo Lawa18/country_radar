@@ -278,24 +278,23 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
     imf_best = None
     wb_best = None
 
-    # 1. Eurostat ratio (annual, if available)
-    try:
-        ratio_js = fetch_eurostat_jsonstat("gov_10dd_edpt1", geo=iso2, unit="PC_GDP", sector="S13")
-        ratio_series = parse_jsonstat_to_series(ratio_js) if ratio_js else {}
-        if ratio_series:
-            years = sorted([y for y in ratio_series if ratio_series[y] is not None], reverse=True)
-            if years:
-                period = years[0]
-                eurostat_best = {
-                    "debt_to_gdp": round(float(ratio_series[period]), 2),
-                    "period": period,
-                    "source": "Eurostat (debt-to-GDP ratio)",
-                    "government_type": "General Government"
-                }
-    except Exception:
-        pass
+    
+# 1. Eurostat ratio (annual, if available)
+try:
+    ratio_es = eurostat_debt_to_gdp_annual(iso2)
+    if ratio_es:
+        ly = max(int(y) for y in ratio_es.keys() if str(y).isdigit())
+        eurostat_best = {
+            "debt_to_gdp": round(float(ratio_es[str(ly)]), 2),
+            "period": str(ly),
+            "source": "Eurostat (debt-to-GDP ratio)",
+            "government_type": "General Government"
+        }
+except Exception:
+    pass
 
-    # 2. IMF WEO ratio
+# 2.
+ IMF WEO ratio
     try:
         weo = fetch_imf_weo_series(iso3, ["GGXWDG", "NGDP"])
         ggxwdg = weo.get("GGXWDG", {})
@@ -336,7 +335,8 @@ def v1_debt(country: str = Query(..., description="Full country name, e.g., Mexi
         return {
             "country": country,
             "iso_codes": codes,
-            "debt_to_gdp": {"value": None, "date": None, "source": None, "government_type": None}
+            "debt_to_gdp": {"value": None, "date": None, "source": None, "government_type": None}    "debt_to_gdp_series": (ratio_es if "ratio_es" in locals() and isinstance(ratio_es, dict) else {})
+}
         }
     all_results.sort(key=lambda r: (int(str(r.get("period"))[:4]), ["Eurostat", "IMF", "World"].index(r["source"].split()[0]) if r.get("source") else 99), reverse=True)
     best = all_results[0]
