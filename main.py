@@ -564,6 +564,23 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
 # ------------------ Eurostat (free) JSON-stat 2.0 helpers ------------------
 EUROSTAT_BASE = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data"
 
+
+@lru_cache(maxsize=256)
+def imf_debt_to_gdp_annual(iso3: str) -> dict:
+    """IMF WEO: General government gross debt, percent of GDP (GGXWDG_NGDP). Returns {YYYY: float}."""
+    try:
+        if 'fetch_imf_datamapper' in globals():
+            data = fetch_imf_datamapper("GGXWDG_NGDP", iso3) or {}
+            return {str(int(y)): float(v) for y, v in data.items()}
+        else:
+            return {}
+    except Exception as e:
+        print(f"[IMF] ratio annual failed {iso3}: {e}")
+        return {}
+
+
+
+
 @lru_cache(maxsize=256)
 def fetch_eurostat_jsonstat(dataset: str, **filters) -> Optional[dict]:
     try:
