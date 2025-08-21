@@ -335,7 +335,6 @@ except Exception:
             "country": country,
             "iso_codes": codes,
             "debt_to_gdp": {"value": None, "date": None, "source": None, "government_type": None}    "debt_to_gdp_series": (ratio_es if "ratio_es" in locals() and isinstance(ratio_es, dict) else {})
-}
         }
     all_results.sort(key=lambda r: (int(str(r.get("period"))[:4]), ["Eurostat", "IMF", "World"].index(r["source"].split()[0]) if r.get("source") else 99), reverse=True)
     best = all_results[0]
