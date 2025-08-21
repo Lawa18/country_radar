@@ -328,26 +328,38 @@ except Exception:
     except Exception:
         pass
 
-    # Pick the best/latest -- prefer Eurostat > IMF > WB if same period
-    all_results = [r for r in [eurostat_best, imf_best, wb_best] if r and r.get("debt_to_gdp") is not None and r.get("period") is not None]
-    if not all_results:
-        return {
-            "country": country,
-            "iso_codes": codes,
-            "debt_to_gdp": {"value": None, "date": None, "source": None, "government_type": None}    "debt_to_gdp_series": (ratio_es if "ratio_es" in locals() and isinstance(ratio_es, dict) else {})
-        }
-    all_results.sort(key=lambda r: (int(str(r.get("period"))[:4]), ["Eurostat", "IMF", "World"].index(r["source"].split()[0]) if r.get("source") else 99), reverse=True)
-    best = all_results[0]
+# Pick the best/latest — prefer Eurostat > IMF > WB if same period
+candidates = [
+    r for r in [eurostat_best, imf_best, wb_best]
+    if r and (r.get("debt_to_gdp") is not None) and (r.get("period") is not None)
+]
+
+if not candidates:
     return {
         "country": country,
         "iso_codes": codes,
-        "debt_to_gdp": {
-            "value": best["debt_to_gdp"],
-            "date": best["period"],
-            "source": best["source"],
-            "government_type": best["government_type"]
-        }
+        # include levels if you’ve built them above; otherwise remove these two lines
+        # "government_debt": government_debt,
+        # "nominal_gdp": nominal_gdp,
+        "debt_to_gdp": {"value": None, "date": None, "source": None, "government_type": None},
+        "debt_to_gdp_series": (ratio_es if isinstance(locals().get("ratio_es"), dict) else {}),
+        "path_used": locals().get("path_used"),
     }
+
+# ranking: higher year wins; if same year → Eurostat > IMF > World/ WB
+_pref = {"Eurostat": 3, "IMF": 2, "World": 1, "WB": 1}
+
+def _rank(r: dict):
+    # year can be "YYYY" or "YYYY-Qn": use the first 4 chars safely
+    period = str(r.get("period", ""))
+    try:
+        year = int(period[:4])
+    except Exception:
+        year = -1
+    first_word = (r.get("source") or "").split()[0]  # "Eurostat", "IMF", "World", "WB", etc.
+    return (year, _pref.get(first_word, 0))
+
+best = sorted(candidates, key=_rank, reverse=True)[0]
 
 # --- [all your code from /country-data and helpers onwards preserved unchanged] ---
 @app.get("/country-data")
