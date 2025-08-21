@@ -293,8 +293,7 @@ try:
 except Exception:
     pass
 
-# 2.
- IMF WEO ratio
+# 2. IMF WEO ratio
     try:
         weo = fetch_imf_weo_series(iso3, ["GGXWDG", "NGDP"])
         ggxwdg = weo.get("GGXWDG", {})
