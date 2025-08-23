@@ -541,16 +541,21 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
         "Interest Rate": imf_series_block("Interest Rate", "FR.INR.RINR"),
         "Reserves (USD)": imf_series_block("Reserves (USD)", "FI.RES.TOTL.CD"),
     }
-    
+
+    # Fill Interest Rate (Policy) from Eurostat (ECB mirror) for euro-area countries
     try:
         if iso2 in EURO_AREA_ISO2:
-            ecb = fetch_ecb_policy_rate_series()
-            if ecb and isinstance(ecb.get("latest", {}).get("value"), (int, float)):
-                imf_data["Interest Rate"] = ecb
+            es_mro = eurostat_ecb_policy_rate_annual()  # { 'YYYY': float, ... } or {}
+            if es_mro:
+                latest_year = max(int(y) for y in es_mro.keys())
+                imf_data["Interest Rate"] = {
+                    "latest": {"value": es_mro[str(latest_year)], "date": str(latest_year), "source": "Eurostat (ECB MRO)"},
+                    "series": es_mro
+                }
             else:
-                print(f"[ECB] No policy rate returned for {iso2} (will keep IMF/WB if present).")
+                print(f"[Eurostat ECB] No policy rate series returned; keeping IMF/WB if present.")
     except Exception as _e:
-        print(f"[ECB] Override failed for {iso2}: {_e}")
+        print(f"[Eurostat ECB] Override failed for {iso2}: {_e}")
         
     try:
         if iso2 in EURO_AREA_ISO2:
