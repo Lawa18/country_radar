@@ -171,41 +171,151 @@ def _monthly_to_annual_last_obs(monthly: dict) -> dict:
 
 @lru_cache(maxsize=64)
 def eurostat_ecb_policy_rate_annual() -> dict:
-    m = eurostat_ecb_mro_monthly_series_via_labels()
-    if not m:
-        return {}
-    return _monthly_to_annual_last_obs(m)
+    """
+    Discover the ECB Main Refinancing Operations (MRO) monthly series inside Eurostat
+    dataset ei_mfir_m for Euro Area (U2/EA), then collapse to annual (last month).
+    Strategy:
+      1) Scan all series for U2 (else EA).
+      2) Prefer series whose LABEL contains "main ... refinancing ... operations"
+         (case-insensitive), EXCLUDING 'deposit' and 'marginal'.
+      3) If label match fails, use a value heuristic over 2022-2025:
+         pick the series with highest non-negative median (MRO > DFR which was often negative).
+      4) Convert monthly YYYY-MM -> annual by last available month per year.
+    Returns { "YYYY": float, ... } (years DESC). Empty dict if nothing found.
+    """
+    import re
+    import statistics
 
-    def monthly_to_annual(series: dict) -> dict:
-        # series keys like "2024-12", "2025-06" → keep the last obs per year
-        out = {}
-        for period, v in series.items():
-            if not isinstance(period, str) or "-" not in period:
-                continue
-            y = period.split("-")[0]
+    # 1) Fetch dataset once for U2, then EA
+    js = fetch_eurostat_jsonstat("ei_mfir_m", geo="U2") or fetch_eurostat_jsonstat("ei_mfir_m", geo="EA")
+    if not js:
+        print("[Eurostat ECB] ei_mfir_m fetch returned empty")
+        return {}
+
+    struct = js.get("structure", {})
+    dims = struct.get("dimensions", {})
+    series_dims = dims.get("series") or []
+    obs_dims = dims.get("observation") or []
+    if not series_dims or not obs_dims:
+        return {}
+
+    # Build label arrays for series dims and time dim
+    def _labels(dim):
+        return [(i, v.get("id"), v.get("name") or v.get("label") or v.get("id")) for i, v in enumerate(dim.get("values", []))]
+    sdim_labels = [_labels(d) for d in series_dims]
+    time_vals = [v.get("id") for v in obs_dims[0].get("values", [])]  # e.g., "2024-12"
+
+    datasets = js.get("dataSets", [])
+    if not datasets:
+        return {}
+    series_map = datasets[0].get("series", {}) or {}
+
+    # Identify likely GEO dim and its index for Euro Area key
+    geo_dim_idx = None
+    geo_idx = None
+    for dim_idx, labset in enumerate(sdim_labels):
+        names = [nm for _, _, nm in labset]
+        if any(n in ("Germany", "France", "Italy", "Euro area") for n in names):
+            geo_dim_idx = dim_idx
+            # prefer codes typical for euro area aggregate
+            pref = {"U2", "EA", "EA19", "EA20", "EA21"}
+            by_code = {code: i for i, code, _nm in labset}
+            for code in pref:
+                if code in by_code:
+                    geo_idx = by_code[code]
+                    break
+            if geo_idx is None:
+                # fall back by label
+                for i, code, nm in labset:
+                    if "Euro area" in str(nm):
+                        geo_idx = i
+                        break
+            break
+
+    # Helper: get (label, monthly_dict) for each series key that matches Euro Area coordinates
+    def extract_series_for_ea():
+        out = []
+        for key, serie in series_map.items():
+            # key like "0:1:2:0:..." positional per series dims
             try:
-                out[y] = float(v)  # overwrite → last month wins
+                parts = [int(p) for p in key.split(":")]
             except Exception:
                 continue
+            if len(parts) != len(sdim_labels):
+                continue
+            # filter to EA if we identified a geo dim
+            if (geo_dim_idx is not None) and (geo_idx is not None) and (parts[geo_dim_idx] != geo_idx):
+                continue
+
+            # Compose a human label by concatenating all series-dim labels for this coordinate
+            labels = []
+            for dim_idx, labset in enumerate(sdim_labels):
+                idx = parts[dim_idx]
+                code, name = labset[idx][1], labset[idx][2]
+                labels.append(str(name or code))
+            long_label = " | ".join(labels)
+
+            obs = serie.get("observations", {})
+            monthly = {}
+            for idx_str, val_list in obs.items():
+                try:
+                    t_idx = int(idx_str)
+                    period = time_vals[t_idx] if t_idx < len(time_vals) else None
+                    if not period or "-" not in period:
+                        continue
+                    val = val_list[0]
+                    if val is None:
+                        continue
+                    monthly[period] = float(val)
+                except Exception:
+                    continue
+            if monthly:
+                out.append((long_label, monthly))
         return out
 
-    # Try Eurostat datasets in order
-    for ds, base_filters in candidates:
-        try:
-            # We pull the euro‑area aggregate (EA) because policy rate is area‑wide
-            js = fetch_eurostat_jsonstat(ds, geo="EA")
-            if not js:
-                continue
-            monthly = parse_jsonstat_to_series(js) or {}
-            annual = monthly_to_annual(monthly)
-            if annual:
-                # make years descending
-                annual = dict(sorted(annual.items(), key=lambda kv: kv[0], reverse=True))
-                return annual
-        except Exception:
-            continue
+    candidates = extract_series_for_ea()
+    if not candidates:
+        print("[Eurostat ECB] No series candidates for EA in ei_mfir_m")
+        return {}
 
-    return {}
+    # 2) Label-based selection
+    must = re.compile(r"\bmain\b.*\brefinancing\b|\brefinancing\b.*\bmain\b", re.I)
+    exclude = re.compile(r"\bdeposit\b|\bmarginal\b|\blending\b|\bDF\b", re.I)
+
+    label_hits = [(lab, mon) for (lab, mon) in candidates if must.search(lab) and not exclude.search(lab)]
+    chosen = None
+    if label_hits:
+        # If multiple, pick the one with most recent non-null observation
+        def latest_obs_yearmonth(mon):
+            return max(mon.keys())
+        chosen = max(label_hits, key=lambda x: latest_obs_yearmonth(x[1]))
+
+    # 3) Value‑based heuristic fallback (if labels didn’t find MRO)
+    if chosen is None:
+        def median_2022p(mon):
+            vals = []
+            for ym, v in mon.items():
+                y = int(ym.split("-")[0]) if "-" in ym else None
+                if y and y >= 2022 and v is not None and -1e-6 <= float(v) <= 20.0:  # exclude negatives & silly
+                    vals.append(float(v))
+            return statistics.median(vals) if vals else float("-inf")
+        chosen = max(candidates, key=lambda x: median_2022p(x[1]))
+
+    chosen_label, monthly = chosen
+
+    # 4) Collapse monthly -> annual (last observation per year)
+    annual = {}
+    for ym in sorted(monthly.keys()):
+        y = ym.split("-")[0]
+        annual[y] = monthly[ym]  # overwrite -> last month wins
+
+    if not annual:
+        return {}
+
+    # Return years in DESC order
+    annual = dict(sorted(annual.items(), key=lambda kv: kv[0], reverse=True))
+    print(f"[Eurostat ECB] Using: {chosen_label}  | years={len(annual)}  latest={list(annual.items())[0]}")
+    return annual
 
 @lru_cache(maxsize=512)
 def resolve_currency_code(iso_alpha_2: str) -> Optional[str]:
