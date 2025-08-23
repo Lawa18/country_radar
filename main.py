@@ -17,138 +17,59 @@ CURRENCY_CODE = {
 
 # ------------------ ECB SDW (Euro area policy rate) ------------------
 
+# ---------- Eurostat: ECB policy (MRO) via Eurostat mirror (annualized) ----------
+
 EURO_AREA_ISO2 = {
     "AT","BE","CY","DE","EE","ES","FI","FR","GR","IE","IT",
     "LT","LU","LV","MT","NL","PT","SI","SK"
 }
 
 @lru_cache(maxsize=256)
-def fetch_ecb_policy_rate_series() -> dict:
+def eurostat_ecb_policy_rate_annual() -> dict:
     """
-    ECB Main Refinancing Operations (MRO) policy rate series:
-      Key: FM.M.U2.EUR.4F.KR.MRR_FR.LEV  (Monthly)
-    Robustly tries multiple hosts, paths, and SDMX flavors.
-    Builds an ANNUAL series = last monthly observation per year.
-    Returns:
-      { "latest": {"value": float, "date":"YYYY", "source":"ECB SDW"},
-        "series": {"YYYY": float, ...} }
+    ECB Main Refinancing Operations (policy rate) via Eurostat mirror.
+    Returns annual series as { 'YYYY': float } using the last available monthly obs per year.
+    NOTE: We try a few known Eurostat flows that carry the ECB policy rate.
     """
-    import json, requests
-
-    bases = [
-        "https://sdw-wsrest.ecb.europa.eu/service",  # classic
-        "https://data-api.ecb.europa.eu/service",    # new
-    ]
-    # SDMX flavors / resource types to try (in this order)
-    resource_paths = [
-        "data/FM/M.U2.EUR.4F.KR.MRR_FR.LEV",
-        "data/compact/FM/M.U2.EUR.4F.KR.MRR_FR.LEV",
-        "series/FM/M.U2.EUR.4F.KR.MRR_FR.LEV",
-    ]
-    # Param sets (we’ll try each)
-    param_sets = [
-        {"lastNObservations": "1"},
-        {"startPeriod": "2000"},
-        {"startPeriod": "2000", "detail": "dataonly"},
-    ]
-    # Headers to cycle through (some stacks are picky)
-    headers_list = [
-        {"Accept": "application/vnd.sdmx.data+json;version=1.0.0-wd",
-         "User-Agent": "CountryRadar/1.0 (+https://country-radar.onrender.com)"},
-        {"Accept": "application/json",
-         "User-Agent": "CountryRadar/1.0 (+https://country-radar.onrender.com)"},
+    # Candidates in Eurostat that carry/refeed the ECB MRO (naming can vary by release)
+    # We query monthly and collapse to annual.
+    candidates = [
+        # (dataset_id, static filters)
+        # Commonly used Eurostat mirror of ECB MRO (monthly):
+        ("ei_mfir_m", {}),            # Main refinancing operations rate, monthly (Eurostat "ei" domain)
+        # Alternative financial interest rates domain:
+        ("irt_eur_m", {}),            # Interest rates – euro area, monthly (if available)
     ]
 
-    def parse_sdmx_json(js: dict) -> dict:
-        """
-        Parse SDMX-JSON data/compact payload into annual dict {"YYYY": value}.
-        """
-        try:
-            ds = js.get("dataSets", [])
-            if not ds:
-                return {}
-            s_map = ds[0].get("series", {})
-            if not s_map:
-                return {}
-            s_key = next(iter(s_map), None)
-            if not s_key:
-                return {}
-            obs = s_map[s_key].get("observations", {})
-            if not obs:
-                return {}
-            # Locate time dimension
-            obs_dims = js.get("structure", {}).get("dimensions", {}).get("observation", [])
-            if not obs_dims:
-                return {}
-            tvals = obs_dims[0].get("values", [])  # TIME_PERIOD values with id like "2024-12"
-            annual = {}
-            for k, v in obs.items():
-                try:
-                    idx = int(k)
-                    period = tvals[idx]["id"]
-                    year = period.split("-")[0]
-                    val = float(v[0])
-                    annual[year] = val  # overwrite ⇒ last month wins
-                except Exception:
-                    continue
-            return annual
-        except Exception:
-            return {}
-
-    def parse_series_api(js: dict) -> dict:
-        """
-        Parse /service/series payload (different structure).
-        We expect a single series with observations including "TIME_PERIOD"/"OBS_VALUE".
-        """
-        try:
-            # Some series endpoints return flat arrays; others include "series" list
-            # Try a generic walk:
-            txt = json.dumps(js)
-            # Fast path: look for pairs of "TIME_PERIOD":"YYYY-MM","OBS_VALUE":value
-            import re
-            pat = re.compile(r'"TIME_PERIOD"\s*:\s*"(\d{4})(?:-\d{2})?"\s*,\s*"OBS_VALUE"\s*:\s*"?([0-9.]+)"?')
-            annual = {}
-            for y, val in pat.findall(txt):
-                try:
-                    annual[y] = float(val)
-                except Exception:
-                    continue
-            return annual
-        except Exception:
-            return {}
-
-    attempts = []
-    for base in bases:
-        for rp in resource_paths:
-            for params in param_sets:
-                attempts.append((f"{base}/{rp}", params))
-
-    last_error = None
-    for url, params in attempts:
-        for headers in headers_list:
-            try:
-                r = requests.get(url, params=params, headers=headers, timeout=15)
-                r.raise_for_status()
-                js = r.json()
-
-                # Try both parsers
-                annual = parse_sdmx_json(js)
-                if not annual:
-                    annual = parse_series_api(js)
-
-                if annual:
-                    latest_year = max(int(y) for y in annual.keys())
-                    out = {
-                        "latest": {"value": annual[str(latest_year)], "date": str(latest_year), "source": "ECB SDW"},
-                        "series": dict(sorted(annual.items(), reverse=True))
-                    }
-                    print(f"[ECB] OK {url} {params} → latest={out['latest']}, years={len(out['series'])}")
-                    return out
-            except Exception as e:
-                last_error = e
+    def monthly_to_annual(series: dict) -> dict:
+        # series keys like "2024-12", "2025-06" → keep the last obs per year
+        out = {}
+        for period, v in series.items():
+            if not isinstance(period, str) or "-" not in period:
                 continue
+            y = period.split("-")[0]
+            try:
+                out[y] = float(v)  # overwrite → last month wins
+            except Exception:
+                continue
+        return out
 
-    print(f"[ECB] Failed after {len(attempts)*len(headers_list)} attempts. Last error: {last_error}")
+    # Try Eurostat datasets in order
+    for ds, base_filters in candidates:
+        try:
+            # We pull the euro‑area aggregate (EA) because policy rate is area‑wide
+            js = fetch_eurostat_jsonstat(ds, geo="EA")
+            if not js:
+                continue
+            monthly = parse_jsonstat_to_series(js) or {}
+            annual = monthly_to_annual(monthly)
+            if annual:
+                # make years descending
+                annual = dict(sorted(annual.items(), key=lambda kv: kv[0], reverse=True))
+                return annual
+        except Exception:
+            continue
+
     return {}
 
 @lru_cache(maxsize=512)
