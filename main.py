@@ -544,14 +544,14 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
     }
     
     try:
-        ir_block = imf_data.get("Interest Rate", {})
-        latest = (ir_block or {}).get("latest") or {}
-        if (latest.get("value") is None) and (iso2 in EURO_AREA_ISO2):
+        if iso2 in EURO_AREA_ISO2:
             ecb = fetch_ecb_policy_rate_series()
-            if ecb:
+            if ecb and isinstance(ecb.get("latest", {}).get("value"), (int, float)):
                 imf_data["Interest Rate"] = ecb
-    except Exception:
-        pass
+            else:
+                print(f"[ECB] No policy rate returned for {iso2} (will keep IMF/WB if present).")
+    except Exception as _e:
+        print(f"[ECB] Override failed for {iso2}: {_e}")
     
     # GDP Growth (%) – prefer IMF, fallback to WB
     gdp_growth_imf = extract_latest_numeric_entry(imf.get("GDP Growth (%)", {}), "IMF")
