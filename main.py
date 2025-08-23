@@ -25,53 +25,97 @@ EURO_AREA_ISO2 = {
 @lru_cache(maxsize=256)
 def fetch_ecb_policy_rate_series() -> dict:
     """
-    ECB Main Refinancing Operations (policy rate, MRO) from SDW.
+    ECB Main Refinancing Operations (MRO) policy rate series.
+    Annual series = last monthly observation per year.
     Returns:
       {
         "latest": {"value": float, "date": "YYYY", "source": "ECB SDW"},
-        "series": {"YYYY": float, ...}  # last monthly observation per year
+        "series": {"YYYY": float, ...}
       }
     """
-    try:
-        url = ("https://sdw-wsrest.ecb.europa.eu/service/data/"
-               "FM/M.U2.EUR.4F.KR.MRR_FR.LEV?format=jsondata")
-        r = requests.get(url, timeout=12)
-        r.raise_for_status()
-        js = r.json()
+    import requests
 
-        ds = js.get("dataSets", [])
-        if not ds: 
+    headers = {
+        "Accept": "application/json, application/vnd.sdmx.data+json;version=1.0.0-wd",
+        "User-Agent": "CountryRadar/1.0 (+https://country-radar.onrender.com)"
+    }
+
+    urls = [
+        # Try latest only (fast path)
+        "https://sdw-wsrest.ecb.europa.eu/service/data/FM/M.U2.EUR.4F.KR.MRR_FR.LEV"
+        "?lastNObservations=1&format=jsondata",
+        # Fallback: full series (we'll annualize)
+        "https://sdw-wsrest.ecb.europa.eu/service/data/FM/M.U2.EUR.4F.KR.MRR_FR.LEV"
+        "?startPeriod=2000&format=jsondata",
+    ]
+
+    def _parse_full(js: dict) -> dict:
+        """Parse a full-series SDMX-JSON payload into annual {YYYY: value} by last month wins."""
+        try:
+            datasets = js.get("dataSets", [])
+            if not datasets:
+                return {}
+            series = datasets[0].get("series", {})
+            if not series:
+                return {}
+
+            # series key is typically "0:0:0:0:0:0:0"
+            skey = next(iter(series.keys()), None)
+            if not skey:
+                return {}
+            obs = series[skey].get("observations", {})
+            if not obs:
+                return {}
+
+            # observation time labels
+            obs_dims = js.get("structure", {}).get("dimensions", {}).get("observation", [])
+            if not obs_dims:
+                return {}
+            time_vals = obs_dims[0].get("values", [])
+
+            annual = {}
+            for idx_str, val_list in obs.items():
+                try:
+                    idx = int(idx_str)
+                    period = time_vals[idx]["id"]  # e.g., "2025-06" or "2024-12"
+                    year = period.split("-")[0]
+                    val = float(val_list[0])
+                    annual[year] = val  # overwrites → last month wins
+                except Exception:
+                    continue
+            return annual
+        except Exception:
             return {}
-        series = ds[0].get("series", {})
-        skey = next(iter(series.keys()), None)
-        if not skey: 
-            return {}
-        obs = series[skey].get("observations", {})
 
-        time_vals = (js.get("structure", {})
-                       .get("dimensions", {})
-                       .get("observation", [])[0]
-                       .get("values", []))
+    # Try both endpoints
+    last_error = None
+    for url in urls:
+        try:
+            r = requests.get(url, headers=headers, timeout=15)
+            r.raise_for_status()
+            js = r.json()
+            annual = _parse_full(js)
 
-        annual = {}
-        for k, v in obs.items():
-            try:
-                idx = int(k)
-                period = time_vals[idx]["id"]     # e.g. "2024-12"
-                year = period.split("-")[0]
-                annual[year] = float(v[0])        # overwrites until last month wins
-            except Exception:
-                continue
+            # If first URL (lastNObservations=1) returned only one obs,
+            # annual will have a single year; that's fine.
+            if annual:
+                latest_year = max(int(y) for y in annual.keys())
+                out = {
+                    "latest": {
+                        "value": annual[str(latest_year)],
+                        "date": str(latest_year),
+                        "source": "ECB SDW",
+                    },
+                    "series": dict(sorted(annual.items(), reverse=True)),
+                }
+                print(f"[ECB] Parsed policy rate: latest={out['latest']} (series years: {len(out['series'])})")
+                return out
+        except Exception as e:
+            last_error = e
+            continue
 
-        if not annual: 
-            return {}
-        latest_year = max(int(y) for y in annual)
-        return {
-            "latest": {"value": annual[str(latest_year)], "date": str(latest_year), "source": "ECB SDW"},
-            "series": dict(sorted(annual.items(), reverse=True))
-        }
-    except Exception:
-        return {}
+    print(f"[ECB] Failed to fetch/parse policy rate. Last error: {last_error}")
+    return {}
 
 @lru_cache(maxsize=512)
 def resolve_currency_code(iso_alpha_2: str) -> Optional[str]:
