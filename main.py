@@ -1300,6 +1300,43 @@ def eurostat_debt_to_gdp_annual(iso2: str) -> dict:
         print(f"[Eurostat] ratio annual failed {iso2}: {e}")
         return {}
 
+@app.get("/debug/eurostat-structure")
+def debug_eurostat_structure(dataset: str = Query(...), geo: str = Query("U2")):
+    """
+    Dumps Eurostat JSON-stat series/observation dimensions for a dataset (e.g., ei_mfir_m).
+    Use: /debug/eurostat-structure?dataset=ei_mfir_m&geo=U2
+    """
+    try:
+        js = fetch_eurostat_jsonstat(dataset, geo=geo)
+        if not js:
+            return {"dataset": dataset, "geo": geo, "error": "empty response"}
+
+        struct = js.get("structure", {})
+        dims = struct.get("dimensions", {})
+        series_dims = dims.get("series") or []
+        obs_dims = dims.get("observation") or []
+
+        def dim_dump(d):
+            return {
+                "id": d.get("id"),
+                "role": d.get("role"),
+                "values": [
+                    {"idx": i, "id": v.get("id"), "name": v.get("name") or v.get("label") or v.get("id")}
+                    for i, v in enumerate(d.get("values", []))
+                ],
+            }
+
+        out = {
+            "dataset": dataset,
+            "geo": geo,
+            "series_dimensions": [dim_dump(d) for d in series_dims],
+            "observation_dimensions": [dim_dump(d) for d in obs_dims],
+            "hint": "Look for the series-dimension whose values include 'Main refinancing operations' or an ID containing 'MRR'. GEO may be absent if filtered by geo=U2.",
+        }
+        return out
+    except Exception as e:
+        return {"error": str(e)}
+
 def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
     def normalize_period(p):
         return p.replace(" ", "").replace("_", "").replace("-", "").upper()
