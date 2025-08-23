@@ -25,46 +25,55 @@ EURO_AREA_ISO2 = {
 @lru_cache(maxsize=256)
 def fetch_ecb_policy_rate_series() -> dict:
     """
-    ECB Main Refinancing Operations (MRO) policy rate series.
-    Annual series = last monthly observation per year.
+    ECB Main Refinancing Operations (MRO) policy rate (FM.M.U2.EUR.4F.KR.MRR_FR.LEV).
+    Builds an annual series from the last monthly observation of each year.
+    Tries multiple base URLs and parameter styles to survive host quirks.
     Returns:
-      {
-        "latest": {"value": float, "date": "YYYY", "source": "ECB SDW"},
-        "series": {"YYYY": float, ...}
-      }
+      { "latest": {"value": float, "date":"YYYY", "source":"ECB SDW"},
+        "series": {"YYYY": float, ...} }
     """
     import requests
 
-    headers = {
-        "Accept": "application/json, application/vnd.sdmx.data+json;version=1.0.0-wd",
-        "User-Agent": "CountryRadar/1.0 (+https://country-radar.onrender.com)"
-    }
+    bases = [
+        "https://data-api.ecb.europa.eu/service/data",
+        "https://sdw-wsrest.ecb.europa.eu/service/data",
+    ]
+    paths = [
+        "FM/M.U2.EUR.4F.KR.MRR_FR.LEV",  # standard SDMX key under flowRef FM
+    ]
+    # Try "latest-only" first, then full series. Some stacks dislike ?format=jsondata
+    attempts = []
+    for base in bases:
+        for path in paths:
+            attempts.extend([
+                (f"{base}/{path}", {"lastNObservations": "1"}),            # latest only
+                (f"{base}/{path}", {"startPeriod": "2000"}),               # full series since 2000
+            ])
 
-    urls = [
-        # Try latest only (fast path)
-        "https://sdw-wsrest.ecb.europa.eu/service/data/FM/M.U2.EUR.4F.KR.MRR_FR.LEV"
-        "?lastNObservations=1&format=jsondata",
-        # Fallback: full series (we'll annualize)
-        "https://sdw-wsrest.ecb.europa.eu/service/data/FM/M.U2.EUR.4F.KR.MRR_FR.LEV"
-        "?startPeriod=2000&format=jsondata",
+    headers_list = [
+        {"Accept": "application/vnd.sdmx.data+json;version=1.0.0-wd",
+         "User-Agent": "CountryRadar/1.0 (+https://country-radar.onrender.com)"},
+        {"Accept": "application/json",
+         "User-Agent": "CountryRadar/1.0 (+https://country-radar.onrender.com)"},
     ]
 
-    def _parse_full(js: dict) -> dict:
-        """Parse a full-series SDMX-JSON payload into annual {YYYY: value} by last month wins."""
+    def parse_series(js: dict) -> dict:
+        """
+        Parse SDMX-JSON into annual last-observation-per-year dict: {"YYYY": value}
+        """
         try:
             datasets = js.get("dataSets", [])
             if not datasets:
                 return {}
-            series = datasets[0].get("series", {})
-            if not series:
+            series_map = datasets[0].get("series", {})
+            if not series_map:
                 return {}
-
-            # series key is typically "0:0:0:0:0:0:0"
-            skey = next(iter(series.keys()), None)
+            # First series key (e.g., "0:0:0:0:0:0:0")
+            skey = next(iter(series_map.keys()), None)
             if not skey:
                 return {}
-            obs = series[skey].get("observations", {})
-            if not obs:
+            observations = series_map[skey].get("observations", {})
+            if not observations:
                 return {}
 
             # observation time labels
@@ -74,47 +83,40 @@ def fetch_ecb_policy_rate_series() -> dict:
             time_vals = obs_dims[0].get("values", [])
 
             annual = {}
-            for idx_str, val_list in obs.items():
+            for idx_str, val_list in observations.items():
                 try:
                     idx = int(idx_str)
-                    period = time_vals[idx]["id"]  # e.g., "2025-06" or "2024-12"
+                    period = time_vals[idx]["id"]  # e.g., "2025-06" or "2016-01"
                     year = period.split("-")[0]
                     val = float(val_list[0])
-                    annual[year] = val  # overwrites → last month wins
+                    annual[year] = val  # overwrite => last month in the year wins
                 except Exception:
                     continue
             return annual
         except Exception:
             return {}
 
-    # Try both endpoints
     last_error = None
-    for url in urls:
-        try:
-            r = requests.get(url, headers=headers, timeout=15)
-            r.raise_for_status()
-            js = r.json()
-            annual = _parse_full(js)
+    for url, params in attempts:
+        for headers in headers_list:
+            try:
+                r = requests.get(url, params=params, headers=headers, timeout=15)
+                r.raise_for_status()
+                js = r.json()
+                annual = parse_series(js)
+                if annual:
+                    latest_year = max(int(y) for y in annual.keys())
+                    out = {
+                        "latest": {"value": annual[str(latest_year)], "date": str(latest_year), "source": "ECB SDW"},
+                        "series": dict(sorted(annual.items(), reverse=True))
+                    }
+                    print(f"[ECB] OK {url} {params} → latest={out['latest']}, years={len(out['series'])}")
+                    return out
+            except Exception as e:
+                last_error = e
+                continue
 
-            # If first URL (lastNObservations=1) returned only one obs,
-            # annual will have a single year; that's fine.
-            if annual:
-                latest_year = max(int(y) for y in annual.keys())
-                out = {
-                    "latest": {
-                        "value": annual[str(latest_year)],
-                        "date": str(latest_year),
-                        "source": "ECB SDW",
-                    },
-                    "series": dict(sorted(annual.items(), reverse=True)),
-                }
-                print(f"[ECB] Parsed policy rate: latest={out['latest']} (series years: {len(out['series'])})")
-                return out
-        except Exception as e:
-            last_error = e
-            continue
-
-    print(f"[ECB] Failed to fetch/parse policy rate. Last error: {last_error}")
+    print(f"[ECB] Failed after {len(attempts)*len(headers_list)} attempts. Last error: {last_error}")
     return {}
 
 @lru_cache(maxsize=512)
