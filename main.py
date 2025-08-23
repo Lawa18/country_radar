@@ -552,6 +552,13 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
                 print(f"[ECB] No policy rate returned for {iso2} (will keep IMF/WB if present).")
     except Exception as _e:
         print(f"[ECB] Override failed for {iso2}: {_e}")
+        
+    try:
+        if iso2 in EURO_AREA_ISO2:
+            probe = fetch_ecb_policy_rate_series()
+            print(f"[ECB] Probe {iso2}: {probe.get('latest')}")
+    except Exception as _e:
+        print(f"[ECB] Probe failed for {iso2}: {_e}")
     
     # GDP Growth (%) – prefer IMF, fallback to WB
     gdp_growth_imf = extract_latest_numeric_entry(imf.get("GDP Growth (%)", {}), "IMF")
