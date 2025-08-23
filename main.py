@@ -15,9 +15,7 @@ CURRENCY_CODE = {
     # "BR": "BRL", "IN": "INR", "ZA": "ZAR", "CN": "CNY",
 }
 
-# ------------------ ECB SDW (Euro area policy rate) ------------------
-
-# ---------- Eurostat: ECB policy (MRO) via Eurostat mirror (annualized) ----------
+# ---------- Eurostat: ECB policy (MRO) via Eurostat mirror (robust label match) ----------
 
 EURO_AREA_ISO2 = {
     "AT","BE","CY","DE","EE","ES","FI","FR","GR","IE","IT",
@@ -27,85 +25,78 @@ EURO_AREA_ISO2 = {
 @lru_cache(maxsize=64)
 def eurostat_ecb_mro_monthly_series_via_labels() -> dict:
     """
-    Find the ECB main refinancing operations (MRO) rate in Eurostat by scanning
-    the dataset's dimension labels for a match like "Main refinancing operations".
-    Returns MONTHLY series as {"YYYY-MM": float, ...} for the euro area aggregate.
-
-    We purposefully:
-      - Query the dataset once (without heavy filters),
-      - Inspect dimensions to locate the indicator/member whose label contains
-        'Main refinancing operations' (case-insensitive),
-      - Then reconstruct the time series from the matching subseries.
+    Returns MONTHLY {"YYYY-MM": float, ...} for ECB Main Refinancing Operations (MRO)
+    discovered by label in Eurostat monthly interest rate datasets.
+    We REQUIRE "main" + "refinancing" in the label, and EXCLUDE "deposit" / "marginal lending".
     """
     import re
 
-    # Candidate Eurostat datasets that (re)publish key rates monthly
-    datasets = ["ei_mfir_m", "irt_eur_m"]  # try in order; both are in the Eurostat 'interest rates' domain
+    datasets = ["ei_mfir_m", "irt_eur_m"]  # try in this order
 
-    def _scan_and_extract(js: dict) -> dict:
-        """
-        Walk the JSON-stat structure, locate a dimension whose labels contain 'main refinancing operations',
-        then extract the corresponding sub-series for geo='EA' (or 'U2').
-        """
+    # STRICT include and exclude patterns
+    must = re.compile(r"\bmain\b.*\brefinancing\b|\brefinancing\b.*\bmain\b", re.I)
+    exclude = re.compile(r"\bdeposit\b|\bmarginal\b|\blending\b|\bdf\b", re.I)
+
+    def labels(dim):
+        out = []
+        for i, v in enumerate(dim.get("values", [])):
+            out.append((i, v.get("id"), v.get("name") or v.get("label") or v.get("id")))
+        return out
+
+    def scan_and_extract(js: dict) -> dict:
         struct = js.get("structure", {})
         dims = struct.get("dimensions", {})
-        ds_dims = dims.get("series") or []  # some products put series dims here
+        series_dims = dims.get("series") or []
         obs_dims = dims.get("observation") or []
 
-        # Build label maps for each dimension
-        def labels(dim):
-            # returns [(idx, id, label)]
-            out = []
-            for i, v in enumerate(dim.get("values", [])):
-                out.append((i, v.get("id"), v.get("name") or v.get("label") or v.get("id")))
-            return out
-
-        series_dim_labels = [labels(d) for d in ds_dims]
-        obs_time = labels(obs_dims[0]) if obs_dims else []
-
-        # Identify dimension index that likely holds the indicator family
-        # Heuristic: look for any series dimension whose labels contain "main refinancing operations"
-        # (case-insensitive). If found, note its position and the code index that matches.
-        mro_dim_index = None
-        mro_member_index = None
-        pat = re.compile(r"main\s+refinancing\s+operations", re.I)
-
-        for dim_idx, labset in enumerate(series_dim_labels):
-            for idx, _id, name in labset:
-                if name and pat.search(str(name)):
-                    mro_dim_index = dim_idx
-                    mro_member_index = idx
-                    break
-            if mro_dim_index is not None:
-                break
-
-        if mro_dim_index is None:
+        if not series_dims or not obs_dims:
             return {}
 
-        # Also locate the geo dimension and pick euro area aggregate
-        geo_dim_index = None
-        geo_id_for_ea = None  # "EA" (Euro area) or "U2" (Euro area changing composition)
+        series_dim_labels = [labels(d) for d in series_dims]
+        time_vals = [v.get("id") for v in obs_dims[0].get("values", [])]
+
+        # Find indicator dim/member with “Main refinancing operations”, excluding deposit/marginal
+        mro_dim_idx = None
+        mro_member_idx = None
+        mro_member_label = None
         for dim_idx, labset in enumerate(series_dim_labels):
+            for idx, _code, name in labset:
+                nm = (name or "").strip()
+                if must.search(nm) and not exclude.search(nm):
+                    mro_dim_idx = dim_idx
+                    mro_member_idx = idx
+                    mro_member_label = nm
+                    break
+            if mro_dim_idx is not None:
+                break
+        if mro_dim_idx is None:
+            return {}
+
+        # Find GEO dim and use Euro area aggregate (prefer U2, then EA*)
+        geo_dim_idx = None
+        geo_idx = None
+        for dim_idx, labset in enumerate(series_dim_labels):
+            # Heuristic: a dim containing many country/area names is GEO
             names = [n for _, _, n in labset]
-            # crude but effective way to find GEO: label set will include country/area names
-            if any(n in ("Germany", "France", "Italy") for n in names) or any(n in ("Euro area", "EA", "U2") for n in names):
-                geo_dim_index = dim_idx
-                # prefer "U2" or "EA" if present
-                for _i, _code, _name in labset:
-                    if _code in ("U2", "EA", "EA19", "EA20", "EA21"):
-                        geo_id_for_ea = _code
+            if any(n in ("Germany","France","Italy","Euro area") for n in names):
+                geo_dim_idx = dim_idx
+                preferred = {"U2","EA","EA19","EA20","EA21"}
+                # try by code first
+                by_code = {code: i for i, code, _ in labset}
+                for code in preferred:
+                    if code in by_code:
+                        geo_idx = by_code[code]
                         break
-                if not geo_id_for_ea and labset:
-                    # fallback to the first EA-like entry by name
-                    for _i, _code, _name in labset:
-                        if "Euro area" in str(_name):
-                            geo_id_for_ea = _code
+                # fallback by name
+                if geo_idx is None:
+                    for i, code, nm in labset:
+                        if "Euro area" in str(nm):
+                            geo_idx = i
                             break
                 break
+        # If GEO not found, we’ll just take whatever the first coords give us.
 
-        # If we didn't find a dedicated GEO dimension above, assume the dataset is already EA aggregate
-        # In either case, reconstruct the series index key for the first (or only) matching series.
-        # JSON-stat "series" uses positional indexes for the series dimensions.
+        # Build coordinates for the chosen series (other dims → index 0)
         data_sets = js.get("dataSets", [])
         if not data_sets:
             return {}
@@ -113,47 +104,33 @@ def eurostat_ecb_mro_monthly_series_via_labels() -> dict:
         if not series_map:
             return {}
 
-        # Determine fixed coordinates for each series dimension.
-        # For all series dimensions OTHER THAN the indicator dim and geo dim,
-        # we take index 0 to pick the first category.
         coord = []
-        total_series_dims = len(series_dim_labels)
-        for i in range(total_series_dims):
-            if i == mro_dim_index:
-                coord.append(mro_member_index)
-            elif i == geo_dim_index and geo_id_for_ea is not None:
-                # find index of geo_id_for_ea in this dimension
-                idx = 0
-                for ii, code, _nm in series_dim_labels[i]:
-                    if code == geo_id_for_ea:
-                        idx = ii
-                        break
-                coord.append(idx)
+        total_dims = len(series_dim_labels)
+        for i in range(total_dims):
+            if i == mro_dim_idx:
+                coord.append(mro_member_idx)
+            elif (geo_dim_idx is not None) and (i == geo_dim_idx) and (geo_idx is not None):
+                coord.append(geo_idx)
             else:
-                coord.append(0)
+                coord.append(0)  # first category for all other dims
 
-        series_key = ":".join(str(x) for x in coord)
-        serie = series_map.get(series_key)
+        key = ":".join(str(x) for x in coord)
+        serie = series_map.get(key)
         if not serie:
-            # try a laxer approach: scan all series and pick the first whose indicator dim matches mro_member_index
-            for key, v in series_map.items():
-                parts = [int(p) for p in key.split(":")]
-                if len(parts) != total_series_dims:
-                    continue
-                if parts[mro_dim_index] == mro_member_index:
-                    serie = v
-                    break
+            # fallback: scan all series and pick the first whose indicator dim matches MRO member
+            for k, v in series_map.items():
+                parts = [int(p) for p in k.split(":") if p.isdigit()]
+                if len(parts) == total_dims and parts[mro_dim_idx] == mro_member_idx:
+                    # if GEO was determined, prefer entries matching geo_idx
+                    if (geo_dim_idx is None) or (parts[geo_dim_idx] == geo_idx):
+                        serie = v
+                        break
         if not serie:
             return {}
 
-        observations = serie.get("observations", {})
-        if not observations:
-            return {}
-
-        # Map observation index -> period id (YYYY-MM)
-        time_vals = [v.get("id") for v in obs_dims[0].get("values", [])] if obs_dims else []
+        obs = serie.get("observations", {})
         out = {}
-        for idx_str, val_list in observations.items():
+        for idx_str, val_list in obs.items():
             try:
                 idx = int(idx_str)
                 period = time_vals[idx] if idx < len(time_vals) else None
@@ -163,39 +140,41 @@ def eurostat_ecb_mro_monthly_series_via_labels() -> dict:
                 out[period] = val
             except Exception:
                 continue
+
+        if out:
+            print(f"[Eurostat ECB] Using series: '{mro_member_label}' ({len(out)} monthly obs)")
         return out
 
     for ds in datasets:
         try:
-            js = fetch_eurostat_jsonstat(ds, geo="EA")  # EA aggregate
-            if not js:
-                js = fetch_eurostat_jsonstat(ds, geo="U2")  # euro area changing composition
+            js = fetch_eurostat_jsonstat(ds, geo="U2") or fetch_eurostat_jsonstat(ds, geo="EA")
             if not js:
                 continue
-            monthly = _scan_and_extract(js)
+            monthly = scan_and_extract(js)
             if monthly:
                 return monthly
         except Exception:
             continue
-
     return {}
 
-@lru_cache(maxsize=256)
+def _monthly_to_annual_last_obs(monthly: dict) -> dict:
+    annual = {}
+    for k, v in monthly.items():
+        if isinstance(k, str) and "-" in k and v is not None:
+            y = k.split("-")[0]
+            try:
+                annual[y] = float(v)  # last month wins
+            except Exception:
+                pass
+    # return years DESC
+    return dict(sorted(annual.items(), key=lambda kv: kv[0], reverse=True))
+
+@lru_cache(maxsize=64)
 def eurostat_ecb_policy_rate_annual() -> dict:
-    """
-    ECB Main Refinancing Operations (policy rate) via Eurostat mirror.
-    Returns annual series as { 'YYYY': float } using the last available monthly obs per year.
-    NOTE: We try a few known Eurostat flows that carry the ECB policy rate.
-    """
-    # Candidates in Eurostat that carry/refeed the ECB MRO (naming can vary by release)
-    # We query monthly and collapse to annual.
-    candidates = [
-        # (dataset_id, static filters)
-        # Commonly used Eurostat mirror of ECB MRO (monthly):
-        ("ei_mfir_m", {}),            # Main refinancing operations rate, monthly (Eurostat "ei" domain)
-        # Alternative financial interest rates domain:
-        ("irt_eur_m", {}),            # Interest rates – euro area, monthly (if available)
-    ]
+    m = eurostat_ecb_mro_monthly_series_via_labels()
+    if not m:
+        return {}
+    return _monthly_to_annual_last_obs(m)
 
     def monthly_to_annual(series: dict) -> dict:
         # series keys like "2024-12", "2025-06" → keep the last obs per year
