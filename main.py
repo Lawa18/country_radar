@@ -7,6 +7,15 @@ import unicodedata
 import requests
 import pycountry
 
+# --- lightweight logger ---
+LOG_ON = True
+def log(tag, msg):
+    if LOG_ON:
+        try:
+            print(f"[{tag}] {msg}")
+        except Exception:
+            pass
+
 # --- ISO-2 -> currency code used for display when values are LCU ---
 CURRENCY_CODE = {
     "MX": "MXN",
@@ -181,6 +190,8 @@ def eurostat_ecb_policy_rate_annual() -> dict:
       3) If label match fails, use a value heuristic over 2022-2025:
          pick the series with highest non-negative median (MRO > DFR which was often negative).
       4) Convert monthly YYYY-MM -> annual by last available month per year.
+      log("Eurostat ECB", f"MRO years={len(annual)}, latest={list(annual.items())[0] if annual else None}")
+      log("Eurostat ECB", "ei_mfir_m fetch returned empty or no series candidates")
     Returns { "YYYY": float, ... } (years DESC). Empty dict if nothing found.
     """
     import re
@@ -1107,7 +1118,38 @@ def parse_jsonstat_to_series(js: dict) -> Dict[str, float]:
     except Exception as e:
         print(f"[Eurostat] parse failed: {e}")
         return {}
+        
+@app.get("/debug/interest")
+def debug_interest(country: str = Query(..., description="Full country name")):
+    try:
+        codes = resolve_country_codes(country)
+        if not codes:
+            return {"error": "Invalid country"}
+        iso2 = codes["iso_alpha_2"]
 
+        # What Eurostat MRO reports
+        es_mro = {}
+        try:
+            es_mro = eurostat_ecb_policy_rate_annual() or {}
+        except Exception as e:
+            log("DEBUG", f"eurostat_ecb_policy_rate_annual error: {e}")
+
+        # What /country-data publishes
+        cd = country_data(country)  # calls your live assembler
+        ir = (cd.get("imf_data") or {}).get("Interest Rate") or {}
+
+        return {
+            "iso2": iso2,
+            "eurostat_mro_preview": {
+                "latest": (lambda s: {"year": max(s.keys()), "value": s[max(s.keys())]} if s else None)(es_mro),
+                "years": len(es_mro),
+                "has_2024": "2024" in es_mro,
+                "has_2025": "2025" in es_mro,
+            },
+            "country_data_interest_rate": ir
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 EU_ISO3 = {
     "AUT","BEL","BGR","HRV","CYP","CZE","DNK","EST","FIN","FRA","DEU","GRC","HUN","IRL","ITA","LVA","LTU","LUX","MLT",
