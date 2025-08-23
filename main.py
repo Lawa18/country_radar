@@ -15,6 +15,64 @@ CURRENCY_CODE = {
     # "BR": "BRL", "IN": "INR", "ZA": "ZAR", "CN": "CNY",
 }
 
+# ------------------ ECB SDW (Euro area policy rate) ------------------
+
+EURO_AREA_ISO2 = {
+    "AT","BE","CY","DE","EE","ES","FI","FR","GR","IE","IT",
+    "LT","LU","LV","MT","NL","PT","SI","SK"
+}
+
+@lru_cache(maxsize=256)
+def fetch_ecb_policy_rate_series() -> dict:
+    """
+    ECB Main Refinancing Operations (policy rate, MRO) from SDW.
+    Returns:
+      {
+        "latest": {"value": float, "date": "YYYY", "source": "ECB SDW"},
+        "series": {"YYYY": float, ...}  # last monthly observation per year
+      }
+    """
+    try:
+        url = ("https://sdw-wsrest.ecb.europa.eu/service/data/"
+               "FM/M.U2.EUR.4F.KR.MRR_FR.LEV?format=jsondata")
+        r = requests.get(url, timeout=12)
+        r.raise_for_status()
+        js = r.json()
+
+        ds = js.get("dataSets", [])
+        if not ds: 
+            return {}
+        series = ds[0].get("series", {})
+        skey = next(iter(series.keys()), None)
+        if not skey: 
+            return {}
+        obs = series[skey].get("observations", {})
+
+        time_vals = (js.get("structure", {})
+                       .get("dimensions", {})
+                       .get("observation", [])[0]
+                       .get("values", []))
+
+        annual = {}
+        for k, v in obs.items():
+            try:
+                idx = int(k)
+                period = time_vals[idx]["id"]     # e.g. "2024-12"
+                year = period.split("-")[0]
+                annual[year] = float(v[0])        # overwrites until last month wins
+            except Exception:
+                continue
+
+        if not annual: 
+            return {}
+        latest_year = max(int(y) for y in annual)
+        return {
+            "latest": {"value": annual[str(latest_year)], "date": str(latest_year), "source": "ECB SDW"},
+            "series": dict(sorted(annual.items(), reverse=True))
+        }
+    except Exception:
+        return {}
+
 @lru_cache(maxsize=512)
 def resolve_currency_code(iso_alpha_2: str) -> Optional[str]:
     try:
@@ -484,7 +542,17 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
         "Interest Rate": imf_series_block("Interest Rate", "FR.INR.RINR"),
         "Reserves (USD)": imf_series_block("Reserves (USD)", "FI.RES.TOTL.CD"),
     }
-
+    
+    try:
+        ir_block = imf_data.get("Interest Rate", {})
+        latest = (ir_block or {}).get("latest") or {}
+        if (latest.get("value") is None) and (iso2 in EURO_AREA_ISO2):
+            ecb = fetch_ecb_policy_rate_series()
+            if ecb:
+                imf_data["Interest Rate"] = ecb
+    except Exception:
+        pass
+    
     # GDP Growth (%) – prefer IMF, fallback to WB
     gdp_growth_imf = extract_latest_numeric_entry(imf.get("GDP Growth (%)", {}), "IMF")
     imf_data["GDP Growth (%)"] = gdp_growth_imf or wb_entry(wb.get("NY.GDP.MKTP.KD.ZG")) or {
