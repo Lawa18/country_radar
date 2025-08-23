@@ -25,31 +25,33 @@ EURO_AREA_ISO2 = {
 @lru_cache(maxsize=256)
 def fetch_ecb_policy_rate_series() -> dict:
     """
-    ECB Main Refinancing Operations (MRO) policy rate (FM.M.U2.EUR.4F.KR.MRR_FR.LEV).
-    Builds an annual series from the last monthly observation of each year.
-    Tries multiple base URLs and parameter styles to survive host quirks.
+    ECB Main Refinancing Operations (MRO) policy rate series:
+      Key: FM.M.U2.EUR.4F.KR.MRR_FR.LEV  (Monthly)
+    Robustly tries multiple hosts, paths, and SDMX flavors.
+    Builds an ANNUAL series = last monthly observation per year.
     Returns:
       { "latest": {"value": float, "date":"YYYY", "source":"ECB SDW"},
         "series": {"YYYY": float, ...} }
     """
-    import requests
+    import json, requests
 
     bases = [
-        "https://data-api.ecb.europa.eu/service/data",
-        "https://sdw-wsrest.ecb.europa.eu/service/data",
+        "https://sdw-wsrest.ecb.europa.eu/service",  # classic
+        "https://data-api.ecb.europa.eu/service",    # new
     ]
-    paths = [
-        "FM/M.U2.EUR.4F.KR.MRR_FR.LEV",  # standard SDMX key under flowRef FM
+    # SDMX flavors / resource types to try (in this order)
+    resource_paths = [
+        "data/FM/M.U2.EUR.4F.KR.MRR_FR.LEV",
+        "data/compact/FM/M.U2.EUR.4F.KR.MRR_FR.LEV",
+        "series/FM/M.U2.EUR.4F.KR.MRR_FR.LEV",
     ]
-    # Try "latest-only" first, then full series. Some stacks dislike ?format=jsondata
-    attempts = []
-    for base in bases:
-        for path in paths:
-            attempts.extend([
-                (f"{base}/{path}", {"lastNObservations": "1"}),            # latest only
-                (f"{base}/{path}", {"startPeriod": "2000"}),               # full series since 2000
-            ])
-
+    # Param sets (we’ll try each)
+    param_sets = [
+        {"lastNObservations": "1"},
+        {"startPeriod": "2000"},
+        {"startPeriod": "2000", "detail": "dataonly"},
+    ]
+    # Headers to cycle through (some stacks are picky)
     headers_list = [
         {"Accept": "application/vnd.sdmx.data+json;version=1.0.0-wd",
          "User-Agent": "CountryRadar/1.0 (+https://country-radar.onrender.com)"},
@@ -57,44 +59,69 @@ def fetch_ecb_policy_rate_series() -> dict:
          "User-Agent": "CountryRadar/1.0 (+https://country-radar.onrender.com)"},
     ]
 
-    def parse_series(js: dict) -> dict:
+    def parse_sdmx_json(js: dict) -> dict:
         """
-        Parse SDMX-JSON into annual last-observation-per-year dict: {"YYYY": value}
+        Parse SDMX-JSON data/compact payload into annual dict {"YYYY": value}.
         """
         try:
-            datasets = js.get("dataSets", [])
-            if not datasets:
+            ds = js.get("dataSets", [])
+            if not ds:
                 return {}
-            series_map = datasets[0].get("series", {})
-            if not series_map:
+            s_map = ds[0].get("series", {})
+            if not s_map:
                 return {}
-            # First series key (e.g., "0:0:0:0:0:0:0")
-            skey = next(iter(series_map.keys()), None)
-            if not skey:
+            s_key = next(iter(s_map), None)
+            if not s_key:
                 return {}
-            observations = series_map[skey].get("observations", {})
-            if not observations:
+            obs = s_map[s_key].get("observations", {})
+            if not obs:
                 return {}
-
-            # observation time labels
+            # Locate time dimension
             obs_dims = js.get("structure", {}).get("dimensions", {}).get("observation", [])
             if not obs_dims:
                 return {}
-            time_vals = obs_dims[0].get("values", [])
-
+            tvals = obs_dims[0].get("values", [])  # TIME_PERIOD values with id like "2024-12"
             annual = {}
-            for idx_str, val_list in observations.items():
+            for k, v in obs.items():
                 try:
-                    idx = int(idx_str)
-                    period = time_vals[idx]["id"]  # e.g., "2025-06" or "2016-01"
+                    idx = int(k)
+                    period = tvals[idx]["id"]
                     year = period.split("-")[0]
-                    val = float(val_list[0])
-                    annual[year] = val  # overwrite => last month in the year wins
+                    val = float(v[0])
+                    annual[year] = val  # overwrite ⇒ last month wins
                 except Exception:
                     continue
             return annual
         except Exception:
             return {}
+
+    def parse_series_api(js: dict) -> dict:
+        """
+        Parse /service/series payload (different structure).
+        We expect a single series with observations including "TIME_PERIOD"/"OBS_VALUE".
+        """
+        try:
+            # Some series endpoints return flat arrays; others include "series" list
+            # Try a generic walk:
+            txt = json.dumps(js)
+            # Fast path: look for pairs of "TIME_PERIOD":"YYYY-MM","OBS_VALUE":value
+            import re
+            pat = re.compile(r'"TIME_PERIOD"\s*:\s*"(\d{4})(?:-\d{2})?"\s*,\s*"OBS_VALUE"\s*:\s*"?([0-9.]+)"?')
+            annual = {}
+            for y, val in pat.findall(txt):
+                try:
+                    annual[y] = float(val)
+                except Exception:
+                    continue
+            return annual
+        except Exception:
+            return {}
+
+    attempts = []
+    for base in bases:
+        for rp in resource_paths:
+            for params in param_sets:
+                attempts.append((f"{base}/{rp}", params))
 
     last_error = None
     for url, params in attempts:
@@ -103,7 +130,12 @@ def fetch_ecb_policy_rate_series() -> dict:
                 r = requests.get(url, params=params, headers=headers, timeout=15)
                 r.raise_for_status()
                 js = r.json()
-                annual = parse_series(js)
+
+                # Try both parsers
+                annual = parse_sdmx_json(js)
+                if not annual:
+                    annual = parse_series_api(js)
+
                 if annual:
                     latest_year = max(int(y) for y in annual.keys())
                     out = {
