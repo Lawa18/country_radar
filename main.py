@@ -7,15 +7,6 @@ import unicodedata
 import requests
 import pycountry
 
-# --- lightweight logger ---
-LOG_ON = True
-def log(tag, msg):
-    if LOG_ON:
-        try:
-            print(f"[{tag}] {msg}")
-        except Exception:
-            pass
-
 # --- ISO-2 -> currency code used for display when values are LCU ---
 CURRENCY_CODE = {
     "MX": "MXN",
@@ -24,309 +15,63 @@ CURRENCY_CODE = {
     # "BR": "BRL", "IN": "INR", "ZA": "ZAR", "CN": "CNY",
 }
 
-# ---------- Eurostat: ECB policy (MRO) via Eurostat mirror (robust label match) ----------
+# ------------------ ECB SDW (Euro area policy rate) ------------------
 
 EURO_AREA_ISO2 = {
     "AT","BE","CY","DE","EE","ES","FI","FR","GR","IE","IT",
     "LT","LU","LV","MT","NL","PT","SI","SK"
 }
 
-@lru_cache(maxsize=64)
-def eurostat_ecb_mro_monthly_series_via_labels() -> dict:
+@lru_cache(maxsize=256)
+def fetch_ecb_policy_rate_series() -> dict:
     """
-    Returns MONTHLY {"YYYY-MM": float, ...} for ECB Main Refinancing Operations (MRO)
-    discovered by label in Eurostat monthly interest rate datasets.
-    We REQUIRE "main" + "refinancing" in the label, and EXCLUDE "deposit" / "marginal lending".
+    ECB Main Refinancing Operations (policy rate, MRO) from SDW.
+    Returns:
+      {
+        "latest": {"value": float, "date": "YYYY", "source": "ECB SDW"},
+        "series": {"YYYY": float, ...}  # last monthly observation per year
+      }
     """
-    import re
+    try:
+        url = ("https://sdw-wsrest.ecb.europa.eu/service/data/"
+               "FM/M.U2.EUR.4F.KR.MRR_FR.LEV?format=jsondata")
+        r = requests.get(url, timeout=12)
+        r.raise_for_status()
+        js = r.json()
 
-    datasets = ["ei_mfir_m", "irt_eur_m"]  # try in this order
-
-    # STRICT include and exclude patterns
-    must = re.compile(r"\bmain\b.*\brefinancing\b|\brefinancing\b.*\bmain\b", re.I)
-    exclude = re.compile(r"\bdeposit\b|\bmarginal\b|\blending\b|\bdf\b", re.I)
-
-    def labels(dim):
-        out = []
-        for i, v in enumerate(dim.get("values", [])):
-            out.append((i, v.get("id"), v.get("name") or v.get("label") or v.get("id")))
-        return out
-
-    def scan_and_extract(js: dict) -> dict:
-        struct = js.get("structure", {})
-        dims = struct.get("dimensions", {})
-        series_dims = dims.get("series") or []
-        obs_dims = dims.get("observation") or []
-
-        if not series_dims or not obs_dims:
+        ds = js.get("dataSets", [])
+        if not ds: 
             return {}
-
-        series_dim_labels = [labels(d) for d in series_dims]
-        time_vals = [v.get("id") for v in obs_dims[0].get("values", [])]
-
-        # Find indicator dim/member with “Main refinancing operations”, excluding deposit/marginal
-        mro_dim_idx = None
-        mro_member_idx = None
-        mro_member_label = None
-        for dim_idx, labset in enumerate(series_dim_labels):
-            for idx, _code, name in labset:
-                nm = (name or "").strip()
-                if must.search(nm) and not exclude.search(nm):
-                    mro_dim_idx = dim_idx
-                    mro_member_idx = idx
-                    mro_member_label = nm
-                    break
-            if mro_dim_idx is not None:
-                break
-        if mro_dim_idx is None:
+        series = ds[0].get("series", {})
+        skey = next(iter(series.keys()), None)
+        if not skey: 
             return {}
+        obs = series[skey].get("observations", {})
 
-        # Find GEO dim and use Euro area aggregate (prefer U2, then EA*)
-        geo_dim_idx = None
-        geo_idx = None
-        for dim_idx, labset in enumerate(series_dim_labels):
-            # Heuristic: a dim containing many country/area names is GEO
-            names = [n for _, _, n in labset]
-            if any(n in ("Germany","France","Italy","Euro area") for n in names):
-                geo_dim_idx = dim_idx
-                preferred = {"U2","EA","EA19","EA20","EA21"}
-                # try by code first
-                by_code = {code: i for i, code, _ in labset}
-                for code in preferred:
-                    if code in by_code:
-                        geo_idx = by_code[code]
-                        break
-                # fallback by name
-                if geo_idx is None:
-                    for i, code, nm in labset:
-                        if "Euro area" in str(nm):
-                            geo_idx = i
-                            break
-                break
-        # If GEO not found, we’ll just take whatever the first coords give us.
+        time_vals = (js.get("structure", {})
+                       .get("dimensions", {})
+                       .get("observation", [])[0]
+                       .get("values", []))
 
-        # Build coordinates for the chosen series (other dims → index 0)
-        data_sets = js.get("dataSets", [])
-        if not data_sets:
-            return {}
-        series_map = data_sets[0].get("series", {})
-        if not series_map:
-            return {}
-
-        coord = []
-        total_dims = len(series_dim_labels)
-        for i in range(total_dims):
-            if i == mro_dim_idx:
-                coord.append(mro_member_idx)
-            elif (geo_dim_idx is not None) and (i == geo_dim_idx) and (geo_idx is not None):
-                coord.append(geo_idx)
-            else:
-                coord.append(0)  # first category for all other dims
-
-        key = ":".join(str(x) for x in coord)
-        serie = series_map.get(key)
-        if not serie:
-            # fallback: scan all series and pick the first whose indicator dim matches MRO member
-            for k, v in series_map.items():
-                parts = [int(p) for p in k.split(":") if p.isdigit()]
-                if len(parts) == total_dims and parts[mro_dim_idx] == mro_member_idx:
-                    # if GEO was determined, prefer entries matching geo_idx
-                    if (geo_dim_idx is None) or (parts[geo_dim_idx] == geo_idx):
-                        serie = v
-                        break
-        if not serie:
-            return {}
-
-        obs = serie.get("observations", {})
-        out = {}
-        for idx_str, val_list in obs.items():
+        annual = {}
+        for k, v in obs.items():
             try:
-                idx = int(idx_str)
-                period = time_vals[idx] if idx < len(time_vals) else None
-                if not period:
-                    continue
-                val = float(val_list[0])
-                out[period] = val
+                idx = int(k)
+                period = time_vals[idx]["id"]     # e.g. "2024-12"
+                year = period.split("-")[0]
+                annual[year] = float(v[0])        # overwrites until last month wins
             except Exception:
                 continue
 
-        if out:
-            print(f"[Eurostat ECB] Using series: '{mro_member_label}' ({len(out)} monthly obs)")
-        return out
-
-    for ds in datasets:
-        try:
-            js = fetch_eurostat_jsonstat(ds, geo="U2") or fetch_eurostat_jsonstat(ds, geo="EA")
-            if not js:
-                continue
-            monthly = scan_and_extract(js)
-            if monthly:
-                return monthly
-        except Exception:
-            continue
-    return {}
-
-def _monthly_to_annual_last_obs(monthly: dict) -> dict:
-    annual = {}
-    for k, v in monthly.items():
-        if isinstance(k, str) and "-" in k and v is not None:
-            y = k.split("-")[0]
-            try:
-                annual[y] = float(v)  # last month wins
-            except Exception:
-                pass
-    # return years DESC
-    return dict(sorted(annual.items(), key=lambda kv: kv[0], reverse=True))
-
-@lru_cache(maxsize=64)
-def eurostat_ecb_policy_rate_annual() -> dict:
-    """
-    Discover the ECB Main Refinancing Operations (MRO) monthly series inside Eurostat
-    dataset ei_mfir_m for Euro Area (U2/EA), then collapse to annual (last month).
-    Strategy:
-      1) Scan all series for U2 (else EA).
-      2) Prefer series whose LABEL contains "main ... refinancing ... operations"
-         (case-insensitive), EXCLUDING 'deposit' and 'marginal'.
-      3) If label match fails, use a value heuristic over 2022-2025:
-         pick the series with highest non-negative median (MRO > DFR which was often negative).
-      4) Convert monthly YYYY-MM -> annual by last available month per year.
-      log("Eurostat ECB", f"MRO years={len(annual)}, latest={list(annual.items())[0] if annual else None}")
-      log("Eurostat ECB", "ei_mfir_m fetch returned empty or no series candidates")
-    Returns { "YYYY": float, ... } (years DESC). Empty dict if nothing found.
-    """
-    import re
-    import statistics
-
-    # 1) Fetch dataset once for U2, then EA
-    js = fetch_eurostat_jsonstat("ei_mfir_m", geo="U2") or fetch_eurostat_jsonstat("ei_mfir_m", geo="EA")
-    if not js:
-        print("[Eurostat ECB] ei_mfir_m fetch returned empty")
+        if not annual: 
+            return {}
+        latest_year = max(int(y) for y in annual)
+        return {
+            "latest": {"value": annual[str(latest_year)], "date": str(latest_year), "source": "ECB SDW"},
+            "series": dict(sorted(annual.items(), reverse=True))
+        }
+    except Exception:
         return {}
-
-    struct = js.get("structure", {})
-    dims = struct.get("dimensions", {})
-    series_dims = dims.get("series") or []
-    obs_dims = dims.get("observation") or []
-    if not series_dims or not obs_dims:
-        return {}
-
-    # Build label arrays for series dims and time dim
-    def _labels(dim):
-        return [(i, v.get("id"), v.get("name") or v.get("label") or v.get("id")) for i, v in enumerate(dim.get("values", []))]
-    sdim_labels = [_labels(d) for d in series_dims]
-    time_vals = [v.get("id") for v in obs_dims[0].get("values", [])]  # e.g., "2024-12"
-
-    datasets = js.get("dataSets", [])
-    if not datasets:
-        return {}
-    series_map = datasets[0].get("series", {}) or {}
-
-    # Identify likely GEO dim and its index for Euro Area key
-    geo_dim_idx = None
-    geo_idx = None
-    for dim_idx, labset in enumerate(sdim_labels):
-        names = [nm for _, _, nm in labset]
-        if any(n in ("Germany", "France", "Italy", "Euro area") for n in names):
-            geo_dim_idx = dim_idx
-            # prefer codes typical for euro area aggregate
-            pref = {"U2", "EA", "EA19", "EA20", "EA21"}
-            by_code = {code: i for i, code, _nm in labset}
-            for code in pref:
-                if code in by_code:
-                    geo_idx = by_code[code]
-                    break
-            if geo_idx is None:
-                # fall back by label
-                for i, code, nm in labset:
-                    if "Euro area" in str(nm):
-                        geo_idx = i
-                        break
-            break
-
-    # Helper: get (label, monthly_dict) for each series key that matches Euro Area coordinates
-    def extract_series_for_ea():
-        out = []
-        for key, serie in series_map.items():
-            # key like "0:1:2:0:..." positional per series dims
-            try:
-                parts = [int(p) for p in key.split(":")]
-            except Exception:
-                continue
-            if len(parts) != len(sdim_labels):
-                continue
-            # filter to EA if we identified a geo dim
-            if (geo_dim_idx is not None) and (geo_idx is not None) and (parts[geo_dim_idx] != geo_idx):
-                continue
-
-            # Compose a human label by concatenating all series-dim labels for this coordinate
-            labels = []
-            for dim_idx, labset in enumerate(sdim_labels):
-                idx = parts[dim_idx]
-                code, name = labset[idx][1], labset[idx][2]
-                labels.append(str(name or code))
-            long_label = " | ".join(labels)
-
-            obs = serie.get("observations", {})
-            monthly = {}
-            for idx_str, val_list in obs.items():
-                try:
-                    t_idx = int(idx_str)
-                    period = time_vals[t_idx] if t_idx < len(time_vals) else None
-                    if not period or "-" not in period:
-                        continue
-                    val = val_list[0]
-                    if val is None:
-                        continue
-                    monthly[period] = float(val)
-                except Exception:
-                    continue
-            if monthly:
-                out.append((long_label, monthly))
-        return out
-
-    candidates = extract_series_for_ea()
-    if not candidates:
-        print("[Eurostat ECB] No series candidates for EA in ei_mfir_m")
-        return {}
-
-    # 2) Label-based selection
-    must = re.compile(r"\bmain\b.*\brefinancing\b|\brefinancing\b.*\bmain\b", re.I)
-    exclude = re.compile(r"\bdeposit\b|\bmarginal\b|\blending\b|\bDF\b", re.I)
-
-    label_hits = [(lab, mon) for (lab, mon) in candidates if must.search(lab) and not exclude.search(lab)]
-    chosen = None
-    if label_hits:
-        # If multiple, pick the one with most recent non-null observation
-        def latest_obs_yearmonth(mon):
-            return max(mon.keys())
-        chosen = max(label_hits, key=lambda x: latest_obs_yearmonth(x[1]))
-
-    # 3) Value‑based heuristic fallback (if labels didn’t find MRO)
-    if chosen is None:
-        def median_2022p(mon):
-            vals = []
-            for ym, v in mon.items():
-                y = int(ym.split("-")[0]) if "-" in ym else None
-                if y and y >= 2022 and v is not None and -1e-6 <= float(v) <= 20.0:  # exclude negatives & silly
-                    vals.append(float(v))
-            return statistics.median(vals) if vals else float("-inf")
-        chosen = max(candidates, key=lambda x: median_2022p(x[1]))
-
-    chosen_label, monthly = chosen
-
-    # 4) Collapse monthly -> annual (last observation per year)
-    annual = {}
-    for ym in sorted(monthly.keys()):
-        y = ym.split("-")[0]
-        annual[y] = monthly[ym]  # overwrite -> last month wins
-
-    if not annual:
-        return {}
-
-    # Return years in DESC order
-    annual = dict(sorted(annual.items(), key=lambda kv: kv[0], reverse=True))
-    print(f"[Eurostat ECB] Using: {chosen_label}  | years={len(annual)}  latest={list(annual.items())[0]}")
-    return annual
 
 @lru_cache(maxsize=512)
 def resolve_currency_code(iso_alpha_2: str) -> Optional[str]:
@@ -556,6 +301,47 @@ def fetch_imf_weo_series(iso_alpha_3: str, indicators: list[str]) -> dict:
 
 # ------------------ Routes ------------------
 
+
+# ------- Minimal Eurostat policy rate (ECB MRO) helper: ei_mfir_m, indic=MRR_FR -------
+def _monthly_to_annual_last(mon: dict) -> dict:
+    out = {}
+    for k in sorted(mon.keys()):  # chronological; last month wins
+        if isinstance(k, str) and "-" in k:
+            v = mon.get(k)
+            if v is None:
+                continue
+            try:
+                y = k.split("-")[0]
+                out[y] = float(v)
+            except Exception:
+                pass
+    return dict(sorted(out.items(), key=lambda kv: kv[0], reverse=True))
+
+@lru_cache(maxsize=64)
+def eurostat_mro_annual() -> dict:
+    """
+    Eurostat mirror of ECB Main Refinancing Operations rate (MRO), monthly dataset ei_mfir_m.
+    We explicitly request the MRO member via indic=MRR_FR for the Euro area aggregate (U2, fallback EA).
+    Returns {'YYYY': float, ...} in DESC order, or {} if not available.
+    """
+    try:
+        for _geo in ("U2", "EA"):  # Euro area changing composition then EA
+            try:
+                _js = fetch_eurostat_jsonstat("ei_mfir_m", geo=_geo, indic="MRR_FR")
+            except Exception:
+                _js = None
+            if not _js:
+                continue
+            try:
+                _monthly = parse_jsonstat_to_series(_js) or {}
+            except Exception:
+                _monthly = {}
+            _annual = _monthly_to_annual_last(_monthly)
+            if _annual:
+                return _annual
+    except Exception:
+        pass
+    return {}
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
@@ -797,43 +583,16 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
         "Interest Rate": imf_series_block("Interest Rate", "FR.INR.RINR"),
         "Reserves (USD)": imf_series_block("Reserves (USD)", "FI.RES.TOTL.CD"),
     }
-
-    # Fill Interest Rate (Policy) from Eurostat (ECB mirror) for euro-area countries
+    
     try:
-        if iso2 in EURO_AREA_ISO2:
-            es_mro = eurostat_ecb_policy_rate_annual()
-            if es_mro:
-                latest_year = max(int(y) for y in es_mro.keys())
-                imf_data["Interest Rate"] = {
-                    "latest": {"value": es_mro[str(latest_year)], "date": str(latest_year), "source": "Eurostat (ECB MRO)"},
-                    "series": es_mro
-                }
-            else:
-                print(f"[Eurostat ECB] No policy rate series returned; keeping IMF/WB if present.")
-    except Exception as _e:
-        print(f"[Eurostat ECB] Override failed for {iso2}: {_e}")
-
-    # Fill Interest Rate (Policy) from Eurostat (ECB mirror) for euro-area countries
-    try:
-        if iso2 in EURO_AREA_ISO2:
-            es_mro = eurostat_ecb_policy_rate_annual()  # { 'YYYY': float, ... } or {}
-            if es_mro:
-                latest_year = max(int(y) for y in es_mro.keys())
-                imf_data["Interest Rate"] = {
-                    "latest": {"value": es_mro[str(latest_year)], "date": str(latest_year), "source": "Eurostat (ECB MRO)"},
-                    "series": es_mro
-                }
-            else:
-                print(f"[Eurostat ECB] No policy rate series returned; keeping IMF/WB if present.")
-    except Exception as _e:
-        print(f"[Eurostat ECB] Override failed for {iso2}: {_e}")
-        
-    try:
-        if iso2 in EURO_AREA_ISO2:
-            probe = fetch_ecb_policy_rate_series()
-            print(f"[ECB] Probe {iso2}: {probe.get('latest')}")
-    except Exception as _e:
-        print(f"[ECB] Probe failed for {iso2}: {_e}")
+        ir_block = imf_data.get("Interest Rate", {})
+        latest = (ir_block or {}).get("latest") or {}
+        if (latest.get("value") is None) and (iso2 in EURO_AREA_ISO2):
+            ecb = fetch_ecb_policy_rate_series()
+            if ecb:
+                imf_data["Interest Rate"] = ecb
+    except Exception:
+        pass
     
     # GDP Growth (%) – prefer IMF, fallback to WB
     gdp_growth_imf = extract_latest_numeric_entry(imf.get("GDP Growth (%)", {}), "IMF")
@@ -1118,38 +877,7 @@ def parse_jsonstat_to_series(js: dict) -> Dict[str, float]:
     except Exception as e:
         print(f"[Eurostat] parse failed: {e}")
         return {}
-        
-@app.get("/debug/interest")
-def debug_interest(country: str = Query(..., description="Full country name")):
-    try:
-        codes = resolve_country_codes(country)
-        if not codes:
-            return {"error": "Invalid country"}
-        iso2 = codes["iso_alpha_2"]
 
-        # What Eurostat MRO reports
-        es_mro = {}
-        try:
-            es_mro = eurostat_ecb_policy_rate_annual() or {}
-        except Exception as e:
-            log("DEBUG", f"eurostat_ecb_policy_rate_annual error: {e}")
-
-        # What /country-data publishes
-        cd = country_data(country)  # calls your live assembler
-        ir = (cd.get("imf_data") or {}).get("Interest Rate") or {}
-
-        return {
-            "iso2": iso2,
-            "eurostat_mro_preview": {
-                "latest": (lambda s: {"year": max(s.keys()), "value": s[max(s.keys())]} if s else None)(es_mro),
-                "years": len(es_mro),
-                "has_2024": "2024" in es_mro,
-                "has_2025": "2025" in es_mro,
-            },
-            "country_data_interest_rate": ir
-        }
-    except Exception as e:
-        return {"error": str(e)}
 
 EU_ISO3 = {
     "AUT","BEL","BGR","HRV","CYP","CZE","DNK","EST","FIN","FRA","DEU","GRC","HUN","IRL","ITA","LVA","LTU","LUX","MLT",
@@ -1299,43 +1027,6 @@ def eurostat_debt_to_gdp_annual(iso2: str) -> dict:
     except Exception as e:
         print(f"[Eurostat] ratio annual failed {iso2}: {e}")
         return {}
-
-@app.get("/debug/eurostat-structure")
-def debug_eurostat_structure(dataset: str = Query(...), geo: str = Query("U2")):
-    """
-    Dumps Eurostat JSON-stat series/observation dimensions for a dataset (e.g., ei_mfir_m).
-    Use: /debug/eurostat-structure?dataset=ei_mfir_m&geo=U2
-    """
-    try:
-        js = fetch_eurostat_jsonstat(dataset, geo=geo)
-        if not js:
-            return {"dataset": dataset, "geo": geo, "error": "empty response"}
-
-        struct = js.get("structure", {})
-        dims = struct.get("dimensions", {})
-        series_dims = dims.get("series") or []
-        obs_dims = dims.get("observation") or []
-
-        def dim_dump(d):
-            return {
-                "id": d.get("id"),
-                "role": d.get("role"),
-                "values": [
-                    {"idx": i, "id": v.get("id"), "name": v.get("name") or v.get("label") or v.get("id")}
-                    for i, v in enumerate(d.get("values", []))
-                ],
-            }
-
-        out = {
-            "dataset": dataset,
-            "geo": geo,
-            "series_dimensions": [dim_dump(d) for d in series_dims],
-            "observation_dimensions": [dim_dump(d) for d in obs_dims],
-            "hint": "Look for the series-dimension whose values include 'Main refinancing operations' or an ID containing 'MRR'. GEO may be absent if filtered by geo=U2.",
-        }
-        return out
-    except Exception as e:
-        return {"error": str(e)}
 
 def eurostat_debt_gdp_quarterly(geo_code: str) -> Optional[dict]:
     def normalize_period(p):
