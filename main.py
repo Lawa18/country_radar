@@ -580,10 +580,24 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
     imf_data = {
         "CPI": imf_series_block("CPI", "FP.CPI.TOTL.ZG"),
         "FX Rate": imf_series_block("FX Rate", "PA.NUS.FCRF"),
-        "Interest Rate": imf_series_block("Interest Rate", "FR.INR.RINR"),
+        # IMPORTANT: publish as "Interest Rate (Policy)" so the UI sees it
+        "Interest Rate (Policy)": imf_series_block("Interest Rate", "FR.INR.RINR"),
         "Reserves (USD)": imf_series_block("Reserves (USD)", "FI.RES.TOTL.CD"),
     }
-    
+
+    # Euro area MRO override from Eurostat (lean path)
+    try:
+        if iso2 in EURO_AREA_ISO2:
+            mro = eurostat_mro_annual() or {}
+            if mro:
+                latest_year = max(int(y) for y in mro.keys())
+                imf_data["Interest Rate (Policy)"] = {
+                    "latest": {"value": mro[str(latest_year)], "date": str(latest_year), "source": "Eurostat (ECB MRO)"},
+                    "series": mro
+                }
+    except Exception:
+        pass
+
     try:
         ir_block = imf_data.get("Interest Rate", {})
         latest = (ir_block or {}).get("latest") or {}
