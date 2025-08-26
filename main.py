@@ -328,7 +328,7 @@ def eurostat_mro_annual() -> dict:
         for geo in ("U2", "EA"):
             js = None
             try:
-                js = fetch_eurostat_jsonstat("ei_mfir_m", geo=geo, indic="MRR_FR")
+                _js = fetch_eurostat_jsonstat("ei_mfir_m", geo=_geo, indic="MRR_FR", freq="M")
             except Exception as e:
                 print(f"[Eurostat ECB] fetch error for geo={geo}: {e}")
             if not js:
@@ -603,11 +603,12 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
         "Reserves (USD)": imf_series_block("Reserves (USD)", "FI.RES.TOTL.CD"),
         # (plus GDP Growth, Unemployment, CAB, Gov Effectiveness below as you already do)
     }
-    # normalize if any other code still writes to "Interest Rate"
+    
+    # Normalize in case any earlier code used "Interest Rate" instead of "Interest Rate (Policy)"
     if "Interest Rate (Policy)" not in imf_data and "Interest Rate" in imf_data:
         imf_data["Interest Rate (Policy)"] = imf_data.pop("Interest Rate")
-
-    # Euro area MRO override from Eurostat (lean path)
+    
+    # Euro area override from Eurostat MRO
     try:
         if iso2 in EURO_AREA_ISO2:
             mro = eurostat_mro_annual() or {}
@@ -617,8 +618,8 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
                     "latest": {"value": mro[str(latest_year)], "date": str(latest_year), "source": "Eurostat (ECB MRO)"},
                     "series": mro
                 }
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[Eurostat ECB] override failed for {iso2}: {e}")
 
     try:
         ir_block = imf_data.get("Interest Rate", {})
@@ -629,7 +630,14 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
                 imf_data["Interest Rate (Policy)"] = ecb
     except Exception:
         pass
-    
+
+    @app.get("/debug/mro")
+    def debug_mro():
+        ser = eurostat_mro_annual() or {}
+        latest_year = max(ser.keys()) if ser else None
+        latest_val = ser.get(latest_year) if latest_year else None
+        return {"ok": bool(ser), "count": len(ser), "latest": {"year": latest_year, "value": latest_val}}
+
     # GDP Growth (%) – prefer IMF, fallback to WB
     gdp_growth_imf = extract_latest_numeric_entry(imf.get("GDP Growth (%)", {}), "IMF")
     imf_data["GDP Growth (%)"] = gdp_growth_imf or wb_entry(wb.get("NY.GDP.MKTP.KD.ZG")) or {
@@ -799,6 +807,9 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
             nominal_gdp_out["latest"]["currency_code"] = "USD"
     except Exception:
         pass
+
+    print("[/country-data] IR(Policy).latest:", imf_data.get("Interest Rate (Policy)",{}).get("latest"))
+    print("[/country-data] IR(Policy).years:", list((imf_data.get("Interest Rate (Policy)",{}).get("series") or {}).keys())[:8])
 
     return JSONResponse(content={
         "country": country,
