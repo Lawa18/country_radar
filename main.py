@@ -604,7 +604,7 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
         if (latest.get("value") is None) and (iso2 in EURO_AREA_ISO2):
             ecb = fetch_ecb_policy_rate_series()
             if ecb:
-                imf_data["Interest Rate"] = ecb
+                imf_data["Interest Rate (Policy)"] = ecb
     except Exception:
         pass
     
