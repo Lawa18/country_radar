@@ -321,27 +321,45 @@ def _monthly_to_annual_last(mon: dict) -> dict:
 def eurostat_mro_annual() -> dict:
     """
     Eurostat mirror of ECB Main Refinancing Operations rate (MRO), monthly dataset ei_mfir_m.
-    We explicitly request the MRO member via indic=MRR_FR for the Euro area aggregate (U2, fallback EA).
-    Returns {'YYYY': float, ...} in DESC order, or {} if not available.
+    Requests indic=MRR_FR for Euro area aggregate (geo=U2, fallback EA).
+    Returns {'YYYY': float, ...} in DESC year order, or {} if not available.
     """
     try:
-        for _geo in ("U2", "EA"):  # Euro area changing composition then EA
+        for geo in ("U2", "EA"):
+            js = None
             try:
-                _js = fetch_eurostat_jsonstat("ei_mfir_m", geo=_geo, indic="MRR_FR")
-            except Exception:
-                _js = None
-            if not _js:
+                js = fetch_eurostat_jsonstat("ei_mfir_m", geo=geo, indic="MRR_FR")
+            except Exception as e:
+                print(f"[Eurostat ECB] fetch error for geo={geo}: {e}")
+            if not js:
                 continue
+
             try:
-                _monthly = parse_jsonstat_to_series(_js) or {}
-            except Exception:
-                _monthly = {}
-            _annual = _monthly_to_annual_last(_monthly)
-            if _annual:
-                return _annual
-    except Exception:
-        pass
+                monthly = parse_jsonstat_to_series(js) or {}
+            except Exception as e:
+                print(f"[Eurostat ECB] parse error: {e}")
+                monthly = {}
+
+            # monthly keys expected 'YYYY-MM' → keep the last observation per year
+            annual = {}
+            for k in sorted(monthly.keys()):  # chronological so last month wins
+                v = monthly.get(k)
+                if v is None or not isinstance(k, str) or "-" not in k:
+                    continue
+                y = k.split("-")[0]
+                try:
+                    annual[y] = float(v)
+                except (TypeError, ValueError):
+                    pass
+
+            if annual:
+                # return as {'YYYY': float} sorted by year desc
+                return {str(y): annual[str(y)] if isinstance(y, str) else annual[y]
+                        for y in sorted(map(int, annual.keys()), reverse=True)}
+    except Exception as e:
+        print(f"[Eurostat ECB] unexpected: {e}")
     return {}
+    
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
@@ -580,10 +598,14 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
     imf_data = {
         "CPI": imf_series_block("CPI", "FP.CPI.TOTL.ZG"),
         "FX Rate": imf_series_block("FX Rate", "PA.NUS.FCRF"),
-        # IMPORTANT: publish as "Interest Rate (Policy)" so the UI sees it
+        # IMPORTANT: publish as the UI key "Interest Rate (Policy)", but fetch IMF by its internal label "Interest Rate"
         "Interest Rate (Policy)": imf_series_block("Interest Rate", "FR.INR.RINR"),
         "Reserves (USD)": imf_series_block("Reserves (USD)", "FI.RES.TOTL.CD"),
+        # (plus GDP Growth, Unemployment, CAB, Gov Effectiveness below as you already do)
     }
+    # normalize if any other code still writes to "Interest Rate"
+    if "Interest Rate (Policy)" not in imf_data and "Interest Rate" in imf_data:
+        imf_data["Interest Rate (Policy)"] = imf_data.pop("Interest Rate")
 
     # Euro area MRO override from Eurostat (lean path)
     try:
