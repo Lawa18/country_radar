@@ -321,40 +321,28 @@ def _monthly_to_annual_last(mon: dict) -> dict:
 def eurostat_mro_annual() -> dict:
     """
     Eurostat mirror of ECB Main Refinancing Operations rate (MRO), monthly dataset ei_mfir_m.
-    Requests indic=MRR_FR for Euro area aggregate (geo=U2, fallback EA).
-    Returns {'YYYY': float, ...} in DESC year order, or {} if not available.
+    We explicitly request the MRO member via indic=MRR_FR for the Euro area aggregate (U2, fallback EA).
+    Returns {'YYYY': float, ...} in DESC order, or {} if not available.
     """
     try:
-        for geo in ("U2", "EA"):
-            js = None
+        for geo in ("U2", "EA"):  # Euro area changing composition then EA
             try:
-                _js = fetch_eurostat_jsonstat("ei_mfir_m", geo=_geo, indic="MRR_FR", freq="M")
+                # NOTE: ei_mfir_m is monthly; include freq='M'
+                js = fetch_eurostat_jsonstat("ei_mfir_m", geo=geo, indic="MRR_FR", freq="M")
             except Exception as e:
                 print(f"[Eurostat ECB] fetch error for geo={geo}: {e}")
+                js = None
             if not js:
                 continue
-
             try:
                 monthly = parse_jsonstat_to_series(js) or {}
             except Exception as e:
-                print(f"[Eurostat ECB] parse error: {e}")
+                print(f"[Eurostat ECB] parse error for geo={geo}: {e}")
                 monthly = {}
-
-            # monthly keys expected 'YYYY-MM' → keep the last observation per year
-            annual = {}
-            for k in sorted(monthly.keys()):  # chronological so last month wins
-                v = monthly.get(k)
-                if v is None or not isinstance(k, str) or "-" not in k:
-                    continue
-                y = k.split("-")[0]
-                try:
-                    annual[y] = float(v)
-                except (TypeError, ValueError):
-                    pass
-
+            annual = _monthly_to_annual_last(monthly) if monthly else {}
             if annual:
-                # return as {'YYYY': float} sorted by year desc
-                return {str(y): annual[str(y)] if isinstance(y, str) else annual[y]
+                # ensure descending year order with string keys
+                return {str(y): float(annual[str(y)] if isinstance(y, str) else annual[y])
                         for y in sorted(map(int, annual.keys()), reverse=True)}
     except Exception as e:
         print(f"[Eurostat ECB] unexpected: {e}")
