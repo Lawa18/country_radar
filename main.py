@@ -321,13 +321,12 @@ def _monthly_to_annual_last(mon: dict) -> dict:
 def eurostat_mro_annual() -> dict:
     """
     Eurostat mirror of ECB Main Refinancing Operations rate (MRO), monthly dataset ei_mfir_m.
-    We explicitly request the MRO member via indic=MRR_FR for the Euro area aggregate (U2, fallback EA).
+    Requests indic=MRR_FR for Euro area aggregate (U2, fallback EA).
     Returns {'YYYY': float, ...} in DESC order, or {} if not available.
     """
     try:
-        for geo in ("U2", "EA"):  # Euro area changing composition then EA
+        for geo in ("U2", "EA"):
             try:
-                # NOTE: ei_mfir_m is monthly; include freq='M'
                 js = fetch_eurostat_jsonstat("ei_mfir_m", geo=geo, indic="MRR_FR", freq="M")
             except Exception as e:
                 print(f"[Eurostat ECB] fetch error for geo={geo}: {e}")
@@ -339,15 +338,45 @@ def eurostat_mro_annual() -> dict:
             except Exception as e:
                 print(f"[Eurostat ECB] parse error for geo={geo}: {e}")
                 monthly = {}
-            annual = _monthly_to_annual_last(monthly) if monthly else {}
+            # Convert monthly 'YYYY-MM' to annual by keeping the last observation per year
+            annual = {}
+            for k in sorted(monthly.keys()):  # chronological; last month wins
+                v = monthly.get(k)
+                if v is None or not isinstance(k, str) or "-" not in k:
+                    continue
+                year = k.split("-")[0]
+                try:
+                    annual[year] = float(v)
+                except (TypeError, ValueError):
+                    pass
             if annual:
-                # ensure descending year order with string keys
-                return {str(y): float(annual[str(y)] if isinstance(y, str) else annual[y])
+                return {str(y): annual[str(y)] if isinstance(y, str) else annual[y]
                         for y in sorted(map(int, annual.keys()), reverse=True)}
     except Exception as e:
         print(f"[Eurostat ECB] unexpected: {e}")
     return {}
-    
+
+@app.get("/debug/mro")
+def debug_mro():
+    """
+    Quick probe for the Eurostat ECB MRO helper.
+    Returns a few years and the latest value if available.
+    """
+    try:
+        ser = eurostat_mro_annual() or {}
+        if not ser:
+            return {"ok": False, "count": 0, "latest": {"year": None, "value": None}}
+        years = sorted(map(int, ser.keys()), reverse=True)
+        y = years[0]
+        return {
+            "ok": True,
+            "count": len(ser),
+            "years_found": years[:10],
+            "latest": {"year": y, "value": ser[str(y)]}
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
