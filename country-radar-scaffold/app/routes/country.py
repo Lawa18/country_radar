@@ -4,7 +4,7 @@ from app.schemas import CountryDataResponse
 
 router = APIRouter()
 
-@router.get("/country-data")
+@router.get("/country-data", response_model=CountryDataResponse)
 def country_data(country: str = Query(..., description="Full country name, e.g., Germany")):
     return build_country_payload(country)
 
