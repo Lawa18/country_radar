@@ -3,8 +3,8 @@ from app.providers.imf_provider import fetch_imf_sdmx_series
 from app.providers.wb_provider import fetch_worldbank_data, wb_series, wb_entry
 from app.providers.eurostat_provider import eurostat_debt_to_gdp_annual, eurostat_mro_annual, fetch_ecb_policy_rate_series
 from app.services.debt_service import compute_debt_payload  # use service, not the route
-from app.utils.country_utils import resolve_country_codes, resolve_currency_code, EURO_AREA_ISO2
-from app.utils.series_utils import extract_latest_numeric_entry  # we'll tidy helpers later
+from app.utils.country_codes import resolve_country_codes, resolve_currency_code, EURO_AREA_ISO2
+from app.utils.parsing import extract_latest_numeric_entry
 
 def build_country_payload(country: str) -> dict:
     codes = resolve_country_codes(country)
