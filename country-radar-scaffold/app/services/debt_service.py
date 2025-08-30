@@ -1,7 +1,7 @@
 from app.providers.eurostat_provider import eurostat_debt_to_gdp_annual
 from app.providers.imf_provider import imf_debt_to_gdp_annual
 from app.providers.wb_provider import fetch_worldbank_data, wb_year_dict_from_raw
-from app.utils.country_utils import resolve_country_codes, resolve_currency_code
+from app.utils.country_codes import resolve_country_codes, resolve_currency_code
 
 def compute_debt_payload(country: str) -> dict:
     """
