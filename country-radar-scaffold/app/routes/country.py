@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Query
 from app.services.indicator_service import build_country_payload
+from app.schemas import CountryDataResponse
 
 router = APIRouter()
 
