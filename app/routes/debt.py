@@ -1,8 +1,8 @@
 from fastapi import APIRouter, Query
+from app.services.debt_service import compute_debt_payload
 
 router = APIRouter()
 
 @router.get("/v1/debt")
-def get_debt(country: str = Query(..., description="Country name, e.g., Germany")):
-    # placeholder response
-    return {"country": country, "debt_to_gdp": "Placeholder ratio"}
+def v1_debt(country: str = Query(..., description="Full country name, e.g., Germany")):
+    return compute_debt_payload(country)
