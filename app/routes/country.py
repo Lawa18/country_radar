@@ -1,8 +1,8 @@
 from fastapi import APIRouter, Query
+from app.services.indicator_service import build_country_payload
 
 router = APIRouter()
 
 @router.get("/country-data")
-def get_country_data(country: str = Query(..., description="Country name, e.g., Germany")):
-    # placeholder response
-    return {"country": country, "data": "Country indicators here"}
+def country_data(country: str = Query(..., description="Full country name, e.g., Germany")):
+    return build_country_payload(country)
