@@ -1,6 +1,4 @@
-cat > app/services/indicator_service.py <<'PY'
 from typing import Dict, Any
-
 from app.utils.country_codes import resolve_country_codes
 from app.services.debt_service import compute_debt_payload
 
@@ -44,5 +42,4 @@ def build_country_payload(country: str) -> Dict[str, Any]:
         "debt_to_gdp":     {"latest": ratio_latest, "series": ratio_series},
         "additional_indicators": {},
     }
-PY
 
