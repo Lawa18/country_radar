@@ -1,4 +1,3 @@
-cat > app/services/debt_service.py <<'PY'
 from typing import Dict, Any, Optional
 
 from app.providers.wb_provider import fetch_worldbank_data, wb_year_dict_from_raw
@@ -9,12 +8,11 @@ from app.utils.country_codes import resolve_country_codes, resolve_currency_code
 
 def compute_debt_payload(country: str) -> Dict[str, Any]:
     """
-    Implements strict selection order for Debt-to-GDP:
-    1) Eurostat annual ratio (EU/EEA/UK)
-    2) IMF WEO annual ratio
-    3) World Bank WDI annual ratio
-    4) If none available: compute from WB annual levels (LCU preferred, USD fallback)
-    Returns a plain dict (no FastAPI types) that your UI/GPT consumes.
+    Strict selection order for Debt-to-GDP:
+      1) Eurostat annual ratio (EU/EEA/UK)
+      2) IMF WEO annual ratio
+      3) World Bank WDI annual ratio
+      4) If none: compute from WB annual levels (LCU preferred; USD fallback)
     """
     try:
         codes = resolve_country_codes(country)
@@ -28,7 +26,7 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
         eurostat_series: Dict[str, float] = {}
         best: Optional[Dict[str, Any]] = None
 
-        # 1) Eurostat annual ratio (EU/EEA/UK) - ratio first
+        # 1) Eurostat ratio
         try:
             eurostat_series = eurostat_debt_to_gdp_annual(iso2) or {}
             if eurostat_series:
@@ -43,7 +41,7 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
         except Exception:
             eurostat_series = {}
 
-        # 2) IMF WEO annual ratio
+        # 2) IMF ratio
         if best is None:
             try:
                 imf_series = imf_debt_to_gdp_annual(iso3) or {}
@@ -59,7 +57,7 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
             except Exception:
                 pass
 
-        # 3) World Bank WDI annual ratio
+        # 3) WB ratio
         if best is None:
             try:
                 wb = fetch_worldbank_data(iso2, iso3)
@@ -79,7 +77,7 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
             except Exception:
                 pass
 
-        # 4) Compute from annual levels only if no ratio found
+        # 4) Compute from levels (LCU first, USD fallback)
         government_debt = None
         nominal_gdp = None
         if best is None:
@@ -93,8 +91,7 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
                 )
                 if common_years:
                     y = common_years[-1]
-                    d = float(debt_lcu[y])
-                    g = float(gdp_lcu[y])
+                    d = float(debt_lcu[y]); g = float(gdp_lcu[y])
                     if g != 0:
                         best = {
                             "source": "World Bank WDI (computed)",
@@ -104,21 +101,14 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
                         }
                         path_used = "WB_ANNUAL_COMPUTED"
                         government_debt = {
-                            "value": d,
-                            "date": str(y),
-                            "source": "World Bank WDI",
+                            "value": d, "date": str(y), "source": "World Bank WDI",
                             "government_type": "Central Government",
-                            "currency": "LCU",
-                            "currency_code": resolve_currency_code(iso2),
+                            "currency": "LCU", "currency_code": resolve_currency_code(iso2),
                         }
                         nominal_gdp = {
-                            "value": g,
-                            "date": str(y),
-                            "source": "World Bank WDI",
-                            "currency": "LCU",
-                            "currency_code": resolve_currency_code(iso2),
+                            "value": g, "date": str(y), "source": "World Bank WDI",
+                            "currency": "LCU", "currency_code": resolve_currency_code(iso2),
                         }
-                # USD fallback compute
                 if best is None:
                     debt_usd = wb_year_dict_from_raw(wb.get("GC.DOD.TOTL.CD")) or {}
                     gdp_usd = wb_year_dict_from_raw(wb.get("NY.GDP.MKTP.CD")) or {}
@@ -128,8 +118,7 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
                     )
                     if common_years:
                         y = common_years[-1]
-                        d = float(debt_usd[y])
-                        g = float(gdp_usd[y])
+                        d = float(debt_usd[y]); g = float(gdp_usd[y])
                         if g != 0:
                             best = {
                                 "source": "World Bank WDI (computed USD)",
@@ -139,24 +128,18 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
                             }
                             path_used = "WB_ANNUAL_COMPUTED_USD"
                             government_debt = {
-                                "value": d,
-                                "date": str(y),
-                                "source": "World Bank WDI",
+                                "value": d, "date": str(y), "source": "World Bank WDI",
                                 "government_type": "Central Government",
-                                "currency": "USD",
-                                "currency_code": "USD",
+                                "currency": "USD", "currency_code": "USD",
                             }
                             nominal_gdp = {
-                                "value": g,
-                                "date": str(y),
-                                "source": "World Bank WDI",
-                                "currency": "USD",
-                                "currency_code": "USD",
+                                "value": g, "date": str(y), "source": "World Bank WDI",
+                                "currency": "USD", "currency_code": "USD",
                             }
             except Exception:
                 pass
 
-        # If still nothing, return empty ratio but keep Eurostat series if present
+        # If still nothing, return empty but include Eurostat series if any
         if best is None:
             return {
                 "country": country,
@@ -166,7 +149,7 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
                 "path_used": path_used,
             }
 
-        # Choose the historical series aligned to the chosen source
+        # Historical series aligned to chosen source
         series: Dict[str, float] = {}
         if path_used == "EUROSTAT_ANNUAL_RATIO":
             series = eurostat_series or {}
@@ -205,5 +188,3 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
 
     except Exception as e:
         return {"error": str(e), "country": country}
-PY
-
