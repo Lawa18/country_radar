@@ -7,7 +7,7 @@ from app.routes import country, debt
 
 app = FastAPI(title="Country Radar API", version="1.0.0")
 
-# CORS (relax now; tighten later if you want)
+# CORS: keep permissive while testing; lock down later.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,24 +19,29 @@ app.add_middleware(
 app.include_router(country.router, tags=["country"])
 app.include_router(debt.router, tags=["debt"])
 
-# Health
 @app.get("/ping")
 def ping():
     return {"status": "ok"}
 
-# OpenAPI: advertise your public base URL (great for GPT Actions)
+# Friendly root so a bare GET / doesn’t 404
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "service": "country-radar",
+        "docs": "/docs",
+        "openapi": "/openapi.json",
+        "health": "/ping",
+    }
+
+# Inject server URL into OpenAPI so GPT Actions know where to call
 def custom_openapi():
     if app.openapi_schema:
         return app.openapi_schema
     schema = get_openapi(title=app.title, version=app.version, routes=app.routes)
-    base = (
-        os.getenv("COUNTRY_RADAR_BASE_URL")           # optional explicit override
-        or os.getenv("RENDER_EXTERNAL_URL")           # Render auto-sets this
-        or "http://127.0.0.1:8000"                    # local fallback
-    )
+    base = os.getenv("COUNTRY_RADAR_BASE_URL", "https://country-radar.onrender.com")
     schema["servers"] = [{"url": base}]
     app.openapi_schema = schema
     return app.openapi_schema
 
 app.openapi = custom_openapi
-
