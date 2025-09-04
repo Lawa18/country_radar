@@ -7,6 +7,21 @@ from functools import lru_cache
 IMF_BASE = os.getenv("IMF_BASE", "https://dataservices.imf.org/REST/SDMX_JSON.svc")
 IMF_TIMEOUT = float(os.getenv("IMF_TIMEOUT", "8.0"))
 
+def fetch_imf_sdmx_series(iso2: str) -> Dict[str, Dict[str, float]]:
+    """
+    Placeholder IMF fetcher returning empty maps.
+    Your country-data logic will gracefully fallback to World Bank via wb_series/wb_entry.
+    Later we will fill this with dataservices.imf.org calls.
+    """
+    return {}
+
+def imf_debt_to_gdp_annual(iso3: str) -> Dict[str, float]:
+    """
+    Placeholder for IMF WEO annual debt/GDP ratio series (by ISO3).
+    Returning {} ensures your strict compute order continues without breaking imports.
+    """
+    return {}
+    
 def _client() -> httpx.Client:
     return httpx.Client(
         timeout=httpx.Timeout(IMF_TIMEOUT, connect=min(IMF_TIMEOUT/2, 4.0)),
