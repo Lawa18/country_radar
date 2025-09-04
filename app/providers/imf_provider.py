@@ -1,32 +1,76 @@
 from __future__ import annotations
+from typing import Dict, Any, Optional
 import os
-from typing import Dict
 import httpx
+from functools import lru_cache
 
-IMF_BASE = "https://dataservices.imf.org/REST/SDMX_JSON.svc"
-IMF_TIMEOUT = float(os.getenv("UPSTREAM_TIMEOUT", "6.0"))
-IMF_START = os.getenv("IMF_START_YEAR", "1990")
+IMF_BASE = os.getenv("IMF_BASE", "https://dataservices.imf.org/REST/SDMX_JSON.svc")
+IMF_TIMEOUT = float(os.getenv("IMF_TIMEOUT", "8.0"))
 
-def _get(url: str, params: Dict[str, str]) -> dict:
+def _client() -> httpx.Client:
+    return httpx.Client(
+        timeout=httpx.Timeout(IMF_TIMEOUT, connect=min(IMF_TIMEOUT/2, 4.0)),
+        headers={"User-Agent": "country-radar/1.0 (+https://country-radar.onrender.com)"},
+        limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
+    )
+
+def _compactdata(dataset: str, key: str, start: Optional[str], end: Optional[str]) -> Dict[str, Any]:
+    params = {}
+    if start: params["startPeriod"] = start
+    if end:   params["endPeriod"]   = end
+    url = f"{IMF_BASE}/CompactData/{dataset}/{key}"
+    with _client() as c:
+        r = c.get(url, params=params)
+        r.raise_for_status()
+        return r.json()
+
+def _parse_obs_to_map(payload: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Defensive SDMX parser: returns {period -> value} for either monthly (YYYY-MM) or annual (YYYY).
+    Works with common SDMX 2.1 JSON variants.
+    """
     try:
-        with httpx.Client(timeout=IMF_TIMEOUT) as client:
-            r = client.get(url, params=params)
-            r.raise_for_status()
-            return r.json()
+        compact = payload.get("CompactData") or {}
+        dataset = compact.get("DataSet") or {}
+        series = dataset.get("Series") or {}
+        if isinstance(series, list):
+            series = series[0] if series else {}
+        obs = series.get("Obs") or []
+        out: Dict[str, float] = {}
+        for o in obs:
+            period = o.get("TIME_PERIOD") or o.get("@TIME_PERIOD") or o.get("Time") or o.get("@Time")
+            val = o.get("OBS_VALUE") or o.get("@OBS_VALUE") or o.get("value") or o.get("@value")
+            if period is None or val in (None, "", "NA"):
+                continue
+            try:
+                out[str(period)] = float(val)
+            except Exception:
+                continue
+        # sort by period if it looks like year or year-month
+        return dict(sorted(out.items(), key=lambda k: k[0]))
     except Exception as e:
-        print(f"[IMF] GET failed {url}: {e}")
+        print(f"[IMF] parse error: {e}")
         return {}
 
-def fetch_imf_sdmx_series(iso2: str) -> Dict[str, Dict[str, float]]:
+@lru_cache(maxsize=256)
+def imf_series_map(dataset: str, key: str, start: Optional[str] = None, end: Optional[str] = None) -> Dict[str, float]:
     """
-    Return a mapping like: {"CPI": {...}, "FX Rate": {...}, ...}
-    For now, return {} quickly so WB fallbacks fill data without timeouts.
+    Fetches a trimmed IMF series and returns {period: value}.
+    Example:
+      dataset="IFS", key="M.DEU.PCPI_PC_CP_A_PT"   # CPI yoy %, Germany, monthly
+      start="2010-01", end="2025-12"
     """
-    return {}
+    try:
+        data = _compactdata(dataset, key, start, end)
+        return _parse_obs_to_map(data)
+    except Exception as e:
+        print(f"[IMF] fetch error {dataset}/{key}: {e}")
+        return {}
 
-def imf_debt_to_gdp_annual(iso3: str) -> Dict[str, float]:
-    """
-    If/when you wire an IMF WEO ratio series, return {YYYY: value}.
-    For now, fast-fail with {} so /v1/debt can proceed to WB fallbacks.
-    """
-    return {}
+def imf_latest(dataset: str, key: str, start: Optional[str] = None, end: Optional[str] = None) -> Optional[tuple[str, float]]:
+    series = imf_series_map(dataset, key, start, end)
+    if not series:
+        return None
+    # last period lexicographically -> latest
+    last = sorted(series.keys())[-1]
+    return last, series[last]
