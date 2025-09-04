@@ -1,9 +1,10 @@
-from typing import Dict, Any, Tuple
-from app.utils.country_codes import resolve_country_codes, resolve_currency_code
+from fastapi.responses import JSONResponse
+
+from app.providers.imf_provider import fetch_imf_sdmx_series, imf_debt_to_gdp_annual
+from app.providers.wb_provider import fetch_worldbank_data, wb_series, wb_entry
+from app.providers.eurostat_provider import eurostat_debt_to_gdp_annual
 from app.services.debt_service import compute_debt_payload
-from app.providers.wb_provider import fetch_worldbank_data, wb_entry, wb_series
-from app.providers.imf_provider import imf_weo_block
-from app.providers.eurostat_provider import eurostat_mro_monthly
+from app.utils.country_codes import resolve_country_codes, resolve_currency_code
 
 EURO_AREA_ISO2 = {
     "AT","BE","CY","DE","EE","ES","FI","FR","GR","HR",
@@ -62,7 +63,6 @@ def build_country_payload(country: str) -> Dict[str, Any]:
     wb = fetch_worldbank_data(iso2, iso3)
 
     # IMF WEO basket (annual) for now
-    weo = imf_weo_block(iso3)
 
     # CPI (YoY %): IMF-first (annual), WB fallback (annual)
     cpi_imf = weo.get("CPI") or {}
