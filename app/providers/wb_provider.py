@@ -1,87 +1,100 @@
-from typing import Dict, Any, Optional, Tuple
+import os
+from typing import Dict, Any, List, Tuple, Optional
 import httpx
 
-# Simple World Bank indicator fetcher (ISO3 code, e.g., CAN, DEU)
-def _wb_fetch_indicator(iso3: str, code: str) -> Dict[int, float]:
-    url = f"https://api.worldbank.org/v2/country/{iso3}/indicator/{code}"
-    params = {"format": "json", "per_page": "20000"}
-    r = httpx.get(url, params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    if not isinstance(data, list) or len(data) < 2 or data[1] is None:
+WB_BASE = "https://api.worldbank.org/v2"
+WB_TIMEOUT = float(os.getenv("UPSTREAM_TIMEOUT", "6.0"))
+WB_START = os.getenv("WB_DATE_START", "1990")  # trims response size
+
+# Indicators we rely on
+WB_CODES = [
+    "GC.DOD.TOTL.GD.ZS",  # Debt/GDP ratio (%)
+    "GC.DOD.TOTL.CN",     # Gov debt (LCU)
+    "NY.GDP.MKTP.CN",     # GDP (LCU)
+    "GC.DOD.TOTL.CD",     # Gov debt (USD)
+    "NY.GDP.MKTP.CD",     # GDP (USD)
+    "SL.UEM.TOTL.ZS",     # Unemployment (%)
+    "BN.CAB.XOKA.GD.ZS",  # Current account % GDP
+    "GE.EST",             # Government effectiveness
+    "NY.GDP.MKTP.KD.ZG",  # GDP growth (%)
+    "FP.CPI.TOTL.ZG",     # CPI yoy (%)
+    "PA.NUS.FCRF",        # FX to USD (LCU per USD)
+    "FI.RES.TOTL.CD",     # Reserves USD
+]
+
+def _wb_get(url: str, params: Dict[str, Any]) -> Any:
+    try:
+        with httpx.Client(timeout=WB_TIMEOUT) as client:
+            r = client.get(url, params=params)
+            r.raise_for_status()
+            return r.json()
+    except Exception as e:
+        print(f"[WB] GET failed {url}: {e}")
         return {}
-    out: Dict[int, float] = {}
-    for row in data[1]:
-        y = row.get("date")
-        v = row.get("value")
-        try:
-            yy = int(str(y))
-        except Exception:
-            continue
-        if v is not None:
-            try:
-                out[yy] = float(v)
-            except Exception:
-                pass
-    return out
+
+def _wb_indicator_url(iso2: str, code: str) -> str:
+    return f"{WB_BASE}/country/{iso2}/indicator/{code}"
 
 def fetch_worldbank_data(iso2: str, iso3: str) -> Dict[str, Any]:
     """
-    Fetch a basket of indicators we need for the Country Radar.
-    Keys mirror WDI codes.
+    Fetches a *trimmed* set of indicators since WB_START to keep payloads small.
+    Returns raw per-indicator JSON so existing parsers still work.
     """
-    codes = [
-        "GC.DOD.TOTL.GD.ZS",  # debt/GDP (%)
-        "GC.DOD.TOTL.CN",     # debt (LCU)
-        "NY.GDP.MKTP.CN",     # GDP (LCU)
-        "GC.DOD.TOTL.CD",     # debt (USD)
-        "NY.GDP.MKTP.CD",     # GDP (USD)
-        "FP.CPI.TOTL.ZG",     # CPI YoY (%)
-        "PA.NUS.FCRF",        # FX rate to USD (LCU per USD)
-        "FI.RES.TOTL.CD",     # Reserves (USD)
-        "NY.GDP.MKTP.KD.ZG",  # GDP growth (%)
-        "SL.UEM.TOTL.ZS",     # Unemployment (%)
-        "BN.CAB.XOKA.GD.ZS",  # Current Account Balance (% of GDP)
-        "GE.EST",             # Government Effectiveness (WGI)
-    ]
     out: Dict[str, Any] = {}
-    for c in codes:
-        try:
-            out[c] = _wb_fetch_indicator(iso3, c)
-        except Exception:
-            out[c] = {}
+    for code in WB_CODES:
+        url = _wb_indicator_url(iso2, code)
+        data = _wb_get(url, {
+            "format": "json",
+            "per_page": "200",
+            "date": f"{WB_START}:9999"  # reduce response size vs. 1960:...
+        })
+        out[code] = data
     return out
 
-def wb_year_dict_from_raw(raw: Optional[Any]) -> Dict[int, float]:
-    if isinstance(raw, dict):
-        return {int(y): float(v) for y, v in raw.items() if v is not None}
-    return {}
+def wb_year_dict_from_raw(raw: Any) -> Dict[int, float]:
+    """
+    Convert WB raw JSON into {year: value}. Ignores None values.
+    Handles both [] and {} inputs safely.
+    """
+    result: Dict[int, float] = {}
+    try:
+        if not isinstance(raw, list) or len(raw) < 2:
+            return {}
+        # WB returns [metadata, [{...}, {...}, ...]]
+        data = raw[1] or []
+        for row in data:
+            y = row.get("date")
+            v = row.get("value")
+            if y is None or v is None:
+                continue
+            ys = str(y)
+            if ys.isdigit():
+                result[int(ys)] = float(v)
+    except Exception as e:
+        print(f"[WB] parse failed: {e}")
+    return result
 
-def _latest(d: Dict[int, float]) -> Optional[Tuple[int, float]]:
-    years = [y for y, v in d.items() if v is not None]
-    if not years:
-        return None
-    y = max(years)
-    return y, d[y]
+def wb_series(raw: Any) -> Dict[str, Any]:
+    """
+    Convert WB raw JSON into {"latest": {...}, "series": {...}} shape.
+    Latest picks the max year with non-null value.
+    """
+    series = wb_year_dict_from_raw(raw)
+    if not series:
+        return {"latest": {"value": None, "date": None, "source": "World Bank WDI"}, "series": {}}
+    yrs = sorted(series.keys())
+    y = yrs[-1]
+    return {
+        "latest": {"value": series[y], "date": str(y), "source": "World Bank WDI"},
+        "series": {str(k): v for k, v in sorted(series.items())}
+    }
 
-def wb_entry(raw: Optional[Any]) -> Optional[Dict[str, Any]]:
-    d = wb_year_dict_from_raw(raw)
-    if not d:
+def wb_entry(raw: Any) -> Optional[Dict[str, Any]]:
+    """
+    Return only the latest point: {"value", "date", "source"} or None.
+    """
+    series = wb_year_dict_from_raw(raw)
+    if not series:
         return None
-    lv = _latest(d)
-    if not lv:
-        return None
-    y, v = lv
-    return {"value": float(v), "date": str(y), "source": "World Bank WDI"}
-
-def wb_series(raw: Optional[Any]) -> Optional[Dict[str, Any]]:
-    d = wb_year_dict_from_raw(raw)
-    if not d:
-        return None
-    lv = _latest(d)
-    latest = {"value": None, "date": None, "source": "World Bank WDI"}
-    if lv:
-        y, v = lv
-        latest = {"value": float(v), "date": str(y), "source": "World Bank WDI"}
-    series = {str(yy): vv for yy, vv in sorted(d.items())}
-    return {"latest": latest, "series": series}
+    y = max(series.keys())
+    return {"value": series[y], "date": str(y), "source": "World Bank WDI"}
