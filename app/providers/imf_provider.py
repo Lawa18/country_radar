@@ -7,6 +7,30 @@ from functools import lru_cache
 IMF_BASE = os.getenv("IMF_BASE", "https://dataservices.imf.org/REST/SDMX_JSON.svc")
 IMF_TIMEOUT = float(os.getenv("IMF_TIMEOUT", "8.0"))
 
+def ifs_cpi_index_monthly(iso3: str) -> Dict[str, float]:
+    return {}
+
+def ifs_unemployment_rate_monthly(iso3: str) -> Dict[str, float]:
+    return {}
+
+def ifs_fx_lcu_per_usd_monthly(iso3: str) -> Dict[str, float]:
+    return {}
+
+def ifs_reserves_usd_monthly(iso3: str) -> Dict[str, float]:
+    return {}
+
+def ifs_gdp_growth_quarterly(iso3: str) -> Dict[str, float]:
+    """Quarterly % change (q/q or y/y, pick one policy when you implement)."""
+    return {}
+
+def ifs_ca_percent_gdp(iso3: str) -> Dict[str, float]:
+    """Quarterly or annual %GDP; normalize to {YYYY[-Q]: pct}."""
+    return {}
+
+def ifs_policy_rate_monthly(iso3: str) -> Dict[str, float]:
+    """If a country reports a policy rate in IFS monthly, return it."""
+    return {}
+
 def fetch_imf_sdmx_series(iso2: str) -> Dict[str, Dict[str, float]]:
     """
     Placeholder IMF fetcher returning empty maps.
