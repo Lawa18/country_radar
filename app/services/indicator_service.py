@@ -1,10 +1,7 @@
+from __future__ import annotations
 from app.providers.ecb_provider import ecb_mro_latest_block
 from app.providers.eurostat_provider import EURO_AREA_ISO2
-
-from __future__ import annotations
-
 from typing import Dict, Any
-
 from app.utils.country_codes import resolve_country_codes, resolve_currency_code
 from app.providers.wb_provider import fetch_worldbank_data, wb_series, wb_entry
 from app.providers.eurostat_provider import eurostat_debt_to_gdp_annual
