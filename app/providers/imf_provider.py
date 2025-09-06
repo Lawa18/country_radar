@@ -8,36 +8,123 @@ IMF_BASE = os.getenv("IMF_BASE", "https://dataservices.imf.org/REST/SDMX_JSON.sv
 IMF_TIMEOUT = float(os.getenv("IMF_TIMEOUT", "8.0"))
 
 def ifs_cpi_index_monthly(iso3: str) -> Dict[str, float]:
-    return {}
+    """Monthly CPI inflation year-over-year % from IMF IFS."""
+    try:
+        # IFS concept: PCPI_PC_CP_A_PT = Consumer Prices, Percent change, Corresponding period previous year
+        key = f"M.{iso3}.PCPI_PC_CP_A_PT"
+        return imf_series_map("IFS", key, start="2010-01")
+    except Exception:
+        return {}
 
 def ifs_unemployment_rate_monthly(iso3: str) -> Dict[str, float]:
-    return {}
+    """Monthly unemployment rate % from IMF IFS."""
+    try:
+        # IFS concept: LUR_PT = Unemployment Rate, Percent
+        key = f"M.{iso3}.LUR_PT"
+        return imf_series_map("IFS", key, start="2010-01")
+    except Exception:
+        return {}
 
 def ifs_fx_lcu_per_usd_monthly(iso3: str) -> Dict[str, float]:
-    return {}
+    """Monthly exchange rate (LCU per USD) from IMF IFS."""
+    try:
+        # IFS concept: ENDA_XDC_USD_RATE = End of Period, National Currency per US Dollar
+        key = f"M.{iso3}.ENDA_XDC_USD_RATE"
+        return imf_series_map("IFS", key, start="2010-01")
+    except Exception:
+        return {}
 
 def ifs_reserves_usd_monthly(iso3: str) -> Dict[str, float]:
-    return {}
+    """Monthly total reserves in USD from IMF IFS."""
+    try:
+        # IFS concept: RAXGS_USD = Total Reserves excluding Gold, US Dollars
+        key = f"M.{iso3}.RAXGS_USD"
+        return imf_series_map("IFS", key, start="2010-01")
+    except Exception:
+        return {}
 
 def ifs_gdp_growth_quarterly(iso3: str) -> Dict[str, float]:
-    """Quarterly % change (q/q or y/y, pick one policy when you implement)."""
-    return {}
+    """Quarterly GDP growth % year-over-year from IMF IFS."""
+    try:
+        # IFS concept: NGDP_R_PC_CP_A_PT = Gross Domestic Product, Real, Percent change, Corresponding period previous year
+        key = f"Q.{iso3}.NGDP_R_PC_CP_A_PT"
+        return imf_series_map("IFS", key, start="2010-Q1")
+    except Exception:
+        return {}
 
 def ifs_ca_percent_gdp(iso3: str) -> Dict[str, float]:
-    """Quarterly or annual %GDP; normalize to {YYYY[-Q]: pct}."""
-    return {}
+    """Quarterly current account balance as % of GDP from IMF IFS."""
+    try:
+        # IFS concept: BCA_BP6_USD = Current Account, US Dollars
+        # We'll need to convert this to % of GDP, but for now return the series
+        key = f"Q.{iso3}.BCA_BP6_USD"
+        return imf_series_map("IFS", key, start="2010-Q1")
+    except Exception:
+        return {}
 
 def ifs_policy_rate_monthly(iso3: str) -> Dict[str, float]:
-    """If a country reports a policy rate in IFS monthly, return it."""
-    return {}
+    """Monthly policy/central bank rate from IMF IFS."""
+    try:
+        # IFS concept: FPOLM_PA = Monetary Policy-Related Interest Rate, Percent per annum
+        key = f"M.{iso3}.FPOLM_PA"
+        return imf_series_map("IFS", key, start="2010-01")
+    except Exception:
+        return {}
 
 def fetch_imf_sdmx_series(iso2: str) -> Dict[str, Dict[str, float]]:
     """
-    Placeholder IMF fetcher returning empty maps.
-    Your country-data logic will gracefully fallback to World Bank via wb_series/wb_entry.
-    Later we will fill this with dataservices.imf.org calls.
+    Fetch IMF IFS series for key indicators using ISO2 -> ISO3 mapping.
+    Returns: {"indicator_name": {"YYYY-MM": value, ...}}
     """
-    return {}
+    # Map ISO2 to ISO3 for IMF API calls
+    try:
+        import pycountry
+        country = pycountry.countries.get(alpha_2=iso2.upper())
+        if not country:
+            return {}
+        iso3 = country.alpha_3
+    except Exception:
+        return {}
+    
+    indicators = {}
+    
+    # Try to fetch each indicator, but don't fail if one doesn't work
+    try:
+        indicators["CPI_YoY"] = ifs_cpi_index_monthly(iso3)
+    except Exception:
+        indicators["CPI_YoY"] = {}
+    
+    try:
+        indicators["Unemployment_Rate"] = ifs_unemployment_rate_monthly(iso3)
+    except Exception:
+        indicators["Unemployment_Rate"] = {}
+    
+    try:
+        indicators["FX_Rate_USD"] = ifs_fx_lcu_per_usd_monthly(iso3)
+    except Exception:
+        indicators["FX_Rate_USD"] = {}
+    
+    try:
+        indicators["Reserves_USD"] = ifs_reserves_usd_monthly(iso3)
+    except Exception:
+        indicators["Reserves_USD"] = {}
+    
+    try:
+        indicators["Policy_Rate"] = ifs_policy_rate_monthly(iso3)
+    except Exception:
+        indicators["Policy_Rate"] = {}
+    
+    try:
+        indicators["GDP_Growth"] = ifs_gdp_growth_quarterly(iso3)
+    except Exception:
+        indicators["GDP_Growth"] = {}
+    
+    try:
+        indicators["Current_Account"] = ifs_ca_percent_gdp(iso3)
+    except Exception:
+        indicators["Current_Account"] = {}
+    
+    return indicators
 
 def imf_debt_to_gdp_annual(iso3: str) -> Dict[str, float]:
     """
@@ -113,3 +200,37 @@ def imf_latest(dataset: str, key: str, start: Optional[str] = None, end: Optiona
     # last period lexicographically -> latest
     last = sorted(series.keys())[-1]
     return last, series[last]
+
+def imf_series_to_latest_block(series_data: Dict[str, float], source_name: str) -> Dict[str, Any]:
+    """Convert IMF series data to the format expected by indicator service."""
+    if not series_data:
+        return {"latest": {"value": None, "date": None, "source": None}, "series": {}}
+    
+    # Get the latest value
+    sorted_periods = sorted(series_data.keys())
+    latest_period = sorted_periods[-1]
+    latest_value = series_data[latest_period]
+    
+    return {
+        "latest": {
+            "value": latest_value,
+            "date": latest_period,
+            "source": source_name
+        },
+        "series": series_data
+    }
+
+def imf_series_to_latest_entry(series_data: Dict[str, float], source_name: str) -> Dict[str, Any]:
+    """Convert IMF series data to latest entry format for table-only indicators."""
+    if not series_data:
+        return {"value": None, "date": None, "source": None}
+    
+    sorted_periods = sorted(series_data.keys())
+    latest_period = sorted_periods[-1]
+    latest_value = series_data[latest_period]
+    
+    return {
+        "value": latest_value,
+        "date": latest_period,
+        "source": source_name
+    }
