@@ -18,6 +18,7 @@ WB_CODES = [
     "FP.CPI.TOTL.ZG",     # CPI yoy (%)
     "PA.NUS.FCRF",        # FX to USD (LCU per USD)
     "FI.RES.TOTL.CD",     # Reserves USD
+    "FR.INR.RINR",        # Policy rate (World Bank, Lending interest rate)
 ]
 
 WB_BASE = "https://api.worldbank.org/v2/country/{country}/indicator/{indicator}"
@@ -28,14 +29,12 @@ WB_TIMEOUT = 6.0             # short timeouts to avoid Render stalls
 _CACHE: Dict[Tuple[str, str], Tuple[float, Any]] = {}  # key=(iso3, indicator) -> (ts, data)
 _CACHE_TTL = 300.0  # seconds
 
-
 def _http_get(url: str, timeout: float) -> Any:
     headers = {"User-Agent": "country-radar/1.0 (+https://country-radar.onrender.com)"}
     with httpx.Client(timeout=timeout, headers=headers) as client:
         r = client.get(url)
         r.raise_for_status()
         return r.json()
-
 
 def _fetch_wb_indicator(iso3: str, indicator: str) -> Optional[List[dict]]:
     """
@@ -67,7 +66,6 @@ def _fetch_wb_indicator(iso3: str, indicator: str) -> Optional[List[dict]]:
         _CACHE[ck] = (now, None)
         return None
 
-
 def fetch_worldbank_data(iso2: str, iso3: str) -> Dict[str, Optional[List[dict]]]:
     """
     Fetch all needed WB indicators for this country (ISO-3 used for requests).
@@ -78,7 +76,6 @@ def fetch_worldbank_data(iso2: str, iso3: str) -> Dict[str, Optional[List[dict]]
     for code in WB_CODES:
         out[code] = _fetch_wb_indicator(iso3, code)
     return out
-
 
 def _to_float(x: Any) -> Optional[float]:
     if x is None:
