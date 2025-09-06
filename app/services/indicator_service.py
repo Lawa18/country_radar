@@ -15,7 +15,7 @@ EURO_AREA_ISO2 = {
     "AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR","HU","IE","IT","LV","LT","LU","MT","NL","PL","PT","RO",
     "SK","SI","ES","SE",  # EU & SE
     "IS","NO","LI",       # EEA
-    "UK"                  # United Kingdom
+    "GB"                  # United Kingdom
 }
 
 def _empty_latest() -> Dict[str, Any]:
