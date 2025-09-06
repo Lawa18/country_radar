@@ -1,3 +1,6 @@
+from app.providers.ecb_provider import ecb_mro_latest_block
+from app.providers.eurostat_provider import EURO_AREA_ISO2
+
 from __future__ import annotations
 
 from typing import Dict, Any
