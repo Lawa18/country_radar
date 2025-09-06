@@ -7,10 +7,25 @@ from functools import lru_cache
 IMF_BASE = os.getenv("IMF_BASE", "https://dataservices.imf.org/REST/SDMX_JSON.svc")
 IMF_TIMEOUT = float(os.getenv("IMF_TIMEOUT", "8.0"))
 
+def imf_series_map(source: str, key: str, start="2010-01") -> Dict[str, float]:
+    url = f"{IMF_BASE}/CompactData/{key}?startPeriod={start}"
+    try:
+        print(f"[IMF] Fetching {url}")  # DEBUG: Log request URL
+        resp = httpx.get(url, timeout=IMF_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        print(f"[IMF] Response for {url}: {str(data)[:500]}")  # DEBUG: Log truncated response
+        # ... rest of your parsing logic ...
+        # (The parsing logic to extract the monthly/quarterly time series should follow here)
+        # For illustration, let's assume you return an empty dict if you don't parse further
+        return {}  # <-- Replace with your actual parsing logic!
+    except Exception as e:
+        print(f"[IMF] Exception fetching {url}: {e}")  # DEBUG: Log exception
+        raise
+
 def ifs_cpi_index_monthly(iso3: str) -> Dict[str, float]:
     """Monthly CPI inflation year-over-year % from IMF IFS."""
     try:
-        # IFS concept: PCPI_PC_CP_A_PT = Consumer Prices, Percent change, Corresponding period previous year
         key = f"M.{iso3}.PCPI_PC_CP_A_PT"
         return imf_series_map("IFS", key, start="2010-01")
     except Exception:
@@ -19,7 +34,6 @@ def ifs_cpi_index_monthly(iso3: str) -> Dict[str, float]:
 def ifs_unemployment_rate_monthly(iso3: str) -> Dict[str, float]:
     """Monthly unemployment rate % from IMF IFS."""
     try:
-        # IFS concept: LUR_PT = Unemployment Rate, Percent
         key = f"M.{iso3}.LUR_PT"
         return imf_series_map("IFS", key, start="2010-01")
     except Exception:
@@ -28,7 +42,6 @@ def ifs_unemployment_rate_monthly(iso3: str) -> Dict[str, float]:
 def ifs_fx_lcu_per_usd_monthly(iso3: str) -> Dict[str, float]:
     """Monthly exchange rate (LCU per USD) from IMF IFS."""
     try:
-        # IFS concept: ENDA_XDC_USD_RATE = End of Period, National Currency per US Dollar
         key = f"M.{iso3}.ENDA_XDC_USD_RATE"
         return imf_series_map("IFS", key, start="2010-01")
     except Exception:
@@ -37,7 +50,6 @@ def ifs_fx_lcu_per_usd_monthly(iso3: str) -> Dict[str, float]:
 def ifs_reserves_usd_monthly(iso3: str) -> Dict[str, float]:
     """Monthly total reserves in USD from IMF IFS."""
     try:
-        # IFS concept: RAXGS_USD = Total Reserves excluding Gold, US Dollars
         key = f"M.{iso3}.RAXGS_USD"
         return imf_series_map("IFS", key, start="2010-01")
     except Exception:
@@ -46,7 +58,6 @@ def ifs_reserves_usd_monthly(iso3: str) -> Dict[str, float]:
 def ifs_gdp_growth_quarterly(iso3: str) -> Dict[str, float]:
     """Quarterly GDP growth % year-over-year from IMF IFS."""
     try:
-        # IFS concept: NGDP_R_PC_CP_A_PT = Gross Domestic Product, Real, Percent change, Corresponding period previous year
         key = f"Q.{iso3}.NGDP_R_PC_CP_A_PT"
         return imf_series_map("IFS", key, start="2010-Q1")
     except Exception:
@@ -55,8 +66,6 @@ def ifs_gdp_growth_quarterly(iso3: str) -> Dict[str, float]:
 def ifs_ca_percent_gdp(iso3: str) -> Dict[str, float]:
     """Quarterly current account balance as % of GDP from IMF IFS."""
     try:
-        # IFS concept: BCA_BP6_USD = Current Account, US Dollars
-        # We'll need to convert this to % of GDP, but for now return the series
         key = f"Q.{iso3}.BCA_BP6_USD"
         return imf_series_map("IFS", key, start="2010-Q1")
     except Exception:
@@ -65,7 +74,6 @@ def ifs_ca_percent_gdp(iso3: str) -> Dict[str, float]:
 def ifs_policy_rate_monthly(iso3: str) -> Dict[str, float]:
     """Monthly policy/central bank rate from IMF IFS."""
     try:
-        # IFS concept: FPOLM_PA = Monetary Policy-Related Interest Rate, Percent per annum
         key = f"M.{iso3}.FPOLM_PA"
         return imf_series_map("IFS", key, start="2010-01")
     except Exception:
