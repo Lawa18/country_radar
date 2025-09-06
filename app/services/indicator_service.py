@@ -10,6 +10,25 @@ from app.providers.wb_provider import fetch_worldbank_data, wb_series, wb_entry
 from app.providers.eurostat_provider import eurostat_debt_to_gdp_annual
 from app.services.debt_service import compute_debt_payload
 
+def ecb_mro_latest_block() -> dict:
+    """
+    Return the euro-area policy rate (ECB MRO) as a monthly block:
+    { "latest": {"value": float|None, "date": "YYYY-MM"|None, "source": str|None}, "series": { "YYYY-MM": float, ... } }
+    """
+    try:
+        series = ecb_mro_monthly() or {}
+    except Exception:
+        series = {}
+
+    if not isinstance(series, dict) or not series:
+        return {"latest": {"value": None, "date": None, "source": None}, "series": {}}
+
+    # keys are expected as "YYYY-MM"
+    last_period = max(series.keys())
+    return {
+        "latest": {"value": series[last_period], "date": last_period, "source": "ECB (Main Refinancing Operations)"},
+        "series": series,
+    }
 
 def _empty_series_block() -> Dict[str, Any]:
     return {
@@ -185,6 +204,15 @@ def build_country_payload(country: str) -> Dict[str, Any]:
         "Current Account Balance (% of GDP)": cab_gdp,
         "Government Effectiveness": gov_effect,
     }
+
+        # --- Euro area override (monthly MRO) ---
+    if iso2 in EURO_AREA_ISO2:
+        try:
+            imf_data["Interest Rate (Policy)"] = ecb_mro_latest_block()
+        except Exception:
+            # Keep whatever IMF/WB value you already had if ECB call fails
+            pass
+
 
     # --- Build final response ---
     response = {
