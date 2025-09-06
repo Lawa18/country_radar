@@ -43,12 +43,32 @@ def _merge_indicator_data(imf_data: Dict[str, Dict[str, float]],
     else:
         indicators["FX Rate"] = wb_series(wb_data.get("PA.NUS.FCRF")) or _empty_series_block()
 
-    # Policy rate – will be overridden by ECB for EU/EEA/UK later
-    if imf_data.get("Policy_Rate"):
+    # Policy rate – order: IMF > ECB (for EU/EEA/UK) > World Bank
+    if imf_data.get("Policy_Rate") and imf_data["Policy_Rate"]:
         indicators["Interest Rate (Policy)"] = imf_series_to_latest_block(imf_data["Policy_Rate"], "IMF IFS")
+    elif is_eu_country:
+        try:
+            ecb_rate = ecb_mro_latest_block()
+            if ecb_rate["latest"]["value"] is not None:
+                indicators["Interest Rate (Policy)"] = ecb_rate
+            else:
+                raise ValueError("ECB MRO latest value is None")
+        except Exception as e:
+            print(f"[ECB] Error fetching policy rate for {iso2}: {e}")
+            # Fallback to World Bank
+            if wb_data.get("FR.INR.RINR"):
+                indicators["Interest Rate (Policy)"] = wb_series(wb_data.get("FR.INR.RINR")) or _empty_series_block()
+            else:
+                print(f"[WARN] No Policy Rate found for country {iso2}")
+                indicators["Interest Rate (Policy)"] = _empty_series_block()
     else:
-        indicators["Interest Rate (Policy)"] = _empty_series_block()
-
+        # Non-EU: fallback to World Bank
+        if wb_data.get("FR.INR.RINR"):
+            indicators["Interest Rate (Policy)"] = wb_series(wb_data.get("FR.INR.RINR")) or _empty_series_block()
+        else:
+            print(f"[WARN] No Policy Rate found for country {iso2}")
+            indicators["Interest Rate (Policy)"] = _empty_series_block()
+    
     # Reserves (USD)
     if imf_data.get("Reserves_USD"):
         indicators["Reserves (USD)"] = imf_series_to_latest_block(imf_data["Reserves_USD"], "IMF IFS")
