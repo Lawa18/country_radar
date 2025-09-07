@@ -1,88 +1,184 @@
-# app/providers/eurostat_provider.py
 from __future__ import annotations
-from typing import Dict, Any, Optional, List
-import time
+from typing import Dict, Any, Optional
+from functools import lru_cache
 import httpx
 
-EUROSTAT_TIMEOUT = 8.0
-EUROSTAT_RETRIES = 3
-EUROSTAT_BACKOFF = 0.8
+# ---- Eurostat dissemination API (v1.0) base ----
+EUROSTAT_BASE = "https://data-api.ec.europa.eu/api/dissemination/statistics/1.0/data"
+TIMEOUT = 6.0
 
-# Try both—DNS on either host sometimes flakes
-EUROSTAT_BASES: List[str] = [
-    "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data",
-    "https://data-api.ec.europa.eu/api/dissemination/statistics/1.0/data",
-]
+# Countries where Eurostat is relevant (EU/EEA + UK). You can expand as needed.
+EU_EEA_UK_ISO2 = {
+    # EU
+    "AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","EL","GR","HU","IE",
+    "IT","LV","LT","LU","MT","NL","PL","PT","RO","SK","SI","ES","SE",
+    # EEA (non-EU)
+    "IS","LI","NO",
+    # UK
+    "GB",
+}
 
-def _get_json(url: str) -> Optional[Dict[str, Any]]:
-    last_err: Optional[Exception] = None
-    for attempt in range(1, EUROSTAT_RETRIES + 1):
-        try:
-            with httpx.Client(timeout=EUROSTAT_TIMEOUT, headers={"Accept": "application/json"}, follow_redirects=True) as client:
-                r = client.get(url)
-                r.raise_for_status()
-                return r.json()
-        except Exception as e:
-            last_err = e
-            print(f"[Eurostat] attempt {attempt} failed {url}: {e}")
-            if attempt < EUROSTAT_RETRIES:
-                time.sleep(EUROSTAT_BACKOFF * attempt)
-    return None
+def _eurostat_geo(iso2: str) -> str:
+    """Eurostat uses 'UK' instead of ISO2 'GB'."""
+    return "UK" if iso2.upper() == "GB" else iso2.upper()
 
-def _parse_dataset(obj: Dict[str, Any]) -> Dict[str, float]:
+def _client() -> httpx.Client:
+    return httpx.Client(
+        timeout=TIMEOUT,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "country-radar/1.0"
+        },
+        follow_redirects=True,
+    )
+
+def _parse_time_value_series(payload: Dict[str, Any]) -> Dict[str, float]:
     """
-    Eurostat 1.0 API dataset -> {'time': value} numeric map (chronological).
+    Parse Eurostat JSON (v1.0) into {period -> value}.
+
+    Assumes the request filtered to a single series and only the 'time'
+    dimension varies, so the 'value' dict index maps directly to time order.
     """
     try:
-        if obj.get("class") != "dataset":
+        dataset = payload.get("value")
+        dims = payload.get("dimension", {})
+        time_cat = ((dims.get("time") or {}).get("category") or {}).get("label") or {}
+        if not dataset or not time_cat:
             return {}
-        dim = obj.get("dimension", {})
-        time_cat = dim.get("time", {}).get("category", {})
-        tindex = time_cat.get("index", {})  # { "2023-01": 0, ... }
-        values = obj.get("value", {})
+
         out: Dict[str, float] = {}
-        for t_label, idx in tindex.items():
+        # Enumerate time in order; values are at indices "0","1",...
+        for idx, period in enumerate(time_cat.keys()):
             key = str(idx)
-            if key in values and values[key] is not None:
+            if key in dataset and dataset[key] is not None:
                 try:
-                    out[str(t_label)] = float(values[key])
-                except Exception:
+                    out[period] = float(dataset[key])
+                except (TypeError, ValueError):
                     pass
-        return dict(sorted(out.items()))
+        return out
     except Exception:
         return {}
 
-def eurostat_hicp_yoy_monthly(iso2: str, start: str = "2019-01") -> Dict[str, float]:
+# --------------------------------------------------------------------
+# 1) CPI YoY (monthly) – HICP all-items (coicop=CP00). Unit = rate (%).
+#    Dataset: prc_hicp_manr
+# --------------------------------------------------------------------
+@lru_cache(maxsize=128)
+def eurostat_cpi_yoy_monthly(iso2: str) -> Dict[str, float]:
     """
-    HICP monthly YoY % — whole basket (CP00).
-    Dataset: prc_hicp_manr
+    Returns monthly YoY CPI (%) for the country, keyed by 'YYYY-MM'.
+    Example: {"2023-01": 8.7, ...}
     """
-    ds = "prc_hicp_manr"
-    # 'unit=RCH_A' = annual rate of change (%). Some mirrors accept 'RTE', we prefer RCH_A.
-    query = f"coicop=CP00&unit=RCH_A&geo={iso2}&time={start}/2035-12&format=json"
-    for base in EUROSTAT_BASES:
-        url = f"{base}/{ds}?{query}"
-        data = _get_json(url)
-        if not data:
-            continue
-        parsed = _parse_dataset(data)
-        if parsed:
-            return parsed
-    return {}
+    geo = _eurostat_geo(iso2)
+    if geo not in EU_EEA_UK_ISO2:
+        return {}
 
-def eurostat_unemployment_rate_monthly(iso2: str, start: str = "2019-01") -> Dict[str, float]:
+    params = {
+        "format": "json",
+        "coicop": "CP00",
+        "unit": "RTE",     # monthly annual rate
+        "geo": geo,
+        # fetch ~15y to be safe; you can narrow later
+        "time": "2010-01/2025-12",
+    }
+    url = f"{EUROSTAT_BASE}/prc_hicp_manr"
+    try:
+        with _client() as client:
+            r = client.get(url, params=params)
+            r.raise_for_status()
+            series = _parse_time_value_series(r.json())
+            return series
+    except Exception as e:
+        print(f"[Eurostat] CPI fetch error for {iso2}: {e}")
+        return {}
+
+# --------------------------------------------------------------------
+# 2) Unemployment rate (monthly, seasonally adjusted) – percent.
+#    Dataset: une_rt_m (PC, s_adj=SA, age=Y15-74, sex=T)
+# --------------------------------------------------------------------
+@lru_cache(maxsize=128)
+def eurostat_unemployment_rate_monthly(iso2: str) -> Dict[str, float]:
     """
-    Unemployment rate monthly (%) — seasonally adjusted, total, age 15-74.
-    Dataset: une_rt_m
+    Returns monthly unemployment rate (%) for the country, keyed by 'YYYY-MM'.
     """
-    ds = "une_rt_m"
-    query = f"s_adj=SA&sex=T&age=Y15-74&geo={iso2}&time={start}/2035-12&format=json"
-    for base in EUROSTAT_BASES:
-        url = f"{base}/{ds}?{query}"
-        data = _get_json(url)
-        if not data:
-            continue
-        parsed = _parse_dataset(data)
-        if parsed:
-            return parsed
-    return {}
+    geo = _eurostat_geo(iso2)
+    if geo not in EU_EEA_UK_ISO2:
+        return {}
+
+    params = {
+        "format": "json",
+        "unit": "PC",
+        "s_adj": "SA",
+        "sex": "T",
+        "age": "Y15-74",
+        "geo": geo,
+        "time": "2010-01/2025-12",
+    }
+    url = f"{EUROSTAT_BASE}/une_rt_m"
+    try:
+        with _client() as client:
+            r = client.get(url, params=params)
+            r.raise_for_status()
+            series = _parse_time_value_series(r.json())
+            return series
+    except Exception as e:
+        print(f"[Eurostat] unemployment fetch error for {iso2}: {e}")
+        return {}
+
+# --------------------------------------------------------------------
+# 3) Debt-to-GDP ratio (annual, %) – General Government (S13)
+#    Dataset: gov_10dd_edpt1 (annual EDP data)
+#    Filters: sect=S13, na_item=GD (gross debt), unit=PC_GDP
+# --------------------------------------------------------------------
+@lru_cache(maxsize=128)
+def eurostat_debt_to_gdp_annual(iso2: str) -> Dict[str, float]:
+    """
+    Returns annual general government debt-to-GDP (%) keyed by 'YYYY' for EU/EEA/UK.
+    Example: {"2021": 69.3, "2022": 66.1, ...}
+    """
+    geo = _eurostat_geo(iso2)
+    if geo not in EU_EEA_UK_ISO2:
+        return {}
+
+    params = {
+        "format": "json",
+        "sect": "S13",        # General government
+        "na_item": "GD",      # Gross debt
+        "unit": "PC_GDP",     # % of GDP
+        "geo": geo,
+        # annual horizon (broad); Eurostat accepts "YYYY/YYYY"
+        "time": "1990/2050",
+    }
+    url = f"{EUROSTAT_BASE}/gov_10dd_edpt1"
+    try:
+        with _client() as client:
+            r = client.get(url, params=params)
+            r.raise_for_status()
+            series = _parse_time_value_series(r.json())
+            # returns keys like "1995", "1996", ...
+            # Clean to only keep numeric year keys
+            out: Dict[str, float] = {}
+            for k, v in series.items():
+                if len(k) == 4 and k.isdigit():
+                    out[k] = v
+            return out
+    except Exception as e:
+        print(f"[Eurostat] debt-to-GDP fetch error for {iso2}: {e}")
+        return {}
+
+# --------------------------------------------------------------------
+# Small helper: pick latest value from a series (used by services)
+# --------------------------------------------------------------------
+def eurostat_latest_value(series_data: Dict[str, float], source_name: str) -> Dict[str, Any]:
+    """
+    Given a {period: value} dict, return {"value": v, "date": period, "source": source_name}
+    for the latest period. If empty, returns N/A block.
+    """
+    if not series_data:
+        return {"value": None, "date": None, "source": None}
+    try:
+        periods = sorted(series_data.keys())
+        last = periods[-1]
+        return {"value": series_data[last], "date": last, "source": source_name}
+    except Exception:
+        return {"value": None, "date": None, "source": None}
