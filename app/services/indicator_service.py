@@ -1,193 +1,156 @@
 from __future__ import annotations
-from typing import Any, Dict
-
-# Data providers
-from app.providers.wb_provider import fetch_worldbank_data, wb_series, wb_entry
-from app.providers.imf_provider import fetch_imf_sdmx_series, imf_series_to_latest_block, imf_series_to_latest_entry
-from app.providers.eurostat_provider import fetch_eurostat_indicators, eurostat_series_to_latest_block, eurostat_series_to_latest_entry, EURO_AREA_ISO2
-# Debt trio service (preserves your strict order)
-from app.services.debt_service import compute_debt_payload
-# Country codes
+from typing import Dict, Any, Optional
 from app.utils.country_codes import resolve_country_codes
-# ECB monthly policy-rate override (Euro area style)
+
+# Providers
+from app.providers.wb_provider import fetch_worldbank_data, wb_year_dict_from_raw
+from app.providers.imf_provider import (
+    fetch_imf_sdmx_series,
+    imf_cpi_yoy_monthly,
+    imf_fx_to_usd_monthly,
+    imf_reserves_usd_monthly,
+    imf_unemployment_rate_monthly,
+    imf_policy_rate_monthly,
+)
+from app.providers.eurostat_provider import (
+    eurostat_hicp_yoy_monthly,
+    eurostat_unemployment_rate_monthly,
+)
 from app.providers.ecb_provider import ecb_mro_latest_block
 
-def _empty_latest() -> Dict[str, Any]:
-    return {"value": None, "date": None, "source": None}
+# --- Country groups ---
+EURO_AREA_ISO2 = {
+    "AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","EL","GR","HU","IE","IT",
+    "LV","LT","LU","MT","NL","PL","PT","RO","SK","SI","ES","SE","IS","NO","LI","CH","UK"
+}
+# ECB MRO applies to euro area members only:
+ECB_EA_ISO2 = {
+    "AT","BE","CY","EE","FI","FR","DE","EL","GR","IE","IT","LV","LT","LU","MT","NL","PT","SK","SI","ES",
+}
 
-def _empty_series_block() -> Dict[str, Any]:
-    return {"latest": _empty_latest(), "series": {}}
+# --- helpers for shaping series into our output blocks ---
 
-def _merge_indicator_data(imf_data: Dict[str, Dict[str, float]], 
-                         eurostat_data: Dict[str, Dict[str, float]], 
-                         wb_data: Dict[str, Any], 
-                         iso2: str) -> Dict[str, Any]:
-    """
-    Merge indicator data with priority: IMF > Eurostat (EU only) > World Bank
-    Returns the final indicators map for the country payload.
-    """
-    indicators: Dict[str, Any] = {}
-    is_eu_country = iso2.upper() in EURO_AREA_ISO2
-    
-    # CPI YoY (%)
-    if imf_data.get("CPI_YoY"):
-        indicators["CPI"] = imf_series_to_latest_block(imf_data["CPI_YoY"], "IMF IFS")
-    elif is_eu_country and eurostat_data.get("CPI_YoY"):
-        indicators["CPI"] = eurostat_series_to_latest_block(eurostat_data["CPI_YoY"], "Eurostat HICP")
+def _latest_from_series(series: Dict[str, float]) -> Optional[Dict[str, Any]]:
+    if not series:
+        return None
+    last_key = sorted(series.keys())[-1]
+    return {"value": series[last_key], "date": last_key}
+
+def _series_block(series: Dict[str, float], source: str) -> Dict[str, Any]:
+    latest = _latest_from_series(series)
+    if latest:
+        latest["source"] = source
     else:
-        indicators["CPI"] = wb_series(wb_data.get("FP.CPI.TOTL.ZG")) or _empty_series_block()
+        latest = {"value": None, "date": None, "source": None}
+    return {"latest": latest, "series": series}
 
-    # FX to USD (LCU per USD)
-    if imf_data.get("FX_Rate_USD"):
-        indicators["FX Rate"] = imf_series_to_latest_block(imf_data["FX_Rate_USD"], "IMF IFS")
-    else:
-        indicators["FX Rate"] = wb_series(wb_data.get("PA.NUS.FCRF")) or _empty_series_block()
+def wb_entry(raw: Optional[list]) -> Optional[Dict[str, Any]]:
+    d = wb_year_dict_from_raw(raw)
+    if not d:
+        return None
+    last_year = sorted(d.keys())[-1]
+    return {"value": d[last_year], "date": last_year, "source": "World Bank WDI"}
 
-    # Policy rate – order: IMF > ECB (for EU/EEA/UK) > World Bank
-    if imf_data.get("Policy_Rate") and imf_data["Policy_Rate"]:
-        indicators["Interest Rate (Policy)"] = imf_series_to_latest_block(imf_data["Policy_Rate"], "IMF IFS")
-    elif is_eu_country:
-        try:
-            ecb_rate = ecb_mro_latest_block()
-            if ecb_rate["latest"]["value"] is not None:
-                indicators["Interest Rate (Policy)"] = ecb_rate
-            else:
-                raise ValueError("ECB MRO latest value is None")
-        except Exception as e:
-            print(f"[ECB] Error fetching policy rate for {iso2}: {e}")
-            # Fallback to World Bank
-            if wb_data.get("FR.INR.RINR"):
-                indicators["Interest Rate (Policy)"] = wb_series(wb_data.get("FR.INR.RINR")) or _empty_series_block()
-            else:
-                print(f"[WARN] No Policy Rate found for country {iso2}")
-                indicators["Interest Rate (Policy)"] = _empty_series_block()
-    else:
-        # Non-EU: fallback to World Bank
-        if wb_data.get("FR.INR.RINR"):
-            indicators["Interest Rate (Policy)"] = wb_series(wb_data.get("FR.INR.RINR")) or _empty_series_block()
-        else:
-            print(f"[WARN] No Policy Rate found for country {iso2}")
-            indicators["Interest Rate (Policy)"] = _empty_series_block()
-    
-    # Reserves (USD)
-    if imf_data.get("Reserves_USD"):
-        indicators["Reserves (USD)"] = imf_series_to_latest_block(imf_data["Reserves_USD"], "IMF IFS")
-    else:
-        indicators["Reserves (USD)"] = wb_series(wb_data.get("FI.RES.TOTL.CD")) or _empty_series_block()
+def wb_series(raw: Optional[list]) -> Optional[Dict[str, Any]]:
+    d = wb_year_dict_from_raw(raw)
+    if not d:
+        return None
+    latest = _latest_from_series(d)
+    latest["source"] = "World Bank WDI"
+    return {"latest": latest, "series": d}
 
-    # Table-only "latest" indicators
-    # GDP Growth (%)
-    if imf_data.get("GDP_Growth"):
-        indicators["GDP Growth (%)"] = imf_series_to_latest_entry(imf_data["GDP_Growth"], "IMF IFS")
-    else:
-        indicators["GDP Growth (%)"] = wb_entry(wb_data.get("NY.GDP.MKTP.KD.ZG")) or _empty_latest()
-
-    # Unemployment (%)
-    if imf_data.get("Unemployment_Rate"):
-        indicators["Unemployment (%)"] = imf_series_to_latest_entry(imf_data["Unemployment_Rate"], "IMF IFS")
-    elif is_eu_country and eurostat_data.get("Unemployment_Rate"):
-        indicators["Unemployment (%)"] = eurostat_series_to_latest_entry(eurostat_data["Unemployment_Rate"], "Eurostat")
-    else:
-        indicators["Unemployment (%)"] = wb_entry(wb_data.get("SL.UEM.TOTL.ZS")) or _empty_latest()
-
-    # Current Account Balance (% of GDP) - keep World Bank for now as IMF needs conversion
-    indicators["Current Account Balance (% of GDP)"] = wb_entry(wb_data.get("BN.CAB.XOKA.GD.ZS")) or _empty_latest()
-
-    # Government Effectiveness - always World Bank
-    indicators["Government Effectiveness"] = wb_entry(wb_data.get("GE.EST")) or _empty_latest()
-
-    return indicators
+# --- main payload builder used by /country-data route ---
 
 def build_country_payload(country: str) -> Dict[str, Any]:
-    """
-    Enhanced country data payload that prioritizes IMF and Eurostat data:
-      - IMF IFS monthly/quarterly data (when available)
-      - Eurostat monthly data for EU countries (when available)  
-      - World Bank WDI as fallback
-      - ECB MRO monthly override for EU/EEA/UK "Interest Rate (Policy)"
-      - Attach Government Debt trio from compute_debt_payload()
-    """
-    # --- Country codes ---
     codes = resolve_country_codes(country)
     if not codes:
         return {"error": "Invalid country name", "country": country}
-    iso2, iso3 = codes["iso_alpha_2"], codes["iso_alpha_3"]
 
-    # --- Fetch data from all providers ---
-    try:
-        # Get IMF data (monthly/quarterly when available)
-        imf_data_raw = fetch_imf_sdmx_series(iso2)
-    except Exception as e:
-        print(f"[IMF] Error fetching data for {iso2}: {e}")
-        imf_data_raw = {}
+    iso2 = codes["iso_alpha_2"]
+    iso3 = codes["iso_alpha_3"]
 
-    try:
-        # Get Eurostat data for EU countries
-        eurostat_data = fetch_eurostat_indicators(iso2) if iso2.upper() in EURO_AREA_ISO2 else {}
-    except Exception as e:
-        print(f"[Eurostat] Error fetching data for {iso2}: {e}")
-        eurostat_data = {}
+    # prefetch WB raw once (used for fallbacks and annual-only)
+    wb_raw = fetch_worldbank_data(iso2, iso3)
 
-    try:
-        # Get World Bank data as fallback
-        wb = fetch_worldbank_data(iso2, iso3)
-    except Exception as e:
-        print(f"[World Bank] Error fetching data for {iso2}: {e}")
-        wb = {}
+    # IMF bundle (monthly) – not used directly, but available if you want
+    imf_bundle = fetch_imf_sdmx_series(iso2)
 
-    # --- Merge indicators with priority: IMF > Eurostat (EU only) > World Bank ---
-    imf_data = _merge_indicator_data(imf_data_raw, eurostat_data, wb, iso2)
+    # --- CPI (prefer Eurostat monthly -> IMF monthly -> WB annual) ---
+    cpi_series = eurostat_hicp_yoy_monthly(iso2, start="2019-01")
+    if cpi_series:
+        cpi_block = _series_block(cpi_series, "Eurostat HICP (YoY, monthly)")
+    else:
+        cpi_series = imf_cpi_yoy_monthly(iso2, start="2019-01")
+        if cpi_series:
+            cpi_block = _series_block(cpi_series, "IMF IFS (CPI YoY, monthly)")
+        else:
+            cpi_block = {"latest": wb_entry(wb_raw.get("FP.CPI.TOTL.ZG")) or {"value": None, "date": None, "source": None}, "series": {}}
 
-    # --- ECB override (monthly) for EU/EEA/UK policy rates ---
-    try:
-        if iso2.upper() in EURO_AREA_ISO2:
-            imf_data["Interest Rate (Policy)"] = ecb_mro_latest_block()
-    except Exception:
-        # Quietly keep IMF/WB/empty if ECB fetch fails
-        pass
+    # --- Unemployment (prefer Eurostat monthly -> IMF monthly -> WB annual) ---
+    unemp_series = eurostat_unemployment_rate_monthly(iso2, start="2019-01")
+    if unemp_series:
+        unemp_block = _series_block(unemp_series, "Eurostat (Unemployment, SA, monthly)")
+    else:
+        unemp_series = imf_unemployment_rate_monthly(iso2, start="2019-01")
+        if unemp_series:
+            unemp_block = _series_block(unemp_series, "IMF IFS (Unemployment, monthly)")
+        else:
+            unemp_block = {"latest": wb_entry(wb_raw.get("SL.UEM.TOTL.ZS")) or {"value": None, "date": None, "source": None}, "series": {}}
 
-    # --- Debt block (reuses your strict order service) ---
-    debt_bundle = compute_debt_payload(country)
+    # --- Policy Rate (ECB for euro area -> IMF -> N/A) ---
+    if iso2 in ECB_EA_ISO2:
+        ir_block = ecb_mro_latest_block()
+        # ir_block already has {"latest": {...}, "series": {...}}
+        if not ir_block.get("latest") or ir_block["latest"].get("value") is None:
+            # try IMF policy monthly if ECB failed (some non-euro EU members)
+            pol_series = imf_policy_rate_monthly(iso2, start="2019-01")
+            ir_block = _series_block(pol_series, "IMF IFS (Policy Rate, monthly)") if pol_series else {"latest": {"value": None, "date": None, "source": None}, "series": {}}
+    else:
+        pol_series = imf_policy_rate_monthly(iso2, start="2019-01")
+        ir_block = _series_block(pol_series, "IMF IFS (Policy Rate, monthly)") if pol_series else {"latest": {"value": None, "date": None, "source": None}, "series": {}}
 
-    gov_debt_latest = {
-        "value": None, "date": None, "source": None,
-        "government_type": None, "currency": None, "currency_code": None,
+    # --- FX rate to USD (IMF monthly -> WB annual) ---
+    fx_series = imf_fx_to_usd_monthly(iso2, start="2019-01")
+    fx_block = _series_block(fx_series, "IMF IFS (FX to USD, monthly)") if fx_series else \
+               {"latest": wb_entry(wb_raw.get("PA.NUS.FCRF")) or {"value": None, "date": None, "source": None}, "series": {}}
+
+    # --- Reserves USD (IMF monthly -> WB annual) ---
+    res_series = imf_reserves_usd_monthly(iso2, start="2019-01")
+    res_block = _series_block(res_series, "IMF IFS (Reserves USD, monthly)") if res_series else \
+                {"latest": wb_entry(wb_raw.get("FI.RES.TOTL.CD")) or {"value": None, "date": None, "source": None}, "series": {}}
+
+    # --- Annual indicators from WB (good coverage) ---
+    gdp_growth = wb_entry(wb_raw.get("NY.GDP.MKTP.KD.ZG")) or {"value": None, "date": None, "source": None}
+    cab_gdp = wb_entry(wb_raw.get("BN.CAB.XOKA.GD.ZS")) or {"value": None, "date": None, "source": None}
+    gov_eff = wb_entry(wb_raw.get("GE.EST")) or {"value": None, "date": None, "source": None}
+
+    # Build response: keep your previous JSON shape
+    imf_data = {
+        "CPI": cpi_block,
+        "FX Rate": fx_block,
+        "Interest Rate (Policy)": ir_block,
+        "Reserves (USD)": res_block,
+        "GDP Growth (%)": gdp_growth,
+        "Unemployment (%)": unemp_block["latest"],  # for table's 'latest'; series kept below
+        "Current Account Balance (% of GDP)": cab_gdp,
+        "Government Effectiveness": gov_eff,
     }
-    nom_gdp_latest = {
-        "value": None, "date": None, "source": None,
-        "currency": None, "currency_code": None,
-    }
-    debt_pct_latest = {"value": None, "date": None, "source": None, "government_type": None}
 
-    if isinstance(debt_bundle, dict):
-        gd = debt_bundle.get("government_debt")
-        if isinstance(gd, dict):
-            for k in list(gov_debt_latest.keys()):
-                if k in gd and gd[k] is not None:
-                    gov_debt_latest[k] = gd[k]
+    # Attach unemployment series into an 'additional_indicators' if you want,
+    # or keep it inside imf_data as a full block. We'll keep full blocks consistent:
+    imf_data["Unemployment (%)"] = unemp_block["latest"]
 
-        ng = debt_bundle.get("nominal_gdp")
-        if isinstance(ng, dict):
-            for k in list(nom_gdp_latest.keys()):
-                if k in ng and ng[k] is not None:
-                    nom_gdp_latest[k] = ng[k]
-
-        dp = debt_bundle.get("debt_to_gdp")
-        if isinstance(dp, dict):
-            for k in list(debt_pct_latest.keys()):
-                if k in dp and dp[k] is not None:
-                    debt_pct_latest[k] = dp[k]
-
-    ratio_series = {}
-    if isinstance(debt_bundle, dict):
-        ratio_series = debt_bundle.get("debt_to_gdp_series") or {}
-
+    # Final payload
     return {
         "country": country,
         "iso_codes": codes,
         "imf_data": imf_data,
-        "government_debt": {"latest": gov_debt_latest, "series": {}},  # series optional for now
-        "nominal_gdp":     {"latest": nom_gdp_latest, "series": {}},   # series optional for now
-        "debt_to_gdp":     {"latest": debt_pct_latest, "series": ratio_series},
-        "additional_indicators": {},
+        # You can also include full series under additional_indicators if your UI renders charts
+        "additional_indicators": {
+            "CPI_series": cpi_block["series"],
+            "Unemployment_series": unemp_block["series"],
+            "PolicyRate_series": ir_block["series"],
+            "FX_series": fx_block["series"],
+            "Reserves_series": res_block["series"],
+        }
     }
