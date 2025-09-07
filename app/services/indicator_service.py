@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import Dict, Any, Optional
 from app.utils.country_codes import resolve_country_codes
+from app.providers.ecb_provider import EURO_AREA_ISO2, ecb_mro_latest_block
 
 # Providers
 from app.providers.wb_provider import fetch_worldbank_data, wb_year_dict_from_raw
