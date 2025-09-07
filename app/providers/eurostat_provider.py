@@ -20,7 +20,7 @@ def eurostat_debt_to_gdp_annual(iso2: str) -> Dict[str, float]:
         return {}
     
     try:
-        base_url = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/gov_10dd_edpt1"
+        base_url = "https://data-api.ec.europa.eu/api/dissemination/statistics/1.0/data/gov_10dd_edpt1"
         params = {
             "format": "json",
             "na_item": "GD",  # Government debt
@@ -61,7 +61,7 @@ def eurostat_unemployment_monthly(iso2: str) -> Dict[str, float]:
         return {}
     
     try:
-        base_url = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/une_rt_m"
+        base_url = "https://data-api.ec.europa.eu/api/dissemination/statistics/1.0/data/une_rt_m"
         params = {
             "format": "json",
             "s_adj": "SA",     # Seasonally adjusted
@@ -102,7 +102,7 @@ def eurostat_cpi_monthly(iso2: str) -> Dict[str, float]:
         return {}
     
     try:
-        base_url = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/prc_hicp_manr"
+        base_url = "https://data-api.ec.europa.eu/api/dissemination/statistics/1.0/data/prc_hicp_manr"
         params = {
             "format": "json",
             "coicop": "CP00",   # All-items HICP
@@ -137,13 +137,13 @@ def eurostat_policy_rate_monthly() -> Dict[str, float]:
     Fetch monthly ECB Main Refinancing Operations (MRO) rate from ECB SDW (direct SDMX-JSON API).
     Returns {YYYY-MM: value, ...}
     """
-    base_url = "https://sdw-wsrest.ecb.europa.eu/service/data/FM/M.U2.EUR.4F.KR.MRR_FR.LEV"
+    base_url = "https://data-api.ecb.europa.eu/service/data/FM/M.U2.EUR.4F.KR.MRR_FR.LEV"
     params = {
         "format": "sdmx-json",
         "lastNObservations": 120
     }
     try:
-        with httpx.Client(timeout=EUROSTAT_TIMEOUT) as client:
+        with httpx.Client(timeout=EUROSTAT_TIMEOUT, follow_redirects=True) as client:
             response = client.get(base_url, params=params)
             response.raise_for_status()
             data = response.json()
