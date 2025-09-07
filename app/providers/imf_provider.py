@@ -7,10 +7,23 @@ import math
 
 import httpx
 
+"""
+IMF providers (IFS + WEO) via SDMX-JSON CompactData API.
+
+Exports used by Country Radar:
+  - imf_cpi_yoy_monthly(iso2)              -> {"YYYY-MM": float}
+  - imf_unemployment_rate_monthly(iso2)    -> {"YYYY-MM": float}
+  - imf_fx_usd_monthly(iso2)               -> {"YYYY-MM": float}
+  - imf_reserves_usd_monthly(iso2)         -> {"YYYY-MM": float}
+  - imf_policy_rate_monthly(iso2)          -> {"YYYY-MM": float}
+  - imf_gdp_growth_quarterly(iso2)         -> {"YYYY-Qn": float}
+  - imf_weo_debt_to_gdp_annual(iso2)       -> {"YYYY": float}   # NEW (for debt_service tier 2)
+"""
+
 # ----------------------------
 # Config & small in-memory TTL
 # ----------------------------
-_IMF_BASE = "https://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData/IFS"
+_IMF_COMPACT_BASE = "https://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData"
 _DEFAULT_TIMEOUT = 7.5  # seconds
 _MAX_RETRIES = 2
 _CACHE_TTL = 3600  # seconds (~1 hour)
@@ -40,7 +53,7 @@ _cache = _TTLCache()
 # -------------
 _HEADERS = {
     "Accept": "application/json",
-    "User-Agent": "CountryRadar/1.0 (imf_provider; https://dataservices.imf.org)",
+    "User-Agent": "CountryRadar/1.0 (imf_provider)",
 }
 
 def _http_get_json(url: str, timeout: float = _DEFAULT_TIMEOUT) -> Optional[Dict[str, Any]]:
@@ -51,27 +64,36 @@ def _http_get_json(url: str, timeout: float = _DEFAULT_TIMEOUT) -> Optional[Dict
                 if resp.status_code == 200:
                     return resp.json()
         except Exception:
-            # brief backoff on next loop
             time.sleep(0.2 * (attempt + 1))
     return None
 
 # -------------------------
 # IMF SDMX-JSON parse utils
 # -------------------------
-def _norm_iso2_for_imf(iso2: str) -> List[str]:
+def _norm_iso2_for_ifs(iso2: str) -> List[str]:
     """
-    IMF IFS uses 2-letter areas like DE, FR, GB. A couple of practical aliases:
-      - 'UK' -> 'GB'
-      - 'EL' (Greece, Eurostat alias) -> 'GR'
-    We try the provided iso2 first, then common alias if applicable.
+    IMF IFS usually uses ISO2 like DE, FR, GB. Normalize aliases and try a couple of variants.
     """
     iso2 = (iso2 or "").upper()
     tries = [iso2]
     if iso2 == "UK":
         tries.append("GB")
-    if iso2 == "EL":
+    if iso2 == "EL":   # Eurostat alias for Greece
         tries.append("GR")
-    return list(dict.fromkeys(tries))  # de-dupe, preserve order
+    return list(dict.fromkeys(tries))  # de-dup, preserve order
+
+def _iso2_to_iso3(iso2: str) -> Optional[str]:
+    try:
+        import pycountry
+        code = (iso2 or "").upper()
+        if code == "UK":  # pycountry uses GB
+            code = "GB"
+        if code == "EL":  # pycountry uses GR
+            code = "GR"
+        country = pycountry.countries.get(alpha_2=code)
+        return country.alpha_3 if country else None
+    except Exception:
+        return None
 
 def _parse_compact_series(payload: Dict[str, Any]) -> Dict[str, float]:
     """
@@ -82,7 +104,6 @@ def _parse_compact_series(payload: Dict[str, Any]) -> Dict[str, float]:
         series = payload["CompactData"]["DataSet"]["Series"]
     except Exception:
         return {}
-    # 'Series' can be a dict or a list; we want a single series dict
     if isinstance(series, list):
         if not series:
             return {}
@@ -92,7 +113,6 @@ def _parse_compact_series(payload: Dict[str, Any]) -> Dict[str, float]:
         return {}
 
     out: Dict[str, float] = {}
-    # Obs can be list of dicts or a single dict
     rows = obs if isinstance(obs, list) else [obs]
     for row in rows:
         t = row.get("@TIME_PERIOD")
@@ -107,19 +127,18 @@ def _parse_compact_series(payload: Dict[str, Any]) -> Dict[str, float]:
             continue
     return out
 
-def _fetch_ifs_series(freq: str, area: str, indicator: str, start_period: str = "2000") -> Dict[str, float]:
+def _fetch_compact_series(dataset: str, key: str, start_period: str = "2000") -> Dict[str, float]:
     """
-    Pull a single IFS series via CompactData: {FREQ}.{AREA}.{INDICATOR}
-    Returns {period -> float} or {}.
+    Pull a single SDMX series via CompactData:
+      URL = {BASE}/{dataset}/{key}?startPeriod=YYYY
+    e.g., IFS/M.DE.PCPI_IX or WEO/A.DEU.GGXWDG_NGDP
     """
-    area = (area or "").upper()
-    indicator = (indicator or "").upper()
-    cache_key = f"IMF::IFS::{freq}.{area}.{indicator}::{start_period}"
+    cache_key = f"IMF::{dataset}::{key}::{start_period}"
     hit = _cache.get(cache_key)
     if hit is not None:
         return hit
 
-    url = f"{_IMF_BASE}/{freq}.{area}.{indicator}?startPeriod={start_period}"
+    url = f"{_IMF_COMPACT_BASE}/{dataset}/{key}?startPeriod={start_period}"
     data = _http_get_json(url)
     series = _parse_compact_series(data or {})
     if series:
@@ -138,8 +157,7 @@ def _yymm_key_to_tuple(k: str) -> Tuple[int, int]:
         return int(k[:4]), int(k[5:6])
     # fallback
     try:
-        y = int(k[:4])
-        m = int(k[-2:])
+        y = int(k[:4]); m = int(k[-2:])
         return y, m if 1 <= m <= 12 else 0
     except Exception:
         return 0, 0
@@ -147,8 +165,7 @@ def _yymm_key_to_tuple(k: str) -> Tuple[int, int]:
 def _yyqq_key_to_tuple(k: str) -> Tuple[int, int]:
     # Accept "YYYY-Qn"
     try:
-        y = int(k[:4])
-        q = int(k[-1])
+        y = int(k[:4]); q = int(k[-1])
         return y, q if 1 <= q <= 4 else 0
     except Exception:
         return 0, 0
@@ -163,10 +180,9 @@ def _compute_yoy_from_level_monthly(level_series: Dict[str, float]) -> Dict[str,
     items = sorted(level_series.items(), key=lambda kv: _yymm_key_to_tuple(kv[0]))
     out: Dict[str, float] = {}
     for i, (t, v) in enumerate(items):
-        # find t-12 months
         if i < 12:
             continue
-        t_prev, v_prev = items[i - 12]
+        _, v_prev = items[i - 12]
         if v_prev and math.isfinite(v_prev) and v_prev != 0:
             out[t] = (v / v_prev - 1.0) * 100.0
     return out
@@ -196,8 +212,8 @@ def imf_cpi_yoy_monthly(iso2: str) -> Dict[str, float]:
     CPI YoY % (monthly), computed from CPI index (PCPI_IX).
     Returns {YYYY-MM -> yoy_percent}.
     """
-    for area in _norm_iso2_for_imf(iso2):
-        idx = _fetch_ifs_series(freq="M", area=area, indicator="PCPI_IX", start_period="2000")
+    for area in _norm_iso2_for_ifs(iso2):
+        idx = _fetch_compact_series("IFS", f"M.{area}.PCPI_IX", start_period="2000")
         if idx:
             return _compute_yoy_from_level_monthly(idx)
     return {}
@@ -207,8 +223,8 @@ def imf_unemployment_rate_monthly(iso2: str) -> Dict[str, float]:
     Unemployment rate, percent, monthly (LUR_PT).
     Returns {YYYY-MM -> percent}.
     """
-    for area in _norm_iso2_for_imf(iso2):
-        ser = _fetch_ifs_series(freq="M", area=area, indicator="LUR_PT", start_period="2000")
+    for area in _norm_iso2_for_ifs(iso2):
+        ser = _fetch_compact_series("IFS", f"M.{area}.LUR_PT", start_period="2000")
         if ser:
             return ser
     return {}
@@ -219,13 +235,11 @@ def imf_fx_usd_monthly(iso2: str) -> Dict[str, float]:
     Prefer end-of-period (ENDE_XDC_USD_RATE), fallback to period average (ENDA_XDC_USD_RATE).
     Returns {YYYY-MM -> rate}.
     """
-    for area in _norm_iso2_for_imf(iso2):
-        # Try end-of-period first
-        ser = _fetch_ifs_series(freq="M", area=area, indicator="ENDE_XDC_USD_RATE", start_period="2000")
+    for area in _norm_iso2_for_ifs(iso2):
+        ser = _fetch_compact_series("IFS", f"M.{area}.ENDE_XDC_USD_RATE", start_period="2000")
         if ser:
             return ser
-        # Fallback to period-average
-        ser = _fetch_ifs_series(freq="M", area=area, indicator="ENDA_XDC_USD_RATE", start_period="2000")
+        ser = _fetch_compact_series("IFS", f"M.{area}.ENDA_XDC_USD_RATE", start_period="2000")
         if ser:
             return ser
     return {}
@@ -235,8 +249,8 @@ def imf_reserves_usd_monthly(iso2: str) -> Dict[str, float]:
     Total reserves excluding gold, US dollars (RAXG_USD), monthly.
     Returns {YYYY-MM -> millions USD}.
     """
-    for area in _norm_iso2_for_imf(iso2):
-        ser = _fetch_ifs_series(freq="M", area=area, indicator="RAXG_USD", start_period="2000")
+    for area in _norm_iso2_for_ifs(iso2):
+        ser = _fetch_compact_series("IFS", f"M.{area}.RAXG_USD", start_period="2000")
         if ser:
             return ser
     return {}
@@ -246,8 +260,8 @@ def imf_policy_rate_monthly(iso2: str) -> Dict[str, float]:
     Central bank policy rate, percent per annum, monthly (FPOLM_PA).
     Returns {YYYY-MM -> percent}.
     """
-    for area in _norm_iso2_for_imf(iso2):
-        ser = _fetch_ifs_series(freq="M", area=area, indicator="FPOLM_PA", start_period="2000")
+    for area in _norm_iso2_for_ifs(iso2):
+        ser = _fetch_compact_series("IFS", f"M.{area}.FPOLM_PA", start_period="2000")
         if ser:
             return ser
     return {}
@@ -257,8 +271,52 @@ def imf_gdp_growth_quarterly(iso2: str) -> Dict[str, float]:
     Real GDP YoY % (quarterly), computed from NGDP_R_SA_XDC (Real GDP, SA, national currency).
     Returns {YYYY-Qn -> yoy_percent}.
     """
-    for area in _norm_iso2_for_imf(iso2):
-        lvl = _fetch_ifs_series(freq="Q", area=area, indicator="NGDP_R_SA_XDC", start_period="2000")
+    for area in _norm_iso2_for_ifs(iso2):
+        lvl = _fetch_compact_series("IFS", f"Q.{area}.NGDP_R_SA_XDC", start_period="2000")
         if lvl:
             return _compute_yoy_from_level_quarterly(lvl)
+    return {}
+
+# ---------------------------
+# IMF WEO: Debt-to-GDP (annual)
+# ---------------------------
+# WEO dataset code can be published as "WEO" (stable) or stamped releases like "WEO:2024-10".
+# We try the stable alias first, then a short list of recent release tags as fallbacks.
+_WEO_DATASETS_TRY: List[str] = [
+    "WEO",
+    "WEO:2025-04",  # Spring 2025 (approx.)
+    "WEO:2024-10",  # Fall 2024
+    "WEO:2024-04",  # Spring 2024
+    "WEO:2023-10",
+]
+
+# Indicator: General Government Gross Debt, % of GDP
+_WEO_DEBT_INDICATORS: List[str] = [
+    "GGXWDG_NGDP",  # main target
+]
+
+def imf_weo_debt_to_gdp_annual(iso2: str) -> Dict[str, float]:
+    """
+    IMF WEO: General Government Gross Debt (% of GDP), annual.
+
+    Attempts:
+      - area = ISO3 (e.g., DEU, USA); WEO typically keys by ISO3 or WEO country codes.
+      - dataset: try "WEO" first, then a few recent stamped releases.
+      - indicator: GGXWDG_NGDP.
+
+    Returns {YYYY -> percent} or {} if not available.
+    """
+    iso3 = _iso2_to_iso3(iso2)
+    if not iso3:
+        return {}
+
+    # Key format for CompactData/WEO is typically: A.{AREA}.{INDICATOR}
+    key_variants: List[str] = [f"A.{iso3}.{ind}" for ind in _WEO_DEBT_INDICATORS]
+
+    for dataset in _WEO_DATASETS_TRY:
+        for key in key_variants:
+            ser = _fetch_compact_series(dataset, key, start_period="2000")
+            if ser:
+                # Keep only annual 'YYYY' labels
+                return {k: v for k, v in ser.items() if isinstance(k, str) and len(k) == 4 and k.isdigit()}
     return {}
