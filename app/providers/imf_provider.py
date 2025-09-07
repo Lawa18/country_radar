@@ -1,135 +1,264 @@
 # app/providers/imf_provider.py
 from __future__ import annotations
-from typing import Dict, Any, Optional
+
+from typing import Dict, List, Tuple, Optional, Any
 import time
+import math
+
 import httpx
 
-IMF_TIMEOUT = 10.0
-IMF_RETRIES = 3
-IMF_BACKOFF = 1.2
+# ----------------------------
+# Config & small in-memory TTL
+# ----------------------------
+_IMF_BASE = "https://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData/IFS"
+_DEFAULT_TIMEOUT = 7.5  # seconds
+_MAX_RETRIES = 2
+_CACHE_TTL = 3600  # seconds (~1 hour)
 
-# IFS variable codes (monthly where available)
-IFS_CODE = {
-    # Inflation YoY (%), monthly
-    "CPI_YOY": "PCPI_YY",
-    # Policy rate (% p.a.), monthly (many countries have this; euro area handled by ECB)
-    "POLICY_RATE": "FPOLM_PA",
-    # FX: local currency per USD, monthly
-    "FX_USD": "ENDA_XDC_USD_RATE",
-    # Official reserves, USD (end of period), monthly
-    "RESERVES_USD": "RAXGS_USD",
-    # Unemployment rate (%), monthly (not all countries available)
-    "UNEMP_RATE": "LUR_PT",
+class _TTLCache:
+    def __init__(self, ttl_seconds: int = _CACHE_TTL) -> None:
+        self.ttl = ttl_seconds
+        self._store: Dict[str, Tuple[float, Any]] = {}
+
+    def get(self, key: str) -> Optional[Any]:
+        hit = self._store.get(key)
+        if not hit:
+            return None
+        exp, value = hit
+        if exp < time.time():
+            self._store.pop(key, None)
+            return None
+        return value
+
+    def set(self, key: str, value: Any) -> None:
+        self._store[key] = (time.time() + self.ttl, value)
+
+_cache = _TTLCache()
+
+# -------------
+# HTTP helpers
+# -------------
+_HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "CountryRadar/1.0 (imf_provider; https://dataservices.imf.org)",
 }
 
-def _parse_ifs_compact(obj: Dict[str, Any]) -> Dict[str, float]:
-    """
-    Parse IMF SDMX 'CompactData' JSON to {period -> value} (period: YYYY-MM or YYYY-Qx).
-    """
-    try:
-        root = obj.get("CompactData", {})
-        # 'CompactData' -> e.g. {'IFS': {'Series': {...}}}
-        dataset = next((v for v in root.values() if isinstance(v, dict)), None)
-        if not dataset:
-            return {}
-        series_list = dataset.get("Series") or []
-        if isinstance(series_list, dict):
-            series_list = [series_list]
-
-        out: Dict[str, float] = {}
-        for s in series_list:
-            obs = s.get("Obs") or []
-            if isinstance(obs, dict):  # sometimes Obs can be a dict
-                obs = [obs]
-            for o in obs:
-                t = o.get("@TIME_PERIOD")
-                v = o.get("@OBS_VALUE")
-                if t and v is not None:
-                    try:
-                        out[str(t)] = float(v)
-                    except Exception:
-                        pass
-        return dict(sorted(out.items()))  # chronological by string period
-    except Exception:
-        return {}
-
-def _http_get_json(url: str, headers: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
-    last_err: Optional[Exception] = None
-    for attempt in range(1, IMF_RETRIES + 1):
+def _http_get_json(url: str, timeout: float = _DEFAULT_TIMEOUT) -> Optional[Dict[str, Any]]:
+    for attempt in range(_MAX_RETRIES + 1):
         try:
-            with httpx.Client(timeout=IMF_TIMEOUT, headers=headers or {"Accept": "application/json"}, follow_redirects=True) as client:
-                r = client.get(url)
-                r.raise_for_status()
-                return r.json()
-        except Exception as e:
-            last_err = e
-            print(f"[IMF] attempt {attempt} failed {url}: {e}")
-            if attempt < IMF_RETRIES:
-                time.sleep(IMF_BACKOFF * attempt)
+            with httpx.Client(timeout=timeout, follow_redirects=True, headers=_HEADERS) as client:
+                resp = client.get(url)
+                if resp.status_code == 200:
+                    return resp.json()
+        except Exception:
+            # brief backoff on next loop
+            time.sleep(0.2 * (attempt + 1))
     return None
 
-def ifs_monthly_series(iso2: str, indicator_key: str, start: str = "2019-01", end: Optional[str] = None) -> Dict[str, float]:
+# -------------------------
+# IMF SDMX-JSON parse utils
+# -------------------------
+def _norm_iso2_for_imf(iso2: str) -> List[str]:
     """
-    Generic IFS monthly fetch: returns { 'YYYY-MM': value, ... } (or quarterly period strings).
-    iso2: ISO-2 country (DE, US, etc)
-    indicator_key: key in IFS_CODE above
+    IMF IFS uses 2-letter areas like DE, FR, GB. A couple of practical aliases:
+      - 'UK' -> 'GB'
+      - 'EL' (Greece, Eurostat alias) -> 'GR'
+    We try the provided iso2 first, then common alias if applicable.
     """
-    code = IFS_CODE.get(indicator_key)
-    if not code:
+    iso2 = (iso2 or "").upper()
+    tries = [iso2]
+    if iso2 == "UK":
+        tries.append("GB")
+    if iso2 == "EL":
+        tries.append("GR")
+    return list(dict.fromkeys(tries))  # de-dupe, preserve order
+
+def _parse_compact_series(payload: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Parses IMF CompactData JSON into {time_period -> value} with floats only.
+    Returns empty dict if missing/invalid.
+    """
+    try:
+        series = payload["CompactData"]["DataSet"]["Series"]
+    except Exception:
+        return {}
+    # 'Series' can be a dict or a list; we want a single series dict
+    if isinstance(series, list):
+        if not series:
+            return {}
+        series = series[0]
+    obs = series.get("Obs")
+    if not obs:
         return {}
 
-    base = "https://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData"
-    freq = "M"  # monthly; IMF will return quarterly/annual for some codes if monthly doesn't exist
-    qs = []
-    if start:
-        qs.append(f"startPeriod={start}")
-    if end:
-        qs.append(f"endPeriod={end}")
-    query = ("?" + "&".join(qs)) if qs else ""
+    out: Dict[str, float] = {}
+    # Obs can be list of dicts or a single dict
+    rows = obs if isinstance(obs, list) else [obs]
+    for row in rows:
+        t = row.get("@TIME_PERIOD")
+        v = row.get("@OBS_VALUE")
+        if t is None or v is None:
+            continue
+        try:
+            fv = float(v)
+            if math.isfinite(fv):
+                out[str(t)] = fv
+        except Exception:
+            continue
+    return out
 
-    url = f"{base}/IFS/{freq}.{iso2}.{code}{query}"
+def _fetch_ifs_series(freq: str, area: str, indicator: str, start_period: str = "2000") -> Dict[str, float]:
+    """
+    Pull a single IFS series via CompactData: {FREQ}.{AREA}.{INDICATOR}
+    Returns {period -> float} or {}.
+    """
+    area = (area or "").upper()
+    indicator = (indicator or "").upper()
+    cache_key = f"IMF::IFS::{freq}.{area}.{indicator}::{start_period}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
+
+    url = f"{_IMF_BASE}/{freq}.{area}.{indicator}?startPeriod={start_period}"
     data = _http_get_json(url)
-    if not data:
+    series = _parse_compact_series(data or {})
+    if series:
+        _cache.set(cache_key, series)
+    return series
+
+# ------------------------
+# Transform helpers (YoY)
+# ------------------------
+def _yymm_key_to_tuple(k: str) -> Tuple[int, int]:
+    # Accept "YYYY-MM" or "YYYYMmm"
+    k = (k or "").strip()
+    if len(k) == 7 and k[4] == "-":
+        return int(k[:4]), int(k[5:7])
+    if len(k) == 6 and (k[4] in ("M", "m")):
+        return int(k[:4]), int(k[5:6])
+    # fallback
+    try:
+        y = int(k[:4])
+        m = int(k[-2:])
+        return y, m if 1 <= m <= 12 else 0
+    except Exception:
+        return 0, 0
+
+def _yyqq_key_to_tuple(k: str) -> Tuple[int, int]:
+    # Accept "YYYY-Qn"
+    try:
+        y = int(k[:4])
+        q = int(k[-1])
+        return y, q if 1 <= q <= 4 else 0
+    except Exception:
+        return 0, 0
+
+def _compute_yoy_from_level_monthly(level_series: Dict[str, float]) -> Dict[str, float]:
+    """
+    Given monthly levels (e.g., CPI index), compute YoY %:
+      yoy_t = (level_t / level_{t-12} - 1) * 100
+    """
+    if not level_series:
         return {}
-    return _parse_ifs_compact(data)
+    items = sorted(level_series.items(), key=lambda kv: _yymm_key_to_tuple(kv[0]))
+    out: Dict[str, float] = {}
+    for i, (t, v) in enumerate(items):
+        # find t-12 months
+        if i < 12:
+            continue
+        t_prev, v_prev = items[i - 12]
+        if v_prev and math.isfinite(v_prev) and v_prev != 0:
+            out[t] = (v / v_prev - 1.0) * 100.0
+    return out
 
-# Convenience wrappers
-def imf_cpi_yoy_monthly(iso2: str, start: str = "2019-01") -> Dict[str, float]:
-    return ifs_monthly_series(iso2, "CPI_YOY", start)
-
-def imf_policy_rate_monthly(iso2: str, start: str = "2019-01") -> Dict[str, float]:
-    return ifs_monthly_series(iso2, "POLICY_RATE", start)
-
-def imf_fx_to_usd_monthly(iso2: str, start: str = "2019-01") -> Dict[str, float]:
-    return ifs_monthly_series(iso2, "FX_USD", start)
-
-def imf_reserves_usd_monthly(iso2: str, start: str = "2019-01") -> Dict[str, float]:
-    return ifs_monthly_series(iso2, "RESERVES_USD", start)
-
-def imf_unemployment_rate_monthly(iso2: str, start: str = "2019-01") -> Dict[str, float]:
-    return ifs_monthly_series(iso2, "UNEMP_RATE", start)
-
-# --- Legacy helper names (kept to avoid import errors in older code) ---
-
-def fetch_imf_sdmx_series(iso2: str) -> Dict[str, Dict[str, float]]:
+def _compute_yoy_from_level_quarterly(level_series: Dict[str, float]) -> Dict[str, float]:
     """
-    Returns a dict of several standard monthly series; caller picks what it needs.
-    {
-      "CPI": {...}, "FX Rate": {...}, "Interest Rate (Policy)": {...},
-      "Reserves (USD)": {...}, "Unemployment (%)": {...}
-    }
+    Given quarterly levels (e.g., real GDP SA), compute YoY % vs same quarter prev year:
+      yoy_t = (level_t / level_{t-4} - 1) * 100
     """
-    return {
-        "CPI": imf_cpi_yoy_monthly(iso2),
-        "FX Rate": imf_fx_to_usd_monthly(iso2),
-        "Interest Rate (Policy)": imf_policy_rate_monthly(iso2),
-        "Reserves (USD)": imf_reserves_usd_monthly(iso2),
-        "Unemployment (%)": imf_unemployment_rate_monthly(iso2),
-    }
+    if not level_series:
+        return {}
+    items = sorted(level_series.items(), key=lambda kv: _yyqq_key_to_tuple(kv[0]))
+    out: Dict[str, float] = {}
+    for i, (t, v) in enumerate(items):
+        if i < 4:
+            continue
+        _, v_prev = items[i - 4]
+        if v_prev and math.isfinite(v_prev) and v_prev != 0:
+            out[t] = (v / v_prev - 1.0) * 100.0
+    return out
 
-def imf_debt_to_gdp_annual(_iso3: str) -> Dict[str, float]:
+# ---------------------------
+# Public provider functions
+# ---------------------------
+def imf_cpi_yoy_monthly(iso2: str) -> Dict[str, float]:
     """
-    Stub (optional). If you later add WEO-based debt/GDP here, return { 'YYYY': value }.
-    For now we leave debt/GDP to Eurostat (EU) or WB fallback.
+    CPI YoY % (monthly), computed from CPI index (PCPI_IX).
+    Returns {YYYY-MM -> yoy_percent}.
     """
+    for area in _norm_iso2_for_imf(iso2):
+        idx = _fetch_ifs_series(freq="M", area=area, indicator="PCPI_IX", start_period="2000")
+        if idx:
+            return _compute_yoy_from_level_monthly(idx)
+    return {}
+
+def imf_unemployment_rate_monthly(iso2: str) -> Dict[str, float]:
+    """
+    Unemployment rate, percent, monthly (LUR_PT).
+    Returns {YYYY-MM -> percent}.
+    """
+    for area in _norm_iso2_for_imf(iso2):
+        ser = _fetch_ifs_series(freq="M", area=area, indicator="LUR_PT", start_period="2000")
+        if ser:
+            return ser
+    return {}
+
+def imf_fx_usd_monthly(iso2: str) -> Dict[str, float]:
+    """
+    Domestic currency per U.S. dollar, monthly.
+    Prefer end-of-period (ENDE_XDC_USD_RATE), fallback to period average (ENDA_XDC_USD_RATE).
+    Returns {YYYY-MM -> rate}.
+    """
+    for area in _norm_iso2_for_imf(iso2):
+        # Try end-of-period first
+        ser = _fetch_ifs_series(freq="M", area=area, indicator="ENDE_XDC_USD_RATE", start_period="2000")
+        if ser:
+            return ser
+        # Fallback to period-average
+        ser = _fetch_ifs_series(freq="M", area=area, indicator="ENDA_XDC_USD_RATE", start_period="2000")
+        if ser:
+            return ser
+    return {}
+
+def imf_reserves_usd_monthly(iso2: str) -> Dict[str, float]:
+    """
+    Total reserves excluding gold, US dollars (RAXG_USD), monthly.
+    Returns {YYYY-MM -> millions USD}.
+    """
+    for area in _norm_iso2_for_imf(iso2):
+        ser = _fetch_ifs_series(freq="M", area=area, indicator="RAXG_USD", start_period="2000")
+        if ser:
+            return ser
+    return {}
+
+def imf_policy_rate_monthly(iso2: str) -> Dict[str, float]:
+    """
+    Central bank policy rate, percent per annum, monthly (FPOLM_PA).
+    Returns {YYYY-MM -> percent}.
+    """
+    for area in _norm_iso2_for_imf(iso2):
+        ser = _fetch_ifs_series(freq="M", area=area, indicator="FPOLM_PA", start_period="2000")
+        if ser:
+            return ser
+    return {}
+
+def imf_gdp_growth_quarterly(iso2: str) -> Dict[str, float]:
+    """
+    Real GDP YoY % (quarterly), computed from NGDP_R_SA_XDC (Real GDP, SA, national currency).
+    Returns {YYYY-Qn -> yoy_percent}.
+    """
+    for area in _norm_iso2_for_imf(iso2):
+        lvl = _fetch_ifs_series(freq="Q", area=area, indicator="NGDP_R_SA_XDC", start_period="2000")
+        if lvl:
+            return _compute_yoy_from_level_quarterly(lvl)
     return {}
