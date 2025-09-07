@@ -1,158 +1,238 @@
 # app/providers/ecb_provider.py
 from __future__ import annotations
-from typing import Dict, Any, List, Tuple, Optional
+
+from typing import Dict, List, Tuple, Optional, Any
 import time
 import httpx
 
-# --- Euro area membership (ISO2) ---
-EURO_AREA_ISO2 = {
-    "AT", "BE", "HR", "CY", "EE", "FI", "FR", "DE", "IE", "IT",
-    "LV", "LT", "LU", "MT", "NL", "PT", "SK", "SI", "ES", "GR",
-}
+"""
+ECB Policy Rate (MRO) provider
 
-ECB_TIMEOUT = 6.0
-ECB_TTL_SECONDS = 1800  # 30 minutes cache TTL
+- Uses ECB Data Portal SDMX API (JSON) to fetch the Main Refinancing Operations rate.
+- Prefers monthly series; falls back to daily (compressed to monthly) and then business-week.
+- Exposes:
+    EURO_AREA_ISO2: List[str]
+    ecb_policy_rate_for_country(iso2) -> Dict[str, float]  # {"YYYY-MM": rate, ...}
+"""
 
-# SDMX key: FM.M.U2.EUR.4F.KR.MRR_FR.LEV (Main Refinancing Operations - level, monthly)
-# New host:
-ECB_MRO_URL_NEW = (
-    "https://data-api.ecb.europa.eu/service/data/FM/"
-    "M.U2.EUR.4F.KR.MRR_FR.LEV?lastNObservations=120&format=sdmx-json"
+# -------------------------------------------------------------------
+# Euro area ISO2 membership (as of 2025; includes Croatia)
+# -------------------------------------------------------------------
+EURO_AREA_ISO2: List[str] = [
+    "AT", "BE", "HR", "CY", "EE", "FI", "FR", "DE", "GR", "IE",
+    "IT", "LV", "LT", "LU", "MT", "NL", "PT", "SK", "SI", "ES",
+    # Accept the Eurostat alias 'EL' for Greece for convenience:
+    "EL",
+]
+
+# -------------------------------------------------------------------
+# HTTP settings & hosts
+# -------------------------------------------------------------------
+# New data portal (primary) + legacy SDW REST (fallback; transparently redirects)
+_ECB_DATA_HOSTS = (
+    "https://data-api.ecb.europa.eu/service/data",           # primary
+    "https://sdw-wsrest.ecb.europa.eu/service/data",         # fallback/redirect
 )
-# Old host (kept as a fallback — we enable redirects below, so either works):
-ECB_MRO_URL_OLD = (
-    "https://sdw-wsrest.ecb.europa.eu/service/data/FM/"
-    "M.U2.EUR.4F.KR.MRR_FR.LEV?lastNObservations=120&format=sdmx-json"
+
+# FM dataset series keys for MRO (Main refinancing operations)
+# Monthly preferred; fall back to daily, then business-week.
+_MRO_KEYS = (
+    "FM/M.U2.EUR.4F.KR.MRR_FR.LEV",  # Monthly
+    "FM/D.U2.EUR.4F.KR.MRR_FR.LEV",  # Daily
+    "FM/B.U2.EUR.4F.KR.MRR_FR.LEV",  # Business-week
 )
 
+_TIMEOUT = 8.0
+_RETRIES = 2
+_CACHE_TTL_SEC = 1800  # 30 minutes
 _HEADERS = {
-    "Accept": "application/vnd.sdmx.data+json;version=1.0",
-    "User-Agent": "country-radar/1.0",
+    "Accept": "application/json",  # we also append format=sdmx-json explicitly
+    "User-Agent": "country-radar/1.0 (+ecb_provider)",
 }
 
-# --- small manual cache so we don't hammer ECB ---
-_cache_series: Optional[Dict[str, float]] = None
-_cache_at: float = 0.0
+# -------------------------------------------------------------------
+# Tiny in-process TTL cache
+# -------------------------------------------------------------------
+class _TTLCache:
+    def __init__(self, ttl_seconds: int = _CACHE_TTL_SEC) -> None:
+        self.ttl = ttl_seconds
+        self._store: Dict[str, Tuple[float, Any]] = {}
 
+    def get(self, key: str) -> Optional[Any]:
+        hit = self._store.get(key)
+        if not hit:
+            return None
+        exp, value = hit
+        if exp < time.time():
+            self._store.pop(key, None)
+            return None
+        return value
 
-def _fetch_json(url: str) -> Dict[str, Any]:
+    def set(self, key: str, value: Any) -> None:
+        self._store[key] = (time.time() + self.ttl, value)
+
+_cache = _TTLCache()
+
+def _client() -> httpx.Client:
+    return httpx.Client(timeout=_TIMEOUT, follow_redirects=True, headers=_HEADERS)
+
+# -------------------------------------------------------------------
+# SDMX-JSON parse (ECB Data Portal)
+# -------------------------------------------------------------------
+def _parse_sdmx_json(payload: Dict[str, Any]) -> Dict[str, float]:
     """
-    Try the new host first, then the old one; follow redirects (the old host
-    302s to the new host now). We keep both to be resilient.
-    """
-    last_exc: Optional[Exception] = None
-    for attempt, u in enumerate((ECB_MRO_URL_NEW, ECB_MRO_URL_OLD), start=1):
-        try:
-            # follow_redirects=True is important because sdw-wsrest now 302s
-            with httpx.Client(
-                timeout=ECB_TIMEOUT, headers=_HEADERS, follow_redirects=True
-            ) as client:
-                r = client.get(u)
-                r.raise_for_status()
-                return r.json()
-        except Exception as e:
-            last_exc = e
-            time.sleep(0.2 * attempt)  # tiny backoff and try next
-    raise RuntimeError(f"ECB fetch failed: {last_exc}")
-
-
-def _parse_sdmx_observations(j: Dict[str, Any]) -> List[Tuple[str, float]]:
-    """
-    Extract [(YYYY-MM, value), ...] from an ECB SDMX-JSON payload.
+    Parse SDMX-JSON ("format=sdmx-json") into {time_period -> value}.
+    Works for single-series responses; returns {} on errors.
     """
     try:
-        data_sets = j.get("dataSets") or []
-        if not data_sets:
-            return []
-        series_dict = data_sets[0].get("series") or {}
-        if not series_dict:
-            return []
-        # take first series (there is only one for this key)
-        first_key = next(iter(series_dict.keys()))
-        obs_map = series_dict[first_key].get("observations") or {}
+        datasets = payload.get("dataSets")
+        if not datasets:
+            return {}
+        ds0 = datasets[0]
+        series_map = ds0.get("series") or {}
+        if not series_map:
+            return {}
 
-        obs_dims = (j.get("structure") or {}).get("dimensions", {}).get("observation") or []
-        if not obs_dims:
-            return []
-        time_values = obs_dims[0].get("values") or []  # [{'id': '2023-01'}, ...]
+        # There should be a single series in a fully specified key query
+        first_key = next(iter(series_map.keys()))
+        series = series_map[first_key] or {}
+        obs = series.get("observations") or {}
+        if not isinstance(obs, dict) or not obs:
+            return {}
 
-        out: List[Tuple[str, float]] = []
-        for idx_str, arr in obs_map.items():
+        # Time coordinates are in structure.dimensions.observation[0].values
+        dims = payload.get("structure", {}).get("dimensions", {}).get("observation", [])
+        if not dims:
+            return {}
+        time_values = dims[0].get("values") or []
+        # Build mapping index -> time-label (e.g., "1999-01", "2024-09-18")
+        idx_to_time: Dict[int, str] = {i: (v.get("id") or "") for i, v in enumerate(time_values)}
+
+        out: Dict[str, float] = {}
+        for k, arr in obs.items():
+            # observations: { "index": [ value, ...attrs ] }
             try:
-                idx = int(idx_str)
-                date = (time_values[idx].get("id") or time_values[idx].get("name"))
-                if not date:
-                    continue
-                val = arr[0] if isinstance(arr, list) and arr else None
-                if val is None:
-                    continue
-                out.append((str(date), float(val)))
+                i = int(k)
             except Exception:
-                # skip any malformed point quietly
                 continue
-
-        out.sort(key=lambda x: x[0])
+            t = idx_to_time.get(i)
+            if not t:
+                continue
+            # value can be number or [number, ...]
+            val = None
+            if isinstance(arr, list) and arr:
+                val = arr[0]
+            elif isinstance(arr, (int, float)):
+                val = arr
+            try:
+                if val is not None:
+                    out[str(t)] = float(val)
+            except Exception:
+                continue
         return out
     except Exception:
-        return []
+        return {}
 
-
-def ecb_mro_series_monthly() -> Dict[str, float]:
+# -------------------------------------------------------------------
+# Fetch helpers
+# -------------------------------------------------------------------
+def _fetch_sdmx_series(series_key: str, start_period: str = "1999-01-01") -> Dict[str, float]:
     """
-    Return {'YYYY-MM': value, ...} for the ECB main refinancing rate (MRO).
-    Cached for 30 minutes to keep calls snappy on Render.
+    Retrieve a series via SDMX JSON from ECB hosts with short retries.
+    series_key like "FM/M.U2.EUR.4F.KR.MRR_FR.LEV"
     """
-    global _cache_series, _cache_at
-    now = time.time()
-    if _cache_series is not None and (now - _cache_at) < ECB_TTL_SECONDS:
-        return dict(_cache_series)
+    cache_key = f"ECB::{series_key}::{start_period}"
+    hit = _cache.get(cache_key)
+    if hit is not None:
+        return hit
 
-    # Fetch (new host first; fallback is inside _fetch_json)
-    j = _fetch_json(ECB_MRO_URL_NEW)
-    series_list = _parse_sdmx_observations(j)
-    series = {d: v for d, v in series_list}
-
-    _cache_series = series
-    _cache_at = now
-    return dict(series)
-
-
-def ecb_mro_latest_block() -> Dict[str, Any]:
-    """
-    Produce a block that matches your API shape for "Interest Rate (Policy)":
-    {
-      "latest": {"value": <float>|None, "date": "YYYY-MM"|None, "source": "ECB SDW (MRO)"|None},
-      "series": {"YYYY-MM": value, ...}
+    params = {
+        "startPeriod": start_period,
+        "format": "sdmx-json",
     }
-    """
-    try:
-        series = ecb_mro_series_monthly()
-    except Exception:
-        return {"latest": {"value": None, "date": None, "source": None}, "series": {}}
 
+    last_exc: Optional[Exception] = None
+    for base in _ECB_DATA_HOSTS:
+        url = f"{base}/{series_key}"
+        for attempt in range(_RETRIES + 1):
+            try:
+                with _client() as client:
+                    resp = client.get(url, params=params)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    series = _parse_sdmx_json(data)
+                    if series:
+                        _cache.set(cache_key, series)
+                        return series
+                    # Even if empty, keep trying fallbacks/hosts
+            except Exception as e:
+                last_exc = e
+            time.sleep(0.25 * (attempt + 1))
+        # try next host
+    return {}
+
+# -------------------------------------------------------------------
+# Utilities to normalize to MONTHLY keys ("YYYY-MM")
+# -------------------------------------------------------------------
+def _daily_to_monthly_last(series_daily: Dict[str, float]) -> Dict[str, float]:
+    """
+    Compress a daily series ("YYYY-MM-DD") to monthly by taking the last
+    available observation within each month.
+    """
+    if not series_daily:
+        return {}
+    tuples: List[Tuple[Tuple[int, int, int], str, float]] = []
+    for t, v in series_daily.items():
+        try:
+            y, m, d = int(t[0:4]), int(t[5:7]), int(t[8:10])
+            tuples.append(((y, m, d), t, float(v)))
+        except Exception:
+            continue
+    # sort ascending by date, then keep last for each (y,m)
+    tuples.sort(key=lambda x: x[0])
+    out: Dict[str, float] = {}
+    for (y, m, _), _, val in tuples:
+        out[f"{y:04d}-{m:02d}"] = val
+    return out
+
+def _maybe_to_monthly(series: Dict[str, float]) -> Dict[str, float]:
+    """
+    If keys are daily (YYYY-MM-DD), compress to YYYY-MM.
+    If keys already monthly (YYYY-MM), return as-is.
+    """
     if not series:
-        return {"latest": {"value": None, "date": None, "source": None}, "series": {}}
+        return {}
+    # Peek at any key
+    k0 = next(iter(series.keys()))
+    if len(k0) == 10 and k0[4] == "-" and k0[7] == "-":
+        return _daily_to_monthly_last(series)
+    return series
 
-    latest_month = sorted(series.keys())[-1]
-    return {
-        "latest": {"value": series[latest_month], "date": latest_month, "source": "ECB SDW (MRO)"},
-        "series": series,
-    }
-
-
-def ecb_policy_rate_for_country(iso2: str) -> Dict[str, Any]:
+# -------------------------------------------------------------------
+# Public API
+# -------------------------------------------------------------------
+def ecb_policy_rate_for_country(iso2: str) -> Dict[str, float]:
     """
-    For euro-area countries, return the ECB MRO block; otherwise return an empty block,
-    so your indicator_service can just drop it in without special casing.
+    Returns {"YYYY-MM": policy_rate_percent, ...} for euro-area ISO2 countries.
+    Non-euro countries -> {}.
+
+    Source priority:
+      1) FM.M.U2.EUR.4F.KR.MRR_FR.LEV (monthly)
+      2) FM.D.U2.EUR.4F.KR.MRR_FR.LEV (daily -> compressed to monthly)
+      3) FM.B.U2.EUR.4F.KR.MRR_FR.LEV (business-week -> treated as daily-like)
     """
-    if iso2 and iso2.upper() in EURO_AREA_ISO2:
-        return ecb_mro_latest_block()
-    return {"latest": {"value": None, "date": None, "source": None}, "series": {}}
+    code = (iso2 or "").strip().upper()
+    # Greece may be reported 'EL' in Eurostat; treat both EL/GR as euro
+    if code not in EURO_AREA_ISO2 and not (code == "GR"):
+        return {}
 
-
-__all__ = [
-    "EURO_AREA_ISO2",
-    "ecb_mro_series_monthly",
-    "ecb_mro_latest_block",
-    "ecb_policy_rate_for_country",
-]
+    # Try monthly → daily → business-week
+    # We always return monthly keys in the final dict.
+    # Start period early enough to cover all history; values are small anyway.
+    for key in _MRO_KEYS:
+        series = _fetch_sdmx_series(key, start_period="1999-01-01")
+        if series:
+            monthly = _maybe_to_monthly(series)
+            if monthly:
+                return monthly
+    return {}
