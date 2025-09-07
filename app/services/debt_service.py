@@ -364,3 +364,20 @@ def debt_payload_for_country(country: str) -> Dict[str, Any]:
         return debt_payload_for_iso2(iso2)
     except Exception:
         return _build_payload(None, None, None, {})
+
+# --- Backward-compat wrappers (keep existing routes working) -----------------
+
+def compute_debt_payload(country: str) -> Dict[str, Any]:
+    """
+    Backward-compat wrapper used by routes/debt.py
+    (older route imports compute_debt_payload(country)).
+    """
+    return debt_payload_for_country(country)
+
+
+def compute_debt_payload_iso2(iso2: str) -> Dict[str, Any]:
+    """
+    Optional convenience wrapper if any caller passes ISO2 directly.
+    """
+    return debt_payload_for_iso2(iso2)
+
