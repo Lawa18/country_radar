@@ -138,6 +138,13 @@ def build_country_payload(country: str) -> Dict[str, Any]:
         "Government Effectiveness": gov_eff,
     }
 
+        # Euro-area override (monthly ECB MRO); keeps IMF/WB fallback if not euro area
+    try:
+        if iso2 in EURO_AREA_ISO2:
+            imf_data["Interest Rate (Policy)"] = ecb_policy_rate_for_country(iso2)
+    except Exception as e:
+        print(f"[ECB] policy override failed for {iso2}: {e}")
+
     # Attach unemployment series into an 'additional_indicators' if you want,
     # or keep it inside imf_data as a full block. We'll keep full blocks consistent:
     imf_data["Unemployment (%)"] = unemp_block["latest"]
