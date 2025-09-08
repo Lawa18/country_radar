@@ -4,6 +4,11 @@ from __future__ import annotations
 from typing import Dict, Tuple, Optional, Any, List
 import time
 
+_EU_UK_ISO2 = {
+    "AT","BE","BG","HR","CY","CZ","DE","DK","EE","ES","FI","FR","GR","EL","HU","IE",
+    "IT","LT","LU","LV","MT","NL","PL","PT","RO","SE","SI","SK","IS","NO","LI","UK"
+}
+
 # --------- Lightweight TTL cache for the assembled country payloads ---------
 class _TTLCache:
     def __init__(self, ttl_seconds: int = 900) -> None:  # 15 minutes
@@ -246,31 +251,21 @@ def _assemble_policy_rate(iso2: str) -> Dict[str, Any]:
     return _build_indicator_block(None, None, None, series_map)
 
 def _assemble_cpi_yoy(iso2: str) -> Dict[str, Any]:
-    """
-    CPI YoY: IMF monthly → Eurostat monthly (EU) → WB annual.
-    """
     imf_ser = imf_cpi_yoy_monthly(iso2) or {}
-    eu_ser = eurostat_hicp_yoy_monthly(iso2) or {}
     wb_ser  = wb_cpi_inflation_annual_pct(iso2) or {}
-
-    src, lp, lv, all_ser = _choose_monthly_then_annual(
-        candidates=[("IMF", imf_ser), ("Eurostat", eu_ser)],
-        annual_fallback=("WorldBank", wb_ser),
-    )
+    candidates = [("IMF", imf_ser)]
+    if iso2.upper() in _EU_UK_ISO2:
+        candidates.append(("Eurostat", eurostat_hicp_yoy_monthly(iso2) or {}))
+    src, lp, lv, all_ser = _choose_monthly_then_annual(candidates, ("WorldBank", wb_ser))
     return _build_indicator_block(src, lp, lv, all_ser)
 
 def _assemble_unemployment(iso2: str) -> Dict[str, Any]:
-    """
-    Unemployment rate: IMF monthly → Eurostat monthly (EU) → WB annual.
-    """
     imf_ser = imf_unemployment_rate_monthly(iso2) or {}
-    eu_ser  = eurostat_unemployment_rate_monthly(iso2) or {}
     wb_ser  = wb_unemployment_rate_annual_pct(iso2) or {}
-
-    src, lp, lv, all_ser = _choose_monthly_then_annual(
-        candidates=[("IMF", imf_ser), ("Eurostat", eu_ser)],
-        annual_fallback=("WorldBank", wb_ser),
-    )
+    candidates = [("IMF", imf_ser)]
+    if iso2.upper() in _EU_UK_ISO2:
+        candidates.append(("Eurostat", eurostat_unemployment_rate_monthly(iso2) or {}))
+    src, lp, lv, all_ser = _choose_monthly_then_annual(candidates, ("WorldBank", wb_ser))
     return _build_indicator_block(src, lp, lv, all_ser)
 
 def _assemble_fx_rate_usd(iso2: str) -> Dict[str, Any]:
