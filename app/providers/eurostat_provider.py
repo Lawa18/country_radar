@@ -28,8 +28,8 @@ _EUROSTAT_HOSTS = (
     "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data",
 )
 
-_HTTP_TIMEOUT = 8.0   # seconds
-_HTTP_RETRIES = 2      # attempts per host (1 + retries)
+_HTTP_TIMEOUT = 5.0   # seconds
+_HTTP_RETRIES = 1      # attempts per host (1 + retries)
 _BACKOFF_SEC = 0.35
 
 # Narrow windows to keep responses small & fast
