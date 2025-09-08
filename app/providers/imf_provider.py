@@ -24,8 +24,8 @@ Exports used by Country Radar:
 # Config & small in-memory TTL
 # ----------------------------
 _IMF_COMPACT_BASE = "https://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData"
-_DEFAULT_TIMEOUT = 7.5  # seconds
-_MAX_RETRIES = 2
+_DEFAULT_TIMEOUT = 4.0  # seconds
+_MAX_RETRIES = 1
 _CACHE_TTL = 3600  # seconds (~1 hour)
 
 class _TTLCache:
