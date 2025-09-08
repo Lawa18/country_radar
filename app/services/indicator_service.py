@@ -169,18 +169,26 @@ except Exception:  # pragma: no cover
     def imf_gdp_growth_quarterly(iso2: str) -> Dict[str, Any]:  # type: ignore
         return {}
 
-# World Bank (annual fallback for many indicators)
-try:
-    from app.providers.wb_provider import (
-        wb_cpi_inflation_annual_pct,                # CPI inflation, annual %
-        wb_unemployment_rate_annual_pct,            # Unemployment, annual %
-        wb_fx_lcu_per_usd_annual,                   # LC per USD, annual (or similar)
-        wb_total_reserves_usd_annual,               # Reserves (USD), annual
-        wb_gdp_growth_annual_pct,                   # GDP growth (annual %)
-        wb_current_account_balance_pct_gdp_annual,  # CAB % GDP
-        wb_government_effectiveness_index_annual,   # Gov effectiveness
-    )  # type: ignore
-except Exception:  # pragma: no cover
+    # World Bank (annual fallback for many indicators) with graceful fallback to wb_provider_cr
+    def _wb_pick(name: str):
+        try:
+            import app.providers.wb_provider as _wb  # your existing provider
+            if hasattr(_wb, name):
+                return getattr(_wb, name)
+        except Exception:
+            pass
+        # fallback to our compact WB client
+        import app.providers.wb_provider_cr as _wb_fallback
+        return getattr(_wb_fallback, name)
+    
+    wb_cpi_inflation_annual_pct                = _wb_pick("wb_cpi_inflation_annual_pct")                # type: ignore
+    wb_unemployment_rate_annual_pct            = _wb_pick("wb_unemployment_rate_annual_pct")            # type: ignore
+    wb_fx_lcu_per_usd_annual                   = _wb_pick("wb_fx_lcu_per_usd_annual")                   # type: ignore
+    wb_total_reserves_usd_annual               = _wb_pick("wb_total_reserves_usd_annual")               # type: ignore
+    wb_gdp_growth_annual_pct                   = _wb_pick("wb_gdp_growth_annual_pct")                   # type: ignore
+    wb_current_account_balance_pct_gdp_annual  = _wb_pick("wb_current_account_balance_pct_gdp_annual")  # type: ignore
+    wb_government_effectiveness_index_annual   = _wb_pick("wb_government_effectiveness_index_annual")   # type: ignore
+
     def wb_cpi_inflation_annual_pct(iso2: str) -> Dict[str, Any]:  # type: ignore
         return {}
     def wb_unemployment_rate_annual_pct(iso2: str) -> Dict[str, Any]:  # type: ignore
