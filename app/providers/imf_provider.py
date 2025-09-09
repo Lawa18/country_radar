@@ -1,4 +1,5 @@
-# app/providers/imf_provider.py
+from pathlib import Path
+code = r"""# app/providers/imf_provider.py
 from __future__ import annotations
 
 from typing import Dict, List, Tuple, Optional, Any
@@ -393,3 +394,6 @@ def imf_weo_debt_to_gdp_annual(iso2: str) -> Dict[str, float]:
 
 # Back-compat alias for older imports
 imf_debt_to_gdp_annual = imf_weo_debt_to_gdp_annual
+"""
+Path('app/providers/imf_provider.py').write_text(code, encoding='utf-8')
+print("Wrote app/providers/imf_provider.py (bytes):", len(code.encode()))
