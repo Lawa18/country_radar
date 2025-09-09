@@ -318,22 +318,34 @@ def _fetch_weo_series(key: str, start_period: str = "2000") -> Dict[str, float]:
 # Public provider functions
 # ---------------------------
 def imf_cpi_yoy_monthly(iso2: str) -> Dict[str, float]:
-    """ CPI YoY % (monthly), computed from CPI index (PCPI_IX). """
-    if IMF_DISABLE: return {}
+    """
+    CPI YoY % (monthly), computed from CPI index.
+    Prefer the IMF CPI dataset (PCPI_IX) and fall back to IFS if needed.
+    """
+    if IMF_DISABLE:
+        return {}
     for area in _norm_iso2_for_ifs(iso2):
-        idx = _fetch_imf_series("IFS", f"M.{area}.PCPI_IX", start_period="2000")
-        if idx:
-            return _compute_yoy_from_level_monthly(idx)
+        # Try CPI dataset first (correct home for PCPI_IX), then IFS
+        for ds in ("CPI", "IFS"):
+            idx = _fetch_imf_series(ds, f"M.{area}.PCPI_IX", start_period="2000")
+            if idx:
+                return _compute_yoy_from_level_monthly(idx)
     return {}
 
 def imf_unemployment_rate_monthly(iso2: str) -> Dict[str, float]:
-    """ Unemployment rate, % (LUR_PT), monthly. """
-    if IMF_DISABLE: return {}
+    """
+    Unemployment rate (%), monthly.
+    Prefer IMF Labor dataset (LP) where LUR_PT is commonly hosted; fall back to IFS.
+    """
+    if IMF_DISABLE:
+        return {}
     for area in _norm_iso2_for_ifs(iso2):
-        ser = _fetch_imf_series("IFS", f"M.{area}.LUR_PT", start_period="2000")
-        if ser:
-            return ser
+        for ds in ("LP", "IFS"):
+            ser = _fetch_imf_series(ds, f"M.{area}.LUR_PT", start_period="2000")
+            if ser:
+                return ser
     return {}
+
 
 def imf_fx_usd_monthly(iso2: str) -> Dict[str, float]:
     """ LCU per USD, monthly. Prefer ENDE_XDC_USD_RATE then ENDA_XDC_USD_RATE. """
