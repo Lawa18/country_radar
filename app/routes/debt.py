@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Any, Dict
 from fastapi import APIRouter, Query, Response
 
-# Back-compat: we expose both names; compute_debt_payload is a wrapper in debt_service.py
+# Back-compat: routes call compute_debt_payload; wrapper exists in debt_service.py
 from app.services.debt_service import compute_debt_payload, debt_payload_for_country
 
 router = APIRouter(tags=["debt"])
