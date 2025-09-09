@@ -5,13 +5,12 @@ from typing import Dict, List, Tuple, Optional, Any
 import time
 import math
 import os
-
 import httpx
 
 """
 IMF providers (IFS + WEO) with robust fallbacks.
 
-Public API (unchanged for Country Radar):
+Public API (used by Country Radar):
   - imf_cpi_yoy_monthly(iso2)              -> {"YYYY-MM": float}
   - imf_unemployment_rate_monthly(iso2)    -> {"YYYY-MM": float}
   - imf_fx_usd_monthly(iso2)               -> {"YYYY-MM": float}
@@ -25,13 +24,15 @@ Public API (unchanged for Country Radar):
 # Config & small in-memory TTL
 # ----------------------------
 IMF_DISABLE = os.getenv("IMF_DISABLE", "0") == "1"                 # force-skip IMF (demo mode)
-IMF_TRY_SDMXCENTRAL = os.getenv("IMF_TRY_SDMXCENTRAL", "0") == "1" # try sdmxcentral.imf.org
+IMF_TRY_SDMXCENTRAL = os.getenv("IMF_TRY_SDMXCENTRAL", "0") == "1" # try sdmxcentral.imf.org (optional)
+IMF_DEBUG = os.getenv("IMF_DEBUG", "0") == "1"
 
 _IMF_COMPACT_BASE = "https://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData"  # primary
 _SDMXCENTRAL_V21_BASE = "https://sdmxcentral.imf.org/ws/public/sdmxapi/rest"       # optional (v2.1)
 _SDMXCENTRAL_V3_BASE  = "https://sdmxcentral.imf.org/sdmx/v2"                       # optional (v3)
 
-_DBNOMICS_BASE = "https://api.db.nomics.world/v22"  # mirror for IMF datasets
+# DBnomics mirrors IMF datasets
+_DBNOMICS_BASE = "https://api.db.nomics.world/v22"
 
 _DEFAULT_TIMEOUT = 4.0     # seconds
 _MAX_RETRIES = 1
@@ -74,7 +75,6 @@ def _http_get_json(url: str, timeout: float = _DEFAULT_TIMEOUT) -> Optional[Dict
                 if resp.status_code == 200:
                     return resp.json()
         except Exception:
-            # brief backoff
             time.sleep(0.2 * (attempt + 1))
     return None
 
@@ -82,16 +82,13 @@ def _http_get_json(url: str, timeout: float = _DEFAULT_TIMEOUT) -> Optional[Dict
 # Utils & parsing helpers
 # -------------------------
 def _norm_iso2_for_ifs(iso2: str) -> List[str]:
-    """
-    IMF IFS usually uses ISO2 like DE, FR, GB. Normalize aliases and try a couple of variants.
-    """
     iso2 = (iso2 or "").upper()
     tries = [iso2]
     if iso2 == "UK":
         tries.append("GB")
     if iso2 == "EL":   # Eurostat alias for Greece
         tries.append("GR")
-    return list(dict.fromkeys(tries))  # de-dup, preserve order
+    return list(dict.fromkeys(tries))
 
 def _iso2_to_iso3(iso2: str) -> Optional[str]:
     try:
@@ -111,9 +108,9 @@ def _safe_float(x: Any) -> Optional[float]:
         v = float(x)
         if math.isfinite(v):
             return v
-        return None
     except Exception:
-        return None
+        pass
+    return None
 
 def _yymm_key_to_tuple(k: str) -> Tuple[int, int]:
     k = (k or "").strip()
@@ -135,10 +132,6 @@ def _yyqq_key_to_tuple(k: str) -> Tuple[int, int]:
         return 0, 0
 
 def _compute_yoy_from_level_monthly(level_series: Dict[str, float]) -> Dict[str, float]:
-    """
-    Monthly levels -> YoY %
-      yoy_t = (level_t / level_{t-12} - 1) * 100
-    """
     if not level_series:
         return {}
     items = sorted(level_series.items(), key=lambda kv: _yymm_key_to_tuple(kv[0]))
@@ -152,10 +145,6 @@ def _compute_yoy_from_level_monthly(level_series: Dict[str, float]) -> Dict[str,
     return out
 
 def _compute_yoy_from_level_quarterly(level_series: Dict[str, float]) -> Dict[str, float]:
-    """
-    Quarterly levels -> YoY % (vs same quarter prev year)
-      yoy_t = (level_t / level_{t-4} - 1) * 100
-    """
     if not level_series:
         return {}
     items = sorted(level_series.items(), key=lambda kv: _yyqq_key_to_tuple(kv[0]))
@@ -169,12 +158,9 @@ def _compute_yoy_from_level_quarterly(level_series: Dict[str, float]) -> Dict[st
     return out
 
 # -------------------------
-# IMF JSON parsers
+# JSON parsers
 # -------------------------
 def _parse_imf_compact(payload: Dict[str, Any]) -> Dict[str, float]:
-    """
-    Parse IMF CompactData JSON (dataservices.imf.org) to {time_period -> value}.
-    """
     try:
         series = payload["CompactData"]["DataSet"]["Series"]
     except Exception:
@@ -191,20 +177,12 @@ def _parse_imf_compact(payload: Dict[str, Any]) -> Dict[str, float]:
     for row in rows:
         t = row.get("@TIME_PERIOD")
         v = row.get("@OBS_VALUE")
-        if t is None or v is None:
-            continue
         fv = _safe_float(v)
-        if fv is not None:
+        if t is not None and fv is not None:
             out[str(t)] = fv
     return out
 
 def _parse_dbnomics_series(payload: Dict[str, Any]) -> Dict[str, float]:
-    """
-    Parse DBnomics /series response to {period -> value}.
-    Supports common shapes:
-      - {"series":{"docs":[{"period":[...], "value":[...]}]}}
-      - {"series":{"docs":[{"observations":[{"period":..., "value":...}, ...]}]}}
-    """
     try:
         series = payload.get("series", {}).get("docs")
         if not series:
@@ -213,7 +191,6 @@ def _parse_dbnomics_series(payload: Dict[str, Any]) -> Dict[str, float]:
     except Exception:
         return {}
     out: Dict[str, float] = {}
-    # shape 1: arrays
     periods = doc.get("period")
     values  = doc.get("value")
     if isinstance(periods, list) and isinstance(values, list) and len(periods) == len(values):
@@ -221,7 +198,6 @@ def _parse_dbnomics_series(payload: Dict[str, Any]) -> Dict[str, float]:
             fv = _safe_float(v)
             if p is not None and fv is not None:
                 out[str(p)] = fv
-    # shape 2: observations as list of dicts
     if not out and isinstance(doc.get("observations"), list):
         for obs in doc["observations"]:
             p = obs.get("period"); v = obs.get("value")
@@ -235,7 +211,7 @@ def _parse_dbnomics_series(payload: Dict[str, Any]) -> Dict[str, float]:
 # -------------------------
 def _fetch_imf_series(dataset: str, key: str, start_period: str = "2000") -> Dict[str, float]:
     """
-    Try IMF primary host; optionally SDMX Central; then DBnomics mirror.
+    Try IMF primary; optionally SDMX Central; then DBnomics mirror.
     Returns {period -> float}.
     """
     if IMF_DISABLE:
@@ -246,49 +222,49 @@ def _fetch_imf_series(dataset: str, key: str, start_period: str = "2000") -> Dic
     if hit is not None:
         return hit
 
-    # 1) IMF primary: dataservices (CompactData JSON)
+    # 1) IMF primary (CompactData JSON)
     url1 = f"{_IMF_COMPACT_BASE}/{dataset}/{key}?startPeriod={start_period}"
     data1 = _http_get_json(url1)
     ser = _parse_imf_compact(data1 or {})
     if ser:
         _cache.set(cache_key, ser)
+        if IMF_DEBUG: print(f"[imf] {dataset}/{key} -> IMF primary ({len(ser)} pts)")
         return ser
 
-    # 2) IMF SDMX Central (optional): v2.1 (REST 1.x) & v3 (REST 2.x)
-    # Note: responses may be SDMX-ML/3.0 JSON; not parsed here by default.
+    # 2) IMF SDMX Central (optional)
     if IMF_TRY_SDMXCENTRAL:
-        # v2.1 style
         url2a = f"{_SDMXCENTRAL_V21_BASE}/{dataset}/{key}?startPeriod={start_period}&format=sdmx-json"
         data2a = _http_get_json(url2a)
-        ser2a = _parse_imf_compact(data2a or {})  # many servers still return Compact-like JSON
+        ser2a = _parse_imf_compact(data2a or {})
         if ser2a:
             _cache.set(cache_key, ser2a)
+            if IMF_DEBUG: print(f"[imf] {dataset}/{key} -> SDMX v2.1 ({len(ser2a)} pts)")
             return ser2a
-        # v3 style
+
         url2b = f"{_SDMXCENTRAL_V3_BASE}/data/{dataset}/{key}?startPeriod={start_period}&format=sdmx-json"
         data2b = _http_get_json(url2b)
         ser2b = _parse_imf_compact(data2b or {})
         if ser2b:
             _cache.set(cache_key, ser2b)
+            if IMF_DEBUG: print(f"[imf] {dataset}/{key} -> SDMX v3 ({len(ser2b)} pts)")
             return ser2b
 
-    # 3) DBnomics mirror (fast & stable)
-    # IMF datasets keep the same dataset code and series mask.
-    # Example: /v22/series/IMF/IFS/M.NG.PCPI_IX?observations=1&format=json
+    # 3) DBnomics mirror
     url3 = f"{_DBNOMICS_BASE}/series/IMF/{dataset}/{key}?observations=1&format=json"
     data3 = _http_get_json(url3)
     ser3 = _parse_dbnomics_series(data3 or {})
     if ser3:
         _cache.set(cache_key, ser3)
+        if IMF_DEBUG: print(f"[imf] {dataset}/{key} -> DBnomics ({len(ser3)} pts)")
         return ser3
 
+    if IMF_DEBUG: print(f"[imf] {dataset}/{key} -> EMPTY")
     return {}
 
 def _fetch_weo_series(key: str, start_period: str = "2000") -> Dict[str, float]:
     """
-    Fetch WEO annual series (e.g., GGXWDG_NGDP) using the same host-fallback.
-    key format: "A.{AREA}.{INDICATOR}" e.g., "A.DEU.GGXWDG_NGDP"
-    Tries datasets: WEO (alias) then a few stamped releases, then DBnomics.
+    Fetch WEO annual series (e.g. GGXWDG_NGDP) via IMF + DBnomics fallback.
+    key: "A.{AREA}.{INDICATOR}"
     """
     if IMF_DISABLE:
         return {}
@@ -298,24 +274,19 @@ def _fetch_weo_series(key: str, start_period: str = "2000") -> Dict[str, float]:
     if hit is not None:
         return hit
 
-    datasets_try: List[str] = [
-        "WEO",
-        "WEO:2025-04",
-        "WEO:2024-10",
-        "WEO:2024-04",
-        "WEO:2023-10",
-    ]
+    datasets_try: List[str] = ["WEO", "WEO:2025-04", "WEO:2024-10", "WEO:2024-04", "WEO:2023-10"]
 
-    # Try IMF primary first
+    # IMF primary
     for ds in datasets_try:
         url = f"{_IMF_COMPACT_BASE}/{ds}/{key}?startPeriod={start_period}"
         data = _http_get_json(url)
         ser = _parse_imf_compact(data or {})
         if ser:
             _cache.set(cache_key, ser)
+            if IMF_DEBUG: print(f"[weo] {ds}/{key} -> IMF primary ({len(ser)} pts)")
             return ser
 
-    # Optionally try SDMX Central
+    # SDMX Central (optional)
     if IMF_TRY_SDMXCENTRAL:
         for ds in datasets_try:
             url2 = f"{_SDMXCENTRAL_V21_BASE}/{ds}/{key}?startPeriod={start_period}&format=sdmx-json"
@@ -323,29 +294,28 @@ def _fetch_weo_series(key: str, start_period: str = "2000") -> Dict[str, float]:
             ser2 = _parse_imf_compact(data2 or {})
             if ser2:
                 _cache.set(cache_key, ser2)
+                if IMF_DEBUG: print(f"[weo] {ds}/{key} -> SDMX v2.1 ({len(ser2)} pts)")
                 return ser2
 
-    # DBnomics mirror for WEO
+    # DBnomics
     for ds in ["WEO:latest"] + datasets_try:
         url3 = f"{_DBNOMICS_BASE}/series/IMF/{ds}/{key}?observations=1&format=json"
         data3 = _http_get_json(url3)
         ser3 = _parse_dbnomics_series(data3 or {})
         if ser3:
             _cache.set(cache_key, ser3)
+            if IMF_DEBUG: print(f"[weo] {ds}/{key} -> DBnomics ({len(ser3)} pts)")
             return ser3
 
+    if IMF_DEBUG: print(f"[weo] {key} -> EMPTY")
     return {}
 
 # ---------------------------
 # Public provider functions
 # ---------------------------
 def imf_cpi_yoy_monthly(iso2: str) -> Dict[str, float]:
-    """
-    CPI YoY % (monthly), computed from CPI index (PCPI_IX).
-    Returns {YYYY-MM -> yoy_percent}.
-    """
-    if IMF_DISABLE:
-        return {}
+    """ CPI YoY % (monthly), computed from CPI index (PCPI_IX). """
+    if IMF_DISABLE: return {}
     for area in _norm_iso2_for_ifs(iso2):
         idx = _fetch_imf_series("IFS", f"M.{area}.PCPI_IX", start_period="2000")
         if idx:
@@ -353,12 +323,8 @@ def imf_cpi_yoy_monthly(iso2: str) -> Dict[str, float]:
     return {}
 
 def imf_unemployment_rate_monthly(iso2: str) -> Dict[str, float]:
-    """
-    Unemployment rate, percent, monthly (LUR_PT).
-    Returns {YYYY-MM -> percent}.
-    """
-    if IMF_DISABLE:
-        return {}
+    """ Unemployment rate, % (LUR_PT), monthly. """
+    if IMF_DISABLE: return {}
     for area in _norm_iso2_for_ifs(iso2):
         ser = _fetch_imf_series("IFS", f"M.{area}.LUR_PT", start_period="2000")
         if ser:
@@ -366,13 +332,8 @@ def imf_unemployment_rate_monthly(iso2: str) -> Dict[str, float]:
     return {}
 
 def imf_fx_usd_monthly(iso2: str) -> Dict[str, float]:
-    """
-    Domestic currency per U.S. dollar, monthly.
-    Prefer end-of-period (ENDE_XDC_USD_RATE), fallback to period average (ENDA_XDC_USD_RATE).
-    Returns {YYYY-MM -> rate}.
-    """
-    if IMF_DISABLE:
-        return {}
+    """ LCU per USD, monthly. Prefer ENDE_XDC_USD_RATE then ENDA_XDC_USD_RATE. """
+    if IMF_DISABLE: return {}
     for area in _norm_iso2_for_ifs(iso2):
         ser = _fetch_imf_series("IFS", f"M.{area}.ENDE_XDC_USD_RATE", start_period="2000")
         if ser:
@@ -383,12 +344,8 @@ def imf_fx_usd_monthly(iso2: str) -> Dict[str, float]:
     return {}
 
 def imf_reserves_usd_monthly(iso2: str) -> Dict[str, float]:
-    """
-    Total reserves excluding gold, US dollars (RAXG_USD), monthly.
-    Returns {YYYY-MM -> millions USD}.
-    """
-    if IMF_DISABLE:
-        return {}
+    """ Total reserves excl. gold, USD (RAXG_USD), monthly. """
+    if IMF_DISABLE: return {}
     for area in _norm_iso2_for_ifs(iso2):
         ser = _fetch_imf_series("IFS", f"M.{area}.RAXG_USD", start_period="2000")
         if ser:
@@ -396,12 +353,8 @@ def imf_reserves_usd_monthly(iso2: str) -> Dict[str, float]:
     return {}
 
 def imf_policy_rate_monthly(iso2: str) -> Dict[str, float]:
-    """
-    Central bank policy rate, percent per annum, monthly (FPOLM_PA).
-    Returns {YYYY-MM -> percent}.
-    """
-    if IMF_DISABLE:
-        return {}
+    """ Policy rate, % p.a. (FPOLM_PA), monthly. """
+    if IMF_DISABLE: return {}
     for area in _norm_iso2_for_ifs(iso2):
         ser = _fetch_imf_series("IFS", f"M.{area}.FPOLM_PA", start_period="2000")
         if ser:
@@ -409,12 +362,8 @@ def imf_policy_rate_monthly(iso2: str) -> Dict[str, float]:
     return {}
 
 def imf_gdp_growth_quarterly(iso2: str) -> Dict[str, float]:
-    """
-    Real GDP YoY % (quarterly), computed from NGDP_R_SA_XDC (Real GDP, SA, national currency).
-    Returns {YYYY-Qn -> yoy_percent}.
-    """
-    if IMF_DISABLE:
-        return {}
+    """ Real GDP YoY % (quarterly), computed from NGDP_R_SA_XDC. """
+    if IMF_DISABLE: return {}
     for area in _norm_iso2_for_ifs(iso2):
         lvl = _fetch_imf_series("IFS", f"Q.{area}.NGDP_R_SA_XDC", start_period="2000")
         if lvl:
@@ -424,26 +373,17 @@ def imf_gdp_growth_quarterly(iso2: str) -> Dict[str, float]:
 # ---------------------------
 # IMF WEO: Debt-to-GDP (annual)
 # ---------------------------
-_WEO_DEBT_INDICATORS: List[str] = [
-    "GGXWDG_NGDP",  # General Government Gross Debt (% of GDP)
-]
+_WEO_DEBT_INDICATORS: List[str] = ["GGXWDG_NGDP"]  # General Government Gross Debt (% of GDP)
 
 def imf_weo_debt_to_gdp_annual(iso2: str) -> Dict[str, float]:
-    """
-    IMF WEO: General Government Gross Debt (% of GDP), annual.
-    Returns {YYYY -> percent} or {} if not available.
-    """
-    if IMF_DISABLE:
-        return {}
-
+    """ IMF WEO: General Government Gross Debt (% of GDP), annual. """
+    if IMF_DISABLE: return {}
     iso3 = _iso2_to_iso3(iso2)
     if not iso3:
         return {}
-
-    key_variants: List[str] = [f"A.{iso3}.{ind}" for ind in _WEO_DEBT_INDICATORS]
-    for key in key_variants:
+    for ind in _WEO_DEBT_INDICATORS:
+        key = f"A.{iso3}.{ind}"
         ser = _fetch_weo_series(key, start_period="2000")
         if ser:
-            # keep only YYYY labels
             return {k: v for k, v in ser.items() if isinstance(k, str) and len(k) == 4 and k.isdigit()}
     return {}
