@@ -10,7 +10,7 @@ import httpx
 """
 IMF providers (IFS + WEO) with robust fallbacks.
 
-Public API (used by Country Radar):
+Exports used by Country Radar:
   - imf_cpi_yoy_monthly(iso2)              -> {"YYYY-MM": float}
   - imf_unemployment_rate_monthly(iso2)    -> {"YYYY-MM": float}
   - imf_fx_usd_monthly(iso2)               -> {"YYYY-MM": float}
@@ -18,6 +18,9 @@ Public API (used by Country Radar):
   - imf_policy_rate_monthly(iso2)          -> {"YYYY-MM": float}
   - imf_gdp_growth_quarterly(iso2)         -> {"YYYY-Qn": float}
   - imf_weo_debt_to_gdp_annual(iso2)       -> {"YYYY": float}
+
+Back-compat alias:
+  - imf_debt_to_gdp_annual(iso2)           -> {"YYYY": float}  (alias to WEO function)
 """
 
 # ----------------------------
@@ -387,3 +390,6 @@ def imf_weo_debt_to_gdp_annual(iso2: str) -> Dict[str, float]:
         if ser:
             return {k: v for k, v in ser.items() if isinstance(k, str) and len(k) == 4 and k.isdigit()}
     return {}
+
+# Back-compat alias for older imports
+imf_debt_to_gdp_annual = imf_weo_debt_to_gdp_annual
