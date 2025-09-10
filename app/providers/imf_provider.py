@@ -1,5 +1,4 @@
-from pathlib import Path
-code = r"""# app/providers/imf_provider.py
+# app/providers/imf_provider.py
 from __future__ import annotations
 
 from typing import Dict, List, Tuple, Optional, Any
@@ -9,7 +8,7 @@ import os
 import httpx
 
 """
-IMF providers (IFS + WEO) with robust fallbacks.
+IMF providers (IFS + WEO) with robust fallbacks and dataset-aware lookups.
 
 Exports used by Country Radar:
   - imf_cpi_yoy_monthly(iso2)              -> {"YYYY-MM": float}
@@ -162,7 +161,103 @@ def _compute_yoy_from_level_quarterly(level_series: Dict[str, float]) -> Dict[st
     return out
 
 # -------------------------
-# JSON parsers
+# DBnomics helpers & parser
+# -------------------------
+def _normalize_period_key(p: Any) -> Optional[str]:
+    """
+    Normalize DBnomics period strings:
+      - 'YYYY-MM-DD' -> 'YYYY-MM'
+      - 'YYYYMmm'    -> 'YYYY-MM'
+      - 'YYYY-Qn' or 'YYYYQn' stays/normalizes to 'YYYY-Qn'
+      - 'YYYY' stays for annual
+    """
+    if p is None:
+        return None
+    s = str(p).strip()
+    if not s:
+        return None
+    if len(s) == 10 and s[4] == "-" and s[7] == "-":  # YYYY-MM-DD
+        return f"{s[:4]}-{s[5:7]}"
+    if len(s) == 7 and s[4] == "-":                   # YYYY-MM
+        return s
+    if len(s) == 7 and (s[4] in ("M", "m")):          # YYYYMmm
+        yy = s[:4]; mm = s[5:]
+        if mm.isdigit() and len(mm) == 2:
+            return f"{yy}-{mm}"
+    if len(s) == 7 and s[4] == "-" and (s[5] in ("Q", "q")):  # YYYY-Qn
+        return f"{s[:4]}-Q{s[-1]}"
+    if len(s) == 6 and (s[4] in ("Q", "q")) and s[-1].isdigit():  # YYYYQn
+        return f"{s[:4]}-Q{s[-1]}"
+    if len(s) == 4 and s.isdigit():                    # YYYY
+        return s
+    return s
+
+def _parse_dbnomics_series(payload: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Robust parser for DBnomics v22 `/series` responses.
+    Handles:
+      - series.docs[0].period + .value (parallel arrays)
+      - series.docs[0].observations = [{period, value}, ...]
+      - series.docs[0].original_period when period missing
+    """
+    if not isinstance(payload, dict):
+        return {}
+
+    series = payload.get("series")
+    if not series:
+        return {}
+
+    # series may be dict or list; prefer first doc
+    doc = None
+    if isinstance(series, dict):
+        docs = series.get("docs")
+        if isinstance(docs, list) and docs:
+            doc = docs[0]
+    elif isinstance(series, list) and series:
+        doc = series[0]
+
+    if not isinstance(doc, dict):
+        return {}
+
+    out: Dict[str, float] = {}
+
+    # Path 1: parallel arrays
+    periods = doc.get("period")
+    values  = doc.get("value")
+    if isinstance(periods, list) and isinstance(values, list) and len(periods) == len(values):
+        for p, v in zip(periods, values):
+            key = _normalize_period_key(p)
+            fv = _safe_float(v)
+            if key and fv is not None:
+                out[key] = fv
+
+    # Path 2: observations list
+    if not out and isinstance(doc.get("observations"), list):
+        for obs in doc["observations"]:
+            if not isinstance(obs, dict):
+                continue
+            p = obs.get("period") or obs.get("original_period")
+            v = obs.get("value")
+            key = _normalize_period_key(p)
+            fv = _safe_float(v)
+            if key and fv is not None:
+                out[key] = fv
+
+    # Path 3: only original_period/value arrays
+    if not out:
+        o_periods = doc.get("original_period")
+        o_values  = doc.get("value")
+        if isinstance(o_periods, list) and isinstance(o_values, list) and len(o_periods) == len(o_values):
+            for p, v in zip(o_periods, o_values):
+                key = _normalize_period_key(p)
+                fv = _safe_float(v)
+                if key and fv is not None:
+                    out[key] = fv
+
+    return out
+
+# -------------------------
+# IMF JSON parser (CompactData)
 # -------------------------
 def _parse_imf_compact(payload: Dict[str, Any]) -> Dict[str, float]:
     try:
@@ -184,30 +279,6 @@ def _parse_imf_compact(payload: Dict[str, Any]) -> Dict[str, float]:
         fv = _safe_float(v)
         if t is not None and fv is not None:
             out[str(t)] = fv
-    return out
-
-def _parse_dbnomics_series(payload: Dict[str, Any]) -> Dict[str, float]:
-    try:
-        series = payload.get("series", {}).get("docs")
-        if not series:
-            return {}
-        doc = series[0]
-    except Exception:
-        return {}
-    out: Dict[str, float] = {}
-    periods = doc.get("period")
-    values  = doc.get("value")
-    if isinstance(periods, list) and isinstance(values, list) and len(periods) == len(values):
-        for p, v in zip(periods, values):
-            fv = _safe_float(v)
-            if p is not None and fv is not None:
-                out[str(p)] = fv
-    if not out and isinstance(doc.get("observations"), list):
-        for obs in doc["observations"]:
-            p = obs.get("period"); v = obs.get("value")
-            fv = _safe_float(v)
-            if p is not None and fv is not None:
-                out[str(p)] = fv
     return out
 
 # -------------------------
@@ -320,12 +391,11 @@ def _fetch_weo_series(key: str, start_period: str = "2000") -> Dict[str, float]:
 def imf_cpi_yoy_monthly(iso2: str) -> Dict[str, float]:
     """
     CPI YoY % (monthly), computed from CPI index.
-    Prefer the IMF CPI dataset (PCPI_IX) and fall back to IFS if needed.
+    Prefer the IMF CPI dataset (PCPI_IX), fall back to IFS.
     """
     if IMF_DISABLE:
         return {}
     for area in _norm_iso2_for_ifs(iso2):
-        # Try CPI dataset first (correct home for PCPI_IX), then IFS
         for ds in ("CPI", "IFS"):
             idx = _fetch_imf_series(ds, f"M.{area}.PCPI_IX", start_period="2000")
             if idx:
@@ -335,7 +405,7 @@ def imf_cpi_yoy_monthly(iso2: str) -> Dict[str, float]:
 def imf_unemployment_rate_monthly(iso2: str) -> Dict[str, float]:
     """
     Unemployment rate (%), monthly.
-    Prefer IMF Labor dataset (LP) where LUR_PT is commonly hosted; fall back to IFS.
+    Prefer IMF Labor dataset (LP) where LUR_PT is hosted; fall back to IFS.
     """
     if IMF_DISABLE:
         return {}
@@ -346,10 +416,12 @@ def imf_unemployment_rate_monthly(iso2: str) -> Dict[str, float]:
                 return ser
     return {}
 
-
 def imf_fx_usd_monthly(iso2: str) -> Dict[str, float]:
-    """ LCU per USD, monthly. Prefer ENDE_XDC_USD_RATE then ENDA_XDC_USD_RATE. """
-    if IMF_DISABLE: return {}
+    """
+    LCU per USD, monthly. Prefer end-of-period (ENDE_XDC_USD_RATE), fallback to period average (ENDA_XDC_USD_RATE).
+    """
+    if IMF_DISABLE:
+        return {}
     for area in _norm_iso2_for_ifs(iso2):
         ser = _fetch_imf_series("IFS", f"M.{area}.ENDE_XDC_USD_RATE", start_period="2000")
         if ser:
@@ -360,8 +432,11 @@ def imf_fx_usd_monthly(iso2: str) -> Dict[str, float]:
     return {}
 
 def imf_reserves_usd_monthly(iso2: str) -> Dict[str, float]:
-    """ Total reserves excl. gold, USD (RAXG_USD), monthly. """
-    if IMF_DISABLE: return {}
+    """
+    Total reserves excl. gold, USD (RAXG_USD), monthly.
+    """
+    if IMF_DISABLE:
+        return {}
     for area in _norm_iso2_for_ifs(iso2):
         ser = _fetch_imf_series("IFS", f"M.{area}.RAXG_USD", start_period="2000")
         if ser:
@@ -369,8 +444,11 @@ def imf_reserves_usd_monthly(iso2: str) -> Dict[str, float]:
     return {}
 
 def imf_policy_rate_monthly(iso2: str) -> Dict[str, float]:
-    """ Policy rate, % p.a. (FPOLM_PA), monthly. """
-    if IMF_DISABLE: return {}
+    """
+    Policy rate, % p.a. (FPOLM_PA), monthly.
+    """
+    if IMF_DISABLE:
+        return {}
     for area in _norm_iso2_for_ifs(iso2):
         ser = _fetch_imf_series("IFS", f"M.{area}.FPOLM_PA", start_period="2000")
         if ser:
@@ -378,8 +456,11 @@ def imf_policy_rate_monthly(iso2: str) -> Dict[str, float]:
     return {}
 
 def imf_gdp_growth_quarterly(iso2: str) -> Dict[str, float]:
-    """ Real GDP YoY % (quarterly), computed from NGDP_R_SA_XDC. """
-    if IMF_DISABLE: return {}
+    """
+    Real GDP YoY % (quarterly), computed from NGDP_R_SA_XDC (Real GDP, SA, national currency).
+    """
+    if IMF_DISABLE:
+        return {}
     for area in _norm_iso2_for_ifs(iso2):
         lvl = _fetch_imf_series("IFS", f"Q.{area}.NGDP_R_SA_XDC", start_period="2000")
         if lvl:
@@ -392,8 +473,11 @@ def imf_gdp_growth_quarterly(iso2: str) -> Dict[str, float]:
 _WEO_DEBT_INDICATORS: List[str] = ["GGXWDG_NGDP"]  # General Government Gross Debt (% of GDP)
 
 def imf_weo_debt_to_gdp_annual(iso2: str) -> Dict[str, float]:
-    """ IMF WEO: General Government Gross Debt (% of GDP), annual. """
-    if IMF_DISABLE: return {}
+    """
+    IMF WEO: General Government Gross Debt (% of GDP), annual.
+    """
+    if IMF_DISABLE:
+        return {}
     iso3 = _iso2_to_iso3(iso2)
     if not iso3:
         return {}
@@ -406,6 +490,3 @@ def imf_weo_debt_to_gdp_annual(iso2: str) -> Dict[str, float]:
 
 # Back-compat alias for older imports
 imf_debt_to_gdp_annual = imf_weo_debt_to_gdp_annual
-"""
-Path('app/providers/imf_provider.py').write_text(code, encoding='utf-8')
-print("Wrote app/providers/imf_provider.py (bytes):", len(code.encode()))
