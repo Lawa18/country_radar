@@ -393,7 +393,7 @@ def imf_cpi_yoy_monthly(iso2: str) -> Dict[str, float]:
     if IMF_DISABLE:
         return {}
     for area in _norm_iso2_for_ifs(iso2):
-        # Direct YoY (%)
+        # Direct YoY series (percent)
         for ds in ("CPI", "IFS"):
             yoy = _fetch_imf_series(ds, f"M.{area}.PCPI_YY", start_period="2000")
             if yoy:
