@@ -26,8 +26,8 @@ Back-compat alias:
 # ----------------------------
 # Config & small in-memory TTL
 # ----------------------------
-IMF_DISABLE = os.getenv("IMF_DISABLE", "0") == "1"                 # force-skip IMF (demo mode)
-IMF_TRY_SDMXCENTRAL = os.getenv("IMF_TRY_SDMXCENTRAL", "0") == "1" # try sdmxcentral.imf.org (optional)
+IMF_DISABLE = os.getenv("IMF_DISABLE", "0") == "1"
+IMF_TRY_SDMXCENTRAL = os.getenv("IMF_TRY_SDMXCENTRAL", "0") == "1"
 IMF_DEBUG = os.getenv("IMF_DEBUG", "0") == "1"
 
 _IMF_COMPACT_BASE = "https://dataservices.imf.org/REST/SDMX_JSON.svc/CompactData"  # primary
@@ -168,7 +168,7 @@ def _normalize_period_key(p: Any) -> Optional[str]:
     Normalize DBnomics period strings:
       - 'YYYY-MM-DD' -> 'YYYY-MM'
       - 'YYYYMmm'    -> 'YYYY-MM'
-      - 'YYYY-Qn' or 'YYYYQn' stays/normalizes to 'YYYY-Qn'
+      - 'YYYY-Qn' or 'YYYYQn' -> 'YYYY-Qn'
       - 'YYYY' stays for annual
     """
     if p is None:
@@ -176,19 +176,19 @@ def _normalize_period_key(p: Any) -> Optional[str]:
     s = str(p).strip()
     if not s:
         return None
-    if len(s) == 10 and s[4] == "-" and s[7] == "-":  # YYYY-MM-DD
+    if len(s) == 10 and s[4] == "-" and s[7] == "-":
         return f"{s[:4]}-{s[5:7]}"
-    if len(s) == 7 and s[4] == "-":                   # YYYY-MM
+    if len(s) == 7 and s[4] == "-":
         return s
-    if len(s) == 7 and (s[4] in ("M", "m")):          # YYYYMmm
+    if len(s) == 7 and (s[4] in ("M", "m")):
         yy = s[:4]; mm = s[5:]
         if mm.isdigit() and len(mm) == 2:
             return f"{yy}-{mm}"
-    if len(s) == 7 and s[4] == "-" and (s[5] in ("Q", "q")):  # YYYY-Qn
+    if len(s) == 7 and s[4] == "-" and (s[5] in ("Q", "q")):
         return f"{s[:4]}-Q{s[-1]}"
-    if len(s) == 6 and (s[4] in ("Q", "q")) and s[-1].isdigit():  # YYYYQn
+    if len(s) == 6 and (s[4] in ("Q", "q")) and s[-1].isdigit():
         return f"{s[:4]}-Q{s[-1]}"
-    if len(s) == 4 and s.isdigit():                    # YYYY
+    if len(s) == 4 and s.isdigit():
         return s
     return s
 
@@ -207,7 +207,6 @@ def _parse_dbnomics_series(payload: Dict[str, Any]) -> Dict[str, float]:
     if not series:
         return {}
 
-    # series may be dict or list; prefer first doc
     doc = None
     if isinstance(series, dict):
         docs = series.get("docs")
@@ -221,7 +220,6 @@ def _parse_dbnomics_series(payload: Dict[str, Any]) -> Dict[str, float]:
 
     out: Dict[str, float] = {}
 
-    # Path 1: parallel arrays
     periods = doc.get("period")
     values  = doc.get("value")
     if isinstance(periods, list) and isinstance(values, list) and len(periods) == len(values):
@@ -231,7 +229,6 @@ def _parse_dbnomics_series(payload: Dict[str, Any]) -> Dict[str, float]:
             if key and fv is not None:
                 out[key] = fv
 
-    # Path 2: observations list
     if not out and isinstance(doc.get("observations"), list):
         for obs in doc["observations"]:
             if not isinstance(obs, dict):
@@ -243,7 +240,6 @@ def _parse_dbnomics_series(payload: Dict[str, Any]) -> Dict[str, float]:
             if key and fv is not None:
                 out[key] = fv
 
-    # Path 3: only original_period/value arrays
     if not out:
         o_periods = doc.get("original_period")
         o_values  = doc.get("value")
@@ -390,12 +386,19 @@ def _fetch_weo_series(key: str, start_period: str = "2000") -> Dict[str, float]:
 # ---------------------------
 def imf_cpi_yoy_monthly(iso2: str) -> Dict[str, float]:
     """
-    CPI YoY % (monthly), computed from CPI index.
-    Prefer the IMF CPI dataset (PCPI_IX), fall back to IFS.
+    CPI YoY % (monthly).
+    Prefer the IMF CPI dataset. Try direct YoY (PCPI_YY) first; if absent, compute YoY from index (PCPI_IX).
+    Fall back to IFS if CPI dataset is missing.
     """
     if IMF_DISABLE:
         return {}
     for area in _norm_iso2_for_ifs(iso2):
+        # Direct YoY (%)
+        for ds in ("CPI", "IFS"):
+            yoy = _fetch_imf_series(ds, f"M.{area}.PCPI_YY", start_period="2000")
+            if yoy:
+                return yoy
+        # Compute YoY from index
         for ds in ("CPI", "IFS"):
             idx = _fetch_imf_series(ds, f"M.{area}.PCPI_IX", start_period="2000")
             if idx:
@@ -405,20 +408,21 @@ def imf_cpi_yoy_monthly(iso2: str) -> Dict[str, float]:
 def imf_unemployment_rate_monthly(iso2: str) -> Dict[str, float]:
     """
     Unemployment rate (%), monthly.
-    Prefer IMF Labor dataset (LP) where LUR_PT is hosted; fall back to IFS.
+    Prefer IMF Labor dataset (LP) where LUR/LUR_PT are hosted; fall back to IFS.
     """
     if IMF_DISABLE:
         return {}
     for area in _norm_iso2_for_ifs(iso2):
         for ds in ("LP", "IFS"):
-            ser = _fetch_imf_series(ds, f"M.{area}.LUR_PT", start_period="2000")
-            if ser:
-                return ser
+            for ind in ("LUR_PT", "LUR"):
+                ser = _fetch_imf_series(ds, f"M.{area}.{ind}", start_period="2000")
+                if ser:
+                    return ser
     return {}
 
 def imf_fx_usd_monthly(iso2: str) -> Dict[str, float]:
     """
-    LCU per USD, monthly. Prefer end-of-period (ENDE_XDC_USD_RATE), fallback to period average (ENDA_XDC_USD_RATE).
+    LCU per USD, monthly. Prefer end-of-period (ENDE_XDC_USD_RATE); fallback to period average (ENDA_XDC_USD_RATE).
     """
     if IMF_DISABLE:
         return {}
@@ -457,14 +461,16 @@ def imf_policy_rate_monthly(iso2: str) -> Dict[str, float]:
 
 def imf_gdp_growth_quarterly(iso2: str) -> Dict[str, float]:
     """
-    Real GDP YoY % (quarterly), computed from NGDP_R_SA_XDC (Real GDP, SA, national currency).
+    Real GDP YoY % (quarterly), computed from NGDP_R_*_XDC (Real GDP, national currency).
+    Prefer seasonally adjusted (NGDP_R_SA_XDC); fallback to non-SA (NGDP_R_XDC).
     """
     if IMF_DISABLE:
         return {}
     for area in _norm_iso2_for_ifs(iso2):
-        lvl = _fetch_imf_series("IFS", f"Q.{area}.NGDP_R_SA_XDC", start_period="2000")
-        if lvl:
-            return _compute_yoy_from_level_quarterly(lvl)
+        for code in (f"Q.{area}.NGDP_R_SA_XDC", f"Q.{area}.NGDP_R_XDC"):
+            lvl = _fetch_imf_series("IFS", code, start_period="2000")
+            if lvl:
+                return _compute_yoy_from_level_quarterly(lvl)
     return {}
 
 # ---------------------------
