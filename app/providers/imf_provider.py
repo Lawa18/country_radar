@@ -37,7 +37,8 @@ _SDMXCENTRAL_V3_BASE  = "https://sdmxcentral.imf.org/sdmx/v2"                   
 # DBnomics mirrors IMF datasets
 _DBNOMICS_BASE = "https://api.db.nomics.world/v22"
 
-_DEFAULT_TIMEOUT = 4.0     # seconds
+# Slightly higher timeout for mirrors (more consistent than IMF primary lately)
+_DEFAULT_TIMEOUT = 6.0     # seconds
 _MAX_RETRIES = 1
 _CACHE_TTL = 3600          # seconds (~1 hour)
 
@@ -75,9 +76,13 @@ def _http_get_json(url: str, timeout: float = _DEFAULT_TIMEOUT) -> Optional[Dict
         try:
             with httpx.Client(timeout=timeout, follow_redirects=True, headers=_HEADERS, http2=True) as client:
                 resp = client.get(url)
+                if IMF_DEBUG:
+                    print(f"[http] GET {url} -> {resp.status_code} (len={len(resp.content)})")
                 if resp.status_code == 200:
                     return resp.json()
-        except Exception:
+        except Exception as e:
+            if IMF_DEBUG:
+                print(f"[http] GET {url} raised {type(e).__name__}: {e}")
             time.sleep(0.2 * (attempt + 1))
     return None
 
@@ -278,11 +283,11 @@ def _parse_imf_compact(payload: Dict[str, Any]) -> Dict[str, float]:
     return out
 
 # -------------------------
-# Fetchers (host fallback)
+# Fetchers (DBnomics ➜ IMF ➜ SDMX Central)
 # -------------------------
 def _fetch_imf_series(dataset: str, key: str, start_period: str = "2000") -> Dict[str, float]:
     """
-    Try IMF primary; optionally SDMX Central; then DBnomics mirror.
+    Try DBnomics mirror first (most reliable), then IMF primary, then SDMX Central.
     Returns {period -> float}.
     """
     if IMF_DISABLE:
@@ -293,16 +298,25 @@ def _fetch_imf_series(dataset: str, key: str, start_period: str = "2000") -> Dic
     if hit is not None:
         return hit
 
-    # 1) IMF primary (CompactData JSON)
+    # 1) DBnomics mirror (first)
+    url3 = f"{_DBNOMICS_BASE}/series/IMF/{dataset}/{key}?observations=1&format=json"
+    data3 = _http_get_json(url3)
+    ser3 = _parse_dbnomics_series(data3 or {})
+    if ser3:
+        _cache.set(cache_key, ser3)
+        if IMF_DEBUG: print(f"[imf] {dataset}/{key} -> DBnomics ({len(ser3)} pts)")
+        return ser3
+
+    # 2) IMF primary (CompactData JSON)
     url1 = f"{_IMF_COMPACT_BASE}/{dataset}/{key}?startPeriod={start_period}"
     data1 = _http_get_json(url1)
-    ser = _parse_imf_compact(data1 or {})
-    if ser:
-        _cache.set(cache_key, ser)
-        if IMF_DEBUG: print(f"[imf] {dataset}/{key} -> IMF primary ({len(ser)} pts)")
-        return ser
+    ser1 = _parse_imf_compact(data1 or {})
+    if ser1:
+        _cache.set(cache_key, ser1)
+        if IMF_DEBUG: print(f"[imf] {dataset}/{key} -> IMF primary ({len(ser1)} pts)")
+        return ser1
 
-    # 2) IMF SDMX Central (optional)
+    # 3) IMF SDMX Central (optional)
     if IMF_TRY_SDMXCENTRAL:
         url2a = f"{_SDMXCENTRAL_V21_BASE}/{dataset}/{key}?startPeriod={start_period}&format=sdmx-json"
         data2a = _http_get_json(url2a)
@@ -320,21 +334,12 @@ def _fetch_imf_series(dataset: str, key: str, start_period: str = "2000") -> Dic
             if IMF_DEBUG: print(f"[imf] {dataset}/{key} -> SDMX v3 ({len(ser2b)} pts)")
             return ser2b
 
-    # 3) DBnomics mirror
-    url3 = f"{_DBNOMICS_BASE}/series/IMF/{dataset}/{key}?observations=1&format=json"
-    data3 = _http_get_json(url3)
-    ser3 = _parse_dbnomics_series(data3 or {})
-    if ser3:
-        _cache.set(cache_key, ser3)
-        if IMF_DEBUG: print(f"[imf] {dataset}/{key} -> DBnomics ({len(ser3)} pts)")
-        return ser3
-
     if IMF_DEBUG: print(f"[imf] {dataset}/{key} -> EMPTY")
     return {}
 
 def _fetch_weo_series(key: str, start_period: str = "2000") -> Dict[str, float]:
     """
-    Fetch WEO annual series (e.g. GGXWDG_NGDP) via IMF + DBnomics fallback.
+    Fetch WEO annual series (e.g. GGXWDG_NGDP) – DBnomics ➜ IMF primary ➜ SDMX Central.
     key: "A.{AREA}.{INDICATOR}"
     """
     if IMF_DISABLE:
@@ -345,10 +350,18 @@ def _fetch_weo_series(key: str, start_period: str = "2000") -> Dict[str, float]:
     if hit is not None:
         return hit
 
-    datasets_try: List[str] = ["WEO", "WEO:2025-04", "WEO:2024-10", "WEO:2024-04", "WEO:2023-10"]
+    # 1) DBnomics first (WEO:latest often works best)
+    for ds in ["WEO:latest", "WEO", "WEO:2025-04", "WEO:2024-10", "WEO:2024-04", "WEO:2023-10"]:
+        url3 = f"{_DBNOMICS_BASE}/series/IMF/{ds}/{key}?observations=1&format=json"
+        data3 = _http_get_json(url3)
+        ser3 = _parse_dbnomics_series(data3 or {})
+        if ser3:
+            _cache.set(cache_key, ser3)
+            if IMF_DEBUG: print(f"[weo] {ds}/{key} -> DBnomics ({len(ser3)} pts)")
+            return ser3
 
-    # IMF primary
-    for ds in datasets_try:
+    # 2) IMF primary
+    for ds in ["WEO", "WEO:2025-04", "WEO:2024-10", "WEO:2024-04", "WEO:2023-10"]:
         url = f"{_IMF_COMPACT_BASE}/{ds}/{key}?startPeriod={start_period}"
         data = _http_get_json(url)
         ser = _parse_imf_compact(data or {})
@@ -357,9 +370,9 @@ def _fetch_weo_series(key: str, start_period: str = "2000") -> Dict[str, float]:
             if IMF_DEBUG: print(f"[weo] {ds}/{key} -> IMF primary ({len(ser)} pts)")
             return ser
 
-    # SDMX Central (optional)
+    # 3) SDMX Central (optional)
     if IMF_TRY_SDMXCENTRAL:
-        for ds in datasets_try:
+        for ds in ["WEO", "WEO:2025-04", "WEO:2024-10", "WEO:2024-04", "WEO:2023-10"]:
             url2 = f"{_SDMXCENTRAL_V21_BASE}/{ds}/{key}?startPeriod={start_period}&format=sdmx-json"
             data2 = _http_get_json(url2)
             ser2 = _parse_imf_compact(data2 or {})
@@ -367,16 +380,6 @@ def _fetch_weo_series(key: str, start_period: str = "2000") -> Dict[str, float]:
                 _cache.set(cache_key, ser2)
                 if IMF_DEBUG: print(f"[weo] {ds}/{key} -> SDMX v2.1 ({len(ser2)} pts)")
                 return ser2
-
-    # DBnomics
-    for ds in ["WEO:latest"] + datasets_try:
-        url3 = f"{_DBNOMICS_BASE}/series/IMF/{ds}/{key}?observations=1&format=json"
-        data3 = _http_get_json(url3)
-        ser3 = _parse_dbnomics_series(data3 or {})
-        if ser3:
-            _cache.set(cache_key, ser3)
-            if IMF_DEBUG: print(f"[weo] {ds}/{key} -> DBnomics ({len(ser3)} pts)")
-            return ser3
 
     if IMF_DEBUG: print(f"[weo] {key} -> EMPTY")
     return {}
@@ -393,7 +396,7 @@ def imf_cpi_yoy_monthly(iso2: str) -> Dict[str, float]:
     if IMF_DISABLE:
         return {}
     for area in _norm_iso2_for_ifs(iso2):
-        # Direct YoY series (percent)
+        # Direct YoY
         for ds in ("CPI", "IFS"):
             yoy = _fetch_imf_series(ds, f"M.{area}.PCPI_YY", start_period="2000")
             if yoy:
