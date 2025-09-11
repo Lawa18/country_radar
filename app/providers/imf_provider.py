@@ -257,6 +257,17 @@ def _parse_dbnomics_series(payload: Dict[str, Any]) -> Dict[str, float]:
 
     return out
 
+def _fetch_db_series(dataset: str, key: str) -> Dict[str, float]:
+    """
+    DBnomics direct fetch (no startPeriod filter; we ingest full series).
+    """
+    url = f"{_DBNOMICS_BASE}/series/IMF/{dataset}/{key}?observations=1&format=json"
+    data = _http_get_json(url)
+    ser = _parse_dbnomics_series(data or {})
+    if IMF_DEBUG:
+        print(f"[dbn] {dataset}/{key} -> {'HIT ' + str(len(ser)) if ser else 'EMPTY'}")
+    return ser
+
 # -------------------------
 # IMF JSON parser (CompactData)
 # -------------------------
@@ -283,12 +294,12 @@ def _parse_imf_compact(payload: Dict[str, Any]) -> Dict[str, float]:
     return out
 
 # -------------------------
-# Fetchers (DBnomics ➜ IMF ➜ SDMX Central)
+# Fetchers (DB ➜ IMF ➜ SDMX Central)
 # -------------------------
 def _fetch_imf_series(dataset: str, key: str, start_period: str = "2000") -> Dict[str, float]:
     """
-    Try DBnomics mirror first (most reliable), then IMF primary, then SDMX Central.
-    Returns {period -> float}.
+    General fetcher for non-DB-first cases (used by many indicators).
+    Order: DBnomics ➜ IMF primary ➜ SDMX Central.
     """
     if IMF_DISABLE:
         return {}
@@ -298,10 +309,8 @@ def _fetch_imf_series(dataset: str, key: str, start_period: str = "2000") -> Dic
     if hit is not None:
         return hit
 
-    # 1) DBnomics mirror (first)
-    url3 = f"{_DBNOMICS_BASE}/series/IMF/{dataset}/{key}?observations=1&format=json"
-    data3 = _http_get_json(url3)
-    ser3 = _parse_dbnomics_series(data3 or {})
+    # 1) DBnomics mirror
+    ser3 = _fetch_db_series(dataset, key)
     if ser3:
         _cache.set(cache_key, ser3)
         if IMF_DEBUG: print(f"[imf] {dataset}/{key} -> DBnomics ({len(ser3)} pts)")
@@ -352,9 +361,7 @@ def _fetch_weo_series(key: str, start_period: str = "2000") -> Dict[str, float]:
 
     # 1) DBnomics first (WEO:latest often works best)
     for ds in ["WEO:latest", "WEO", "WEO:2025-04", "WEO:2024-10", "WEO:2024-04", "WEO:2023-10"]:
-        url3 = f"{_DBNOMICS_BASE}/series/IMF/{ds}/{key}?observations=1&format=json"
-        data3 = _http_get_json(url3)
-        ser3 = _parse_dbnomics_series(data3 or {})
+        ser3 = _fetch_db_series(ds, key)
         if ser3:
             _cache.set(cache_key, ser3)
             if IMF_DEBUG: print(f"[weo] {ds}/{key} -> DBnomics ({len(ser3)} pts)")
@@ -391,18 +398,31 @@ def imf_cpi_yoy_monthly(iso2: str) -> Dict[str, float]:
     """
     CPI YoY % (monthly).
     Prefer the IMF CPI dataset. Try direct YoY (PCPI_YY) first; if absent, compute YoY from index (PCPI_IX).
-    Fall back to IFS if CPI dataset is missing.
+    We explicitly hit DBnomics first for robustness.
     """
     if IMF_DISABLE:
         return {}
     for area in _norm_iso2_for_ifs(iso2):
-        # Direct YoY
+        # 1) DBnomics CPI direct YoY
+        yoy = _fetch_db_series("CPI", f"M.{area}.PCPI_YY")
+        if yoy:
+            return yoy
+        # 2) DBnomics CPI index -> compute YoY
+        idx = _fetch_db_series("CPI", f"M.{area}.PCPI_IX")
+        if idx:
+            return _compute_yoy_from_level_monthly(idx)
+        # 3) DBnomics IFS as fallback
+        yoy = _fetch_db_series("IFS", f"M.{area}.PCPI_YY")
+        if yoy:
+            return yoy
+        idx = _fetch_db_series("IFS", f"M.{area}.PCPI_IX")
+        if idx:
+            return _compute_yoy_from_level_monthly(idx)
+        # 4) General fetcher (IMF ➜ SDMX Central)
         for ds in ("CPI", "IFS"):
             yoy = _fetch_imf_series(ds, f"M.{area}.PCPI_YY", start_period="2000")
             if yoy:
                 return yoy
-        # Compute YoY from index
-        for ds in ("CPI", "IFS"):
             idx = _fetch_imf_series(ds, f"M.{area}.PCPI_IX", start_period="2000")
             if idx:
                 return _compute_yoy_from_level_monthly(idx)
@@ -412,10 +432,18 @@ def imf_unemployment_rate_monthly(iso2: str) -> Dict[str, float]:
     """
     Unemployment rate (%), monthly.
     Prefer IMF Labor dataset (LP) where LUR/LUR_PT are hosted; fall back to IFS.
+    DBnomics-first to avoid IMF outages.
     """
     if IMF_DISABLE:
         return {}
     for area in _norm_iso2_for_ifs(iso2):
+        # DBnomics first
+        for ds in ("LP", "IFS"):
+            for ind in ("LUR_PT", "LUR"):
+                ser = _fetch_db_series(ds, f"M.{area}.{ind}")
+                if ser:
+                    return ser
+        # General fetcher as final fallback
         for ds in ("LP", "IFS"):
             for ind in ("LUR_PT", "LUR"):
                 ser = _fetch_imf_series(ds, f"M.{area}.{ind}", start_period="2000")
