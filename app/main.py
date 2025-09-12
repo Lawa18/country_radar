@@ -1,5 +1,7 @@
+# app/main.py
 import os
-from fastapi import FastAPI
+import time
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 
@@ -34,6 +36,16 @@ def root():
         "health": "/ping",
     }
 
+# Optional: tiny request logger to aid debugging connector calls
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    start = time.time()
+    resp = await call_next(request)
+    dur_ms = (time.time() - start) * 1000.0
+    ua = request.headers.get("user-agent", "-")
+    print(f"[req] {request.method} {request.url.path}?{request.query_params} ua={ua} -> {resp.status_code} {dur_ms:.1f}ms")
+    return resp
+
 # Inject server URL into OpenAPI so GPT Actions know where to call
 def custom_openapi():
     if app.openapi_schema:
@@ -41,6 +53,8 @@ def custom_openapi():
     schema = get_openapi(title=app.title, version=app.version, routes=app.routes)
     base = os.getenv("COUNTRY_RADAR_BASE_URL", "https://country-radar.onrender.com")
     schema["servers"] = [{"url": base}]
+    # Normalize to 3.1.1 for finicky clients
+    schema["openapi"] = "3.1.1"
     app.openapi_schema = schema
     return app.openapi_schema
 
