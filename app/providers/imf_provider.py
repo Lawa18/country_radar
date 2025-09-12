@@ -4,16 +4,10 @@ from __future__ import annotations
 """
 Robust IMF provider for Country Radar.
 
-Design goals
-------------
-- Prefer DBnomics mirror first (fast & reliable), then IMF CompactData, then SDMX Central.
-- Dataset-aware lookups (CPI, LP, IFS, WEO).
-- Compute YoY when a direct YoY series is missing (e.g., CPI: PCPI_IX -> YoY).
-- Small in-memory cache (TTL ~1 hour) to smooth Render cold starts.
-- Minimal external deps (httpx, pycountry).
+Order of operations for every series:
+DBnomics ➜ IMF CompactData (primary) ➜ SDMX Central (optional)
 
-Public functions used by the service
-------------------------------------
+Public functions:
 - imf_cpi_yoy_monthly(iso2)              -> { "YYYY-MM": float }
 - imf_unemployment_rate_monthly(iso2)    -> { "YYYY-MM": float }
 - imf_fx_usd_monthly(iso2)               -> { "YYYY-MM": float }
@@ -21,7 +15,7 @@ Public functions used by the service
 - imf_policy_rate_monthly(iso2)          -> { "YYYY-MM": float }
 - imf_gdp_growth_quarterly(iso2)         -> { "YYYY-Qn": float }
 - imf_weo_debt_to_gdp_annual(iso2)       -> { "YYYY": float }
-- imf_debt_to_gdp_annual(iso2)           -> alias of the above (back-compat)
+- imf_debt_to_gdp_annual(iso2)           -> alias of the WEO function
 """
 
 from typing import Dict, List, Tuple, Optional, Any
@@ -43,16 +37,13 @@ _SDMXCENTRAL_V21_BASE = "https://sdmxcentral.imf.org/ws/public/sdmxapi/rest"
 _SDMXCENTRAL_V3_BASE  = "https://sdmxcentral.imf.org/sdmx/v2"
 _DBNOMICS_BASE        = "https://api.db.nomics.world/v22"
 
-# HTTP behavior
-_DEFAULT_TIMEOUT = 6.0  # seconds
+# HTTP & cache
+_DEFAULT_TIMEOUT = 6.0
 _MAX_RETRIES = 1
-
-# Cache
-_CACHE_TTL = 3600  # seconds == 1 hour
-
+_CACHE_TTL = 3600  # 1 hour
 
 # ----------------------------
-# Small in-memory TTL cache
+# Tiny in-memory TTL cache
 # ----------------------------
 class _TTLCache:
     def __init__(self, ttl_seconds: int = _CACHE_TTL) -> None:
@@ -72,9 +63,7 @@ class _TTLCache:
     def set(self, key: str, value: Any) -> None:
         self._store[key] = (time.time() + self.ttl, value)
 
-
 _cache = _TTLCache()
-
 
 # ----------------------------
 # HTTP helpers
@@ -100,22 +89,16 @@ def _http_get_json(url: str, timeout: float = _DEFAULT_TIMEOUT) -> Optional[Dict
             time.sleep(0.2 * (attempt + 1))
     return None
 
-
 # ----------------------------
 # Utilities & parsing
 # ----------------------------
 def _norm_iso2_for_ifs(iso2: str) -> List[str]:
-    """
-    Return candidate ISO2 area codes to try for IMF datasets.
-    Handles common aliases: UK->GB, EL->GR.
-    """
     iso2 = (iso2 or "").upper()
     tries = [iso2]
     if iso2 == "UK":
         tries.append("GB")
-    if iso2 == "EL":
+    if iso2 == "EL":  # Eurostat alias for Greece
         tries.append("GR")
-    # dedupe while preserving order
     return list(dict.fromkeys(tries))
 
 def _iso2_to_iso3(iso2: str) -> Optional[str]:
@@ -185,18 +168,10 @@ def _compute_yoy_from_level_quarterly(level_series: Dict[str, float]) -> Dict[st
             out[t] = (v / v_prev - 1.0) * 100.0
     return out
 
-
 # ----------------------------
 # DBnomics parsing
 # ----------------------------
 def _normalize_period_key(p: Any) -> Optional[str]:
-    """
-    Normalize DBnomics period strings:
-    - 'YYYY-MM-DD' -> 'YYYY-MM'
-    - 'YYYYMmm'    -> 'YYYY-MM'
-    - 'YYYY-Qn' or 'YYYYQn' -> 'YYYY-Qn'
-    - 'YYYY' (annual) left as-is
-    """
     if p is None:
         return None
     s = str(p).strip()
@@ -219,12 +194,6 @@ def _normalize_period_key(p: Any) -> Optional[str]:
     return s
 
 def _parse_dbnomics_series(payload: Dict[str, Any]) -> Dict[str, float]:
-    """
-    Robust parser for DBnomics v22 `/series` responses:
-      - series.docs[0].period + .value (parallel arrays), or
-      - series.docs[0].observations = [{period, value}, ...], or
-      - series.docs[0].original_period + .value
-    """
     if not isinstance(payload, dict):
         return {}
 
@@ -275,13 +244,15 @@ def _parse_dbnomics_series(payload: Dict[str, Any]) -> Dict[str, float]:
     return out
 
 def _fetch_db_series(dataset: str, key: str) -> Dict[str, float]:
+    """
+    DBnomics direct fetch (full series). Returns {period -> float}.
+    """
     url = f"{_DBNOMICS_BASE}/series/IMF/{dataset}/{key}?observations=1&format=json"
     data = _http_get_json(url)
     ser = _parse_dbnomics_series(data or {})
     if IMF_DEBUG:
         print(f"[dbn] {dataset}/{key} -> {'HIT ' + str(len(ser)) if ser else 'EMPTY'}")
     return ser
-
 
 # ----------------------------
 # IMF CompactData parsing
@@ -310,15 +281,10 @@ def _parse_imf_compact(payload: Dict[str, Any]) -> Dict[str, float]:
             out[str(t)] = fv
     return out
 
-
 # ----------------------------
-# General IMF fetcher (DB → IMF → SDMX)
+# Generic fetchers (DB ➜ IMF ➜ SDMX)
 # ----------------------------
 def _fetch_imf_series(dataset: str, key: str, start_period: str = "2000") -> Dict[str, float]:
-    """
-    General-purpose fetcher for a dataset+key.
-    Order: DBnomics → IMF CompactData → SDMX Central (v2.1 then v3).
-    """
     if IMF_DISABLE:
         return {}
 
@@ -327,14 +293,14 @@ def _fetch_imf_series(dataset: str, key: str, start_period: str = "2000") -> Dic
     if hit is not None:
         return hit
 
-    # 1) DBnomics first (best availability)
+    # 1) DBnomics first
     ser3 = _fetch_db_series(dataset, key)
     if ser3:
         _cache.set(cache_key, ser3)
         if IMF_DEBUG: print(f"[imf] {dataset}/{key} -> DBnomics ({len(ser3)} pts)")
         return ser3
 
-    # 2) IMF CompactData (primary)
+    # 2) IMF CompactData
     url1 = f"{_IMF_COMPACT_BASE}/{dataset}/{key}?startPeriod={start_period}"
     data1 = _http_get_json(url1)
     ser1 = _parse_imf_compact(data1 or {})
@@ -343,7 +309,7 @@ def _fetch_imf_series(dataset: str, key: str, start_period: str = "2000") -> Dic
         if IMF_DEBUG: print(f"[imf] {dataset}/{key} -> IMF primary ({len(ser1)} pts)")
         return ser1
 
-    # 3) SDMX Central (optional)
+    # 3) SDMX Central
     if IMF_TRY_SDMXCENTRAL:
         url2a = f"{_SDMXCENTRAL_V21_BASE}/{dataset}/{key}?startPeriod={start_period}&format=sdmx-json"
         data2a = _http_get_json(url2a)
@@ -364,15 +330,7 @@ def _fetch_imf_series(dataset: str, key: str, start_period: str = "2000") -> Dic
     if IMF_DEBUG: print(f"[imf] {dataset}/{key} -> EMPTY")
     return {}
 
-
-# ----------------------------
-# WEO fetcher (annual; DB → IMF → SDMX)
-# ----------------------------
 def _fetch_weo_series(key: str, start_period: str = "2000") -> Dict[str, float]:
-    """
-    key pattern: "A.{ISO3}.{INDICATOR}"
-    e.g., "A.NGA.GGXWDG_NGDP"
-    """
     if IMF_DISABLE:
         return {}
 
@@ -381,7 +339,7 @@ def _fetch_weo_series(key: str, start_period: str = "2000") -> Dict[str, float]:
     if hit is not None:
         return hit
 
-    # 1) DBnomics first (latest snapshot is usually exposed)
+    # 1) DBnomics first (WEO:latest)
     for ds in ["WEO:latest", "WEO", "WEO:2025-04", "WEO:2024-10", "WEO:2024-04", "WEO:2023-10"]:
         ser3 = _fetch_db_series(ds, key)
         if ser3:
@@ -413,28 +371,24 @@ def _fetch_weo_series(key: str, start_period: str = "2000") -> Dict[str, float]:
     if IMF_DEBUG: print(f"[weo] {key} -> EMPTY")
     return {}
 
-
 # ----------------------------
 # Public provider functions
 # ----------------------------
 def imf_cpi_yoy_monthly(iso2: str) -> Dict[str, float]:
     """
     CPI YoY % (monthly).
-    Prefer IMF CPI dataset:
-      1) Direct YoY: PCPI_YY
-      2) Compute YoY from index: PCPI_IX
-    Fallback to IFS if CPI is missing.
-    DBnomics-first is used inside the fetchers.
+    Prefer CPI dataset (PCPI_YY). If missing, compute YoY from index (PCPI_IX).
+    Fallback to IFS.
     """
     if IMF_DISABLE:
         return {}
     for area in _norm_iso2_for_ifs(iso2):
-        # Try direct YoY first, CPI then IFS
+        # Direct YoY first
         for ds in ("CPI", "IFS"):
             yoy = _fetch_imf_series(ds, f"M.{area}.PCPI_YY", start_period="2000")
             if yoy:
                 return yoy
-        # Compute YoY from index, CPI then IFS
+        # Compute YoY from index
         for ds in ("CPI", "IFS"):
             idx = _fetch_imf_series(ds, f"M.{area}.PCPI_IX", start_period="2000")
             if idx:
@@ -444,10 +398,9 @@ def imf_cpi_yoy_monthly(iso2: str) -> Dict[str, float]:
 def imf_unemployment_rate_monthly(iso2: str) -> Dict[str, float]:
     """
     Unemployment rate (%), monthly.
-    Prefer IMF Labor dataset (LP), then fallback to IFS.
-    Codes:
-      - LUR_PT : Percent (preferred)
-      - LUR    : Level/index (rare; if present we still return raw values)
+    Prefer LP (Labor) dataset; fallback to IFS. Indicators:
+      - LUR_PT (percent)
+      - LUR    (index/level)
     """
     if IMF_DISABLE:
         return {}
@@ -461,8 +414,7 @@ def imf_unemployment_rate_monthly(iso2: str) -> Dict[str, float]:
 
 def imf_fx_usd_monthly(iso2: str) -> Dict[str, float]:
     """
-    LCU per USD, monthly.
-    Prefer end-of-period rate (ENDE_XDC_USD_RATE), fallback to period average (ENDA_XDC_USD_RATE).
+    LCU per USD, monthly. Prefer end-of-period (ENDE_XDC_USD_RATE) then average (ENDA_XDC_USD_RATE).
     """
     if IMF_DISABLE:
         return {}
@@ -490,7 +442,7 @@ def imf_reserves_usd_monthly(iso2: str) -> Dict[str, float]:
 def imf_policy_rate_monthly(iso2: str) -> Dict[str, float]:
     """
     Policy rate, % p.a. (FPOLM_PA), monthly.
-    Note: For euro area, your ECB provider should override this elsewhere.
+    (Note: For euro area, your ECB provider should override downstream.)
     """
     if IMF_DISABLE:
         return {}
@@ -502,9 +454,8 @@ def imf_policy_rate_monthly(iso2: str) -> Dict[str, float]:
 
 def imf_gdp_growth_quarterly(iso2: str) -> Dict[str, float]:
     """
-    Real GDP YoY % (quarterly). We compute YoY from levels:
-      - Prefer SA series: NGDP_R_SA_XDC
-      - Fallback to non-SA: NGDP_R_XDC
+    Real GDP YoY % (quarterly), computed from levels:
+    Prefer SA series: NGDP_R_SA_XDC, fallback NGDP_R_XDC.
     """
     if IMF_DISABLE:
         return {}
@@ -519,7 +470,7 @@ _WEO_DEBT_INDICATORS: List[str] = ["GGXWDG_NGDP"]  # General Gov. Gross Debt (% 
 
 def imf_weo_debt_to_gdp_annual(iso2: str) -> Dict[str, float]:
     """
-    IMF WEO: General government gross debt (% of GDP), annual.
+    IMF WEO: General Government Gross Debt (% of GDP), annual.
     """
     if IMF_DISABLE:
         return {}
@@ -530,15 +481,13 @@ def imf_weo_debt_to_gdp_annual(iso2: str) -> Dict[str, float]:
         key = f"A.{iso3}.{ind}"
         ser = _fetch_weo_series(key, start_period="2000")
         if ser:
-            # keep only annual keys
             return {k: v for k, v in ser.items() if isinstance(k, str) and len(k) == 4 and k.isdigit()}
     return {}
 
 # Back-compat alias
 imf_debt_to_gdp_annual = imf_weo_debt_to_gdp_annual
 
-
-# Explicit export list (helps avoid drift and lets you sanity-check imports)
+# Explicit export list
 __all__ = [
     "imf_cpi_yoy_monthly",
     "imf_unemployment_rate_monthly",
