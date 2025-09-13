@@ -42,11 +42,15 @@ def root():
 # Optional: tiny request logger to aid debugging connector calls
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
+    path = request.url.path
+    ua = request.headers.get("user-agent", "")
+    skip = path == "/ping" or ua.startswith("Render/")  # skip health checks
+
     start = time.time()
     resp = await call_next(request)
-    dur_ms = (time.time() - start) * 1000.0
-    ua = request.headers.get("user-agent", "-")
-    print(f"[req] {request.method} {request.url.path}?{request.query_params} ua={ua} -> {resp.status_code} {dur_ms:.1f}ms")
+    if not skip:
+        dur_ms = (time.time() - start) * 1000.0
+        print(f"[req] {request.method} {path}?{request.query_params} ua={ua} -> {resp.status_code} {dur_ms:.1f}ms")
     return resp
 
 # Inject server URL into OpenAPI so GPT Actions know where to call
