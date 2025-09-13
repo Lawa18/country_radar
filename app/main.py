@@ -7,6 +7,9 @@ from fastapi.openapi.utils import get_openapi
 
 from app.routes import country, debt
 
+from starlette.middleware.gzip import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
 app = FastAPI(title="Country Radar API", version="1.0.0")
 
 # CORS: keep permissive while testing; lock down later.
