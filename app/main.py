@@ -1,18 +1,26 @@
 # app/main.py
+from __future__ import annotations
+
 import os
 import time
 from typing import Any, Dict
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from starlette.middleware.gzip import GZipMiddleware
 
+# Routers
 from app.routes import country, debt
 
-app = FastAPI(title="Country Radar API", version="1.0.4", openapi_url="/openapi.json")
+APP_TITLE = "Country Radar API"
+APP_VERSION = "1.0.4"
 
-# CORS (permissive while testing)
+app = FastAPI(title=APP_TITLE, version=APP_VERSION, openapi_url="/openapi.json")
+
+# --- Middleware ---
+
+# CORS (permissive while testing; tighten for prod if needed)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,10 +28,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# GZip to shrink responses
+# GZip to shrink JSON responses
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# Routers
+# Quiet health-check noise in logs
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    path = request.url.path
+    ua = request.headers.get("user-agent", "")
+    # Silence Render health checks and explicit /ping
+    skip = path == "/ping" or ua.startswith("Render/")
+    start = time.time()
+    resp: Response = await call_next(request)
+    if not skip:
+        dur_ms = (time.time() - start) * 1000.0
+        print(f"[req] {request.method} {path}?{request.query_params} ua={ua} -> {resp.status_code} {dur_ms:.1f}ms")
+    return resp
+
+# --- Routes ---
+
 app.include_router(country.router, tags=["country"])
 app.include_router(debt.router, tags=["debt"])
 
@@ -33,34 +56,23 @@ def ping():
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "country-radar", "docs": "/docs", "openapi": "/openapi.json", "health": "/ping"}
+    return {
+        "ok": True,
+        "service": "country-radar",
+        "docs": "/docs",
+        "openapi": "/openapi.json",
+        "health": "/ping",
+    }
 
-# Quiet health-check noise in logs
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    path = request.url.path
-    ua = request.headers.get("user-agent", "")
-    skip = path == "/ping" or ua.startswith("Render/")
-    start = time.time()
-    resp = await call_next(request)
-    if not skip:
-        dur_ms = (time.time() - start) * 1000.0
-        print(f"[req] {request.method} {path}?{request.query_params} ua={ua} -> {resp.status_code} {dur_ms:.1f}ms")
-    return resp
+# --- OpenAPI sanitizer (to satisfy strict validators & GPT Actions) ---
 
-def _sanitize_openapi_for_actions(schema: Dict[str, Any]) -> Dict[str, Any]:
-    # Ensure servers
-    base = os.getenv("COUNTRY_RADAR_BASE_URL", "https://country-radar.onrender.com")
-    schema.setdefault("servers", [{"url": base, "description": "Production"}])
-    # Remove HEAD for /country-data if present
-    paths = schema.get("paths") or {}
-    cd = paths.get("/country-data") or {}
-    if "head" in cd:
-        cd.pop("head", None)
-        paths["/country-data"] = cd
-    # Fix parameter schemas: strip invalid schema.examples objects
-    for _path, item in (paths or {}).items():
-        for _method, op in (item or {}).items():
+def _fix_parameter_schemas(spec: Dict[str, Any]) -> None:
+    """Strip illegal schema.examples maps and ensure schemas exist for params."""
+    paths = spec.get("paths") or {}
+    for _p, item in paths.items():
+        if not isinstance(item, dict):
+            continue
+        for _m, op in item.items():
             if not isinstance(op, dict):
                 continue
             params = op.get("parameters")
@@ -68,23 +80,73 @@ def _sanitize_openapi_for_actions(schema: Dict[str, Any]) -> Dict[str, Any]:
                 continue
             for p in params:
                 sch = p.get("schema")
-                # If FastAPI embedded a dict of examples inside the schema, remove it (or move to parameter-level)
                 if isinstance(sch, dict) and isinstance(sch.get("examples"), dict):
-                    # safest: drop it
                     sch.pop("examples", None)
-                # Guarantee a simple schema exists for query params
                 if sch is None:
                     p["schema"] = {"type": "string"}
+
+def _force_response_schema_object(spec: Dict[str, Any], path: str, method: str = "get") -> None:
+    """
+    Force responses[200].content['application/json'].schema to be a simple object with 'properties': {}.
+    This directly addresses errors like:
+      ('paths', '/country-data', '200', 'response', 'content', 'application/json', 'schema'), object schema missing properties
+    """
+    paths = spec.get("paths") or {}
+    op = (paths.get(path) or {}).get(method.lower())
+    if not isinstance(op, dict):
+        return
+    responses = op.get("responses") or {}
+    resp_200 = responses.get("200")
+    if not isinstance(resp_200, dict):
+        return
+    content = (resp_200.get("content") or {}).get("application/json")
+    if not isinstance(content, dict):
+        return
+    # Overwrite with a validator-friendly minimal object schema
+    content["schema"] = {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": True,
+        "title": f"Response {path} {method.upper()}",
+    }
+
+def _sanitize_openapi_for_actions(spec: Dict[str, Any]) -> Dict[str, Any]:
+    # Servers
+    base = os.getenv("COUNTRY_RADAR_BASE_URL", "https://country-radar.onrender.com")
+    spec.setdefault("servers", [{"url": base, "description": "Production"}])
+
+    # Remove HEAD /country-data from spec if present (we keep the runtime endpoint hidden in the router)
+    paths = spec.get("paths") or {}
+    cd = paths.get("/country-data")
+    if isinstance(cd, dict) and "head" in cd:
+        cd.pop("head", None)
+
+    # Parameter schema fixes
+    _fix_parameter_schemas(spec)
+
+    # Force a minimal, valid object schema at the exact nodes validators inspect
+    _force_response_schema_object(spec, "/country-data", "get")
+    _force_response_schema_object(spec, "/v1/debt", "get")
+    _force_response_schema_object(spec, "/ping", "get")
+    _force_response_schema_object(spec, "/", "get")
+
     # Normalize spec version
-    schema["openapi"] = "3.1.1"
-    return schema
+    spec["openapi"] = "3.1.1"
+    return spec
 
 def custom_openapi():
-    if app.openapi_schema:
-        return app.openapi_schema
-    schema = get_openapi(title=app.title, version=app.version, routes=app.routes, description="Macroeconomic data API")
-    schema = _sanitize_openapi_for_actions(schema)
-    app.openapi_schema = schema
-    return app.openapi_schema
+    # Regenerate on each call during iteration to avoid stale cache;
+    # if you prefer caching, uncomment the 3 lines below.
+    # if app.openapi_schema:
+    #     return app.openapi_schema
+    raw = get_openapi(
+        title=app.title,
+        version=app.version,
+        routes=app.routes,
+        description="Macroeconomic data API",
+    )
+    spec = _sanitize_openapi_for_actions(raw)
+    # app.openapi_schema = spec
+    return spec
 
 app.openapi = custom_openapi
