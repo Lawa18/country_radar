@@ -11,10 +11,25 @@ from app.services.indicator_service import build_country_payload
 router = APIRouter(tags=["country"])
 
 class SeriesMode(str, Enum):
-    none = "none"  # only latest fields, no series
-    mini = "mini"  # keep last N per source (default)
-    full = "full"  # keep everything as returned by the service
+    none = "none"
+    mini = "mini"
+    full = "full"
 
+@router.get("/country-data", summary="Country macro indicators bundle",
+            response_description="Compact bundle of macro indicators for a given country.")
+def country_data(
+    country: str = Query(..., min_length=2, description=(
+        "Full country name (e.g., 'Germany', 'United States', 'Sweden'). "
+        "Common aliases are accepted (e.g., 'USA')."
+    )),
+    series: SeriesMode = Query(  # DEFAULT -> none  ✅
+        default=SeriesMode.none,
+        description="How much time series to include: 'none' (only latest), 'mini' (last N), or 'full' (all).",
+    ),
+    keep: int = Query(default=36, ge=1, le=240,
+                      description="If series='mini', keep this many most-recent observations per series."),
+) -> Dict[str, Any]:
+    
 def _parse_period_key(k: str) -> Tuple[int, int, int]:
     """
     Normalize period keys so we can sort generically:
