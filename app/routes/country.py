@@ -1,27 +1,27 @@
 # app/routes/country.py
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple, List
+from typing import Any, Dict, Tuple
 from enum import Enum
-from fastapi import APIRouter, Query, Response, HTTPException
+from copy import deepcopy
 
+from fastapi import APIRouter, Query, Response, HTTPException
 from app.services.indicator_service import build_country_payload
 
 router = APIRouter(tags=["country"])
 
 class SeriesMode(str, Enum):
-    none = "none"
-    mini = "mini"
-    full = "full"
+    none = "none"  # only latest fields, no series
+    mini = "mini"  # keep last N per source (default)
+    full = "full"  # keep everything as returned by the service
 
 def _parse_period_key(k: str) -> Tuple[int, int, int]:
     """
     Normalize period keys so we can sort generically:
-      - 'YYYY-MM' -> (YYYY, MM, 0)
-      - 'YYYYMmm' -> (YYYY, MM, 0)
-      - 'YYYY-Qn' or 'YYYYQn' -> (YYYY, 10+n, 0)  (quarters sort after months)
-      - 'YYYY' -> (YYYY, 0, 0)
-      - fallback: place at beginning
+      - 'YYYY-MM'    -> (YYYY, MM, 0)
+      - 'YYYYMmm'    -> (YYYY, MM, 0)
+      - 'YYYY-Qn' or 'YYYYQn' -> (YYYY, 10+n, 0)  (quarters after months)
+      - 'YYYY'       -> (YYYY, 0, 0)
     """
     try:
         s = (k or "").strip().upper()
@@ -30,7 +30,7 @@ def _parse_period_key(k: str) -> Tuple[int, int, int]:
             y = int(s[:4]); m = int(s[5:7]); return (y, m, 0)
         # YYYYMmm
         if len(s) == 6 and s[4] == "M":
-            y = int(s[:4]); m = int(s[5:6] + s[6:]); return (y, m, 0)
+            y = int(s[:4]); m = int(s[5:7]); return (y, m, 0)
         # YYYY-Qn / YYYYQn
         if "Q" in s:
             if "-" in s:
@@ -41,7 +41,7 @@ def _parse_period_key(k: str) -> Tuple[int, int, int]:
         # YYYY
         if len(s) == 4 and s.isdigit():
             return (int(s), 0, 0)
-        # best-effort: try to pull year and month numbers
+        # best-effort: pull digits
         digits = [int(x) for x in "".join(ch if ch.isdigit() else " " for ch in s).split()]
         if len(digits) >= 2:
             y, m = digits[0], digits[1]
@@ -55,7 +55,7 @@ def _parse_period_key(k: str) -> Tuple[int, int, int]:
 def _shrink_series_map(series_by_source: Dict[str, Dict[str, Any]], keep: int) -> Dict[str, Dict[str, Any]]:
     """
     Given {"IMF": {period->value}, "Eurostat": {...}}, keep the last N points per source.
-    Works for monthly, quarterly, or annual period keys.
+    Works for monthly, quarterly, or annual keys.
     """
     out: Dict[str, Dict[str, Any]] = {}
     for src, ser in (series_by_source or {}).items():
@@ -87,7 +87,7 @@ def country_data(
     ),
     series: SeriesMode = Query(
         default=SeriesMode.mini,
-        description="How much time series to include: 'none' (only latest), 'mini' (last N points), or 'full' (all).",
+        description="How much time series to include: 'none' (only latest), 'mini' (last N), or 'full' (all).",
     ),
     keep: int = Query(
         default=36, ge=1, le=240,
@@ -98,6 +98,8 @@ def country_data(
     Returns CPI (YoY), unemployment, FX vs USD, reserves (USD), policy rate, GDP growth,
     CAB %GDP, government effectiveness, and the debt block. IMF/Eurostat monthly win
     over WB; ECB overrides policy for euro area. Use 'series' and 'keep' to control payload size.
+
+    IMPORTANT: We deep-copy the payload before trimming so we don't mutate the service cache.
     """
     name = country.strip()
     if not name:
@@ -107,21 +109,26 @@ def country_data(
     if isinstance(payload, dict) and payload.get("error"):
         raise HTTPException(status_code=400, detail=str(payload["error"]))
 
-    # Optionally shrink series to make responses connector-friendly
-    if series != SeriesMode.full and isinstance(payload, dict):
-        inds = payload.get("indicators") or {}
+    if series == SeriesMode.full:
+        # Return the service payload as-is (do NOT mutate it)
+        return payload
+
+    # Work on a deep copy so we don't modify the cached object in indicator_service
+    resp = deepcopy(payload)
+
+    if isinstance(resp, dict):
+        inds = resp.get("indicators") or {}
         for key, block in list(inds.items()):
             if not isinstance(block, dict):
                 continue
             if series == SeriesMode.none:
                 block["series"] = {}
             else:
-                # mini: keep last N per source
                 ser_map = block.get("series") or {}
                 block["series"] = _shrink_series_map(ser_map, keep)
 
-        # Debt series as well (if present)
-        debt = payload.get("debt")
+        # Debt series too
+        debt = resp.get("debt")
         if isinstance(debt, dict):
             ser_map = debt.get("series")
             if isinstance(ser_map, dict):
@@ -130,7 +137,7 @@ def country_data(
                 else:
                     debt["series"] = _shrink_series_map({"debt": ser_map}, keep).get("debt", {})
 
-    return payload
+    return resp
 
 # Keep HEAD for warmups, but hide from OpenAPI to avoid connector confusion
 @router.head(
