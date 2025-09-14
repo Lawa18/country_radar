@@ -72,3 +72,48 @@ def fetch_worldbank_data(iso2: str, iso3: str) -> Dict[str, Optional[List[Dict[s
     for code in WB_CODES:
         out[code] = fetch_wb_indicator_raw(iso3, code)
     return out
+
+
+# --- World Bank indicator wrappers expected by indicator_service ----------------
+# These thin wrappers fetch a single WB series and return a {year:int -> value:float}.
+
+# Codes used (confirmed present in this wb_provider):
+# FP.CPI.TOTL.ZG         -> Inflation, consumer prices (annual %)
+# SL.UEM.TOTL.ZS         -> Unemployment, total (% of total labor force)
+# PA.NUS.FCRF            -> Official exchange rate (LCU per USD, period average)
+# FI.RES.TOTL.CD         -> Total reserves (current US$)
+# NY.GDP.MKTP.KD.ZG      -> GDP growth (annual %)
+# BN.CAB.XOKA.GD.ZS      -> Current account balance (% of GDP)
+# GE.EST                 -> Government Effectiveness (WGI index)
+
+from typing import Optional, Dict
+
+def _wb_year_dict(iso3: str, code: str) -> Optional[Dict[int, float]]:
+    """
+    Fetch a single World Bank indicator for iso3 and convert to {year:int -> value:float}.
+    Returns None if no data.
+    """
+    raw = fetch_wb_indicator_raw(iso3, code)
+    return wb_year_dict_from_raw(raw)
+
+def wb_cpi_yoy_annual(iso3: str) -> Optional[Dict[int, float]]:
+    return _wb_year_dict(iso3, "FP.CPI.TOTL.ZG")
+
+def wb_unemployment_rate_annual(iso3: str) -> Optional[Dict[int, float]]:
+    return _wb_year_dict(iso3, "SL.UEM.TOTL.ZS")
+
+def wb_fx_rate_usd_annual(iso3: str) -> Optional[Dict[int, float]]:
+    return _wb_year_dict(iso3, "PA.NUS.FCRF")
+
+def wb_reserves_usd_annual(iso3: str) -> Optional[Dict[int, float]]:
+    return _wb_year_dict(iso3, "FI.RES.TOTL.CD")
+
+def wb_gdp_growth_annual_pct(iso3: str) -> Optional[Dict[int, float]]:
+    return _wb_year_dict(iso3, "NY.GDP.MKTP.KD.ZG")
+
+def wb_current_account_balance_pct_gdp_annual(iso3: str) -> Optional[Dict[int, float]]:
+    return _wb_year_dict(iso3, "BN.CAB.XOKA.GD.ZS")
+
+def wb_government_effectiveness_annual(iso3: str) -> Optional[Dict[int, float]]:
+    return _wb_year_dict(iso3, "GE.EST")
+# -------------------------------------------------------------------------------
