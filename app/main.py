@@ -10,8 +10,16 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from starlette.middleware.gzip import GZipMiddleware
 
-# Routers
+# Routers (existing)
 from app.routes import country, debt
+
+# NEW: small, latest-only endpoint (tiny payload for Actions)
+# Make sure you have app/routes/country_lite.py as provided earlier.
+from app.routes import country_lite  # noqa: F401
+
+# NEW: zero-friction probe endpoint for connector reachability
+# Make sure you have app/routes/action_probe.py as provided earlier.
+from app.routes import action_probe  # noqa: F401
 
 APP_TITLE = "Country Radar API"
 APP_VERSION = "1.0.4"
@@ -31,7 +39,7 @@ app.add_middleware(
 # GZip to shrink JSON responses
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-# Quiet health-check noise in logs
+# Quiet health-check noise in logs, with lightweight tracing for key endpoints
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     path = request.url.path
@@ -40,6 +48,15 @@ async def log_requests(request: Request, call_next):
     skip = path == "/ping" or ua.startswith("Render/")
     start = time.time()
     resp: Response = await call_next(request)
+
+    # Trace the endpoints relevant to Actions to prove requests are landing
+    if path.startswith("/__action_probe") or path.startswith("/v1/country-lite") or path.startswith("/country-data"):
+        try:
+            ip = request.client.host if request.client else "-"
+        except Exception:
+            ip = "-"
+        print(f"[trace] {request.method} {path}?{request.query_params} ua={ua} ip={ip} -> {resp.status_code}")
+
     if not skip:
         dur_ms = (time.time() - start) * 1000.0
         print(f"[req] {request.method} {path}?{request.query_params} ua={ua} -> {resp.status_code} {dur_ms:.1f}ms")
@@ -47,8 +64,13 @@ async def log_requests(request: Request, call_next):
 
 # --- Routes ---
 
+# Existing routers
 app.include_router(country.router, tags=["country"])
 app.include_router(debt.router, tags=["debt"])
+
+# NEW: include the lite and probe routers (files must exist as separate modules)
+app.include_router(country_lite.router, tags=["country"])
+app.include_router(action_probe.router, tags=["country"])
 
 @app.get("/ping")
 def ping():
@@ -115,7 +137,7 @@ def _sanitize_openapi_for_actions(spec: Dict[str, Any]) -> Dict[str, Any]:
     base = os.getenv("COUNTRY_RADAR_BASE_URL", "https://country-radar.onrender.com")
     spec.setdefault("servers", [{"url": base, "description": "Production"}])
 
-    # Remove HEAD /country-data from spec if present (we keep the runtime endpoint hidden in the router)
+    # Remove HEAD /country-data from spec if present (keep runtime endpoint hidden in router)
     paths = spec.get("paths") or {}
     cd = paths.get("/country-data")
     if isinstance(cd, dict) and "head" in cd:
@@ -130,13 +152,17 @@ def _sanitize_openapi_for_actions(spec: Dict[str, Any]) -> Dict[str, Any]:
     _force_response_schema_object(spec, "/ping", "get")
     _force_response_schema_object(spec, "/", "get")
 
+    # NEW: ensure the two added endpoints also have object schemas
+    _force_response_schema_object(spec, "/v1/country-lite", "get")
+    _force_response_schema_object(spec, "/__action_probe", "get")
+
     # Normalize spec version
     spec["openapi"] = "3.1.1"
     return spec
 
 def custom_openapi():
     # Regenerate on each call during iteration to avoid stale cache;
-    # if you prefer caching, uncomment the 3 lines below.
+    # if you prefer caching later, uncomment the 3 lines below.
     # if app.openapi_schema:
     #     return app.openapi_schema
     raw = get_openapi(
