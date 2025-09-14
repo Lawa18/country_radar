@@ -10,16 +10,23 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from starlette.middleware.gzip import GZipMiddleware
 
-# Routers (existing)
+# Existing routers
 from app.routes import country, debt
 
-# NEW: small, latest-only endpoint (tiny payload for Actions)
-# Make sure you have app/routes/country_lite.py as provided earlier.
-from app.routes import country_lite  # noqa: F401
+# Optional routers (guarded so the app still boots if files are missing)
+HAVE_COUNTRY_LITE = False
+HAVE_ACTION_PROBE = False
+try:
+    from app.routes import country_lite  # type: ignore
+    HAVE_COUNTRY_LITE = True
+except Exception:
+    pass
 
-# NEW: zero-friction probe endpoint for connector reachability
-# Make sure you have app/routes/action_probe.py as provided earlier.
-from app.routes import action_probe  # noqa: F401
+try:
+    from app.routes import action_probe  # type: ignore
+    HAVE_ACTION_PROBE = True
+except Exception:
+    pass
 
 APP_TITLE = "Country Radar API"
 APP_VERSION = "1.0.4"
@@ -49,7 +56,7 @@ async def log_requests(request: Request, call_next):
     start = time.time()
     resp: Response = await call_next(request)
 
-    # Trace the endpoints relevant to Actions to prove requests are landing
+    # Trace endpoints relevant to Actions to prove requests are landing
     if path.startswith("/__action_probe") or path.startswith("/v1/country-lite") or path.startswith("/country-data"):
         try:
             ip = request.client.host if request.client else "-"
@@ -68,9 +75,16 @@ async def log_requests(request: Request, call_next):
 app.include_router(country.router, tags=["country"])
 app.include_router(debt.router, tags=["debt"])
 
-# NEW: include the lite and probe routers (files must exist as separate modules)
-app.include_router(country_lite.router, tags=["country"])
-app.include_router(action_probe.router, tags=["country"])
+# Optional: include the lite and probe routers if available
+if HAVE_COUNTRY_LITE:
+    app.include_router(country_lite.router, tags=["country"])  # type: ignore
+else:
+    print("[init] country_lite router not found; skipping /v1/country-lite")
+
+if HAVE_ACTION_PROBE:
+    app.include_router(action_probe.router, tags=["country"])  # type: ignore
+else:
+    print("[init] action_probe router not found; skipping /__action_probe")
 
 @app.get("/ping")
 def ping():
@@ -110,8 +124,6 @@ def _fix_parameter_schemas(spec: Dict[str, Any]) -> None:
 def _force_response_schema_object(spec: Dict[str, Any], path: str, method: str = "get") -> None:
     """
     Force responses[200].content['application/json'].schema to be a simple object with 'properties': {}.
-    This directly addresses errors like:
-      ('paths', '/country-data', '200', 'response', 'content', 'application/json', 'schema'), object schema missing properties
     """
     paths = spec.get("paths") or {}
     op = (paths.get(path) or {}).get(method.lower())
@@ -137,7 +149,7 @@ def _sanitize_openapi_for_actions(spec: Dict[str, Any]) -> Dict[str, Any]:
     base = os.getenv("COUNTRY_RADAR_BASE_URL", "https://country-radar.onrender.com")
     spec.setdefault("servers", [{"url": base, "description": "Production"}])
 
-    # Remove HEAD /country-data from spec if present (keep runtime endpoint hidden in router)
+    # Remove HEAD /country-data from spec if present
     paths = spec.get("paths") or {}
     cd = paths.get("/country-data")
     if isinstance(cd, dict) and "head" in cd:
@@ -152,19 +164,18 @@ def _sanitize_openapi_for_actions(spec: Dict[str, Any]) -> Dict[str, Any]:
     _force_response_schema_object(spec, "/ping", "get")
     _force_response_schema_object(spec, "/", "get")
 
-    # NEW: ensure the two added endpoints also have object schemas
-    _force_response_schema_object(spec, "/v1/country-lite", "get")
-    _force_response_schema_object(spec, "/__action_probe", "get")
+    # Only force schemas for optional endpoints if they are actually mounted
+    if HAVE_COUNTRY_LITE:
+        _force_response_schema_object(spec, "/v1/country-lite", "get")
+    if HAVE_ACTION_PROBE:
+        _force_response_schema_object(spec, "/__action_probe", "get")
 
     # Normalize spec version
     spec["openapi"] = "3.1.1"
     return spec
 
 def custom_openapi():
-    # Regenerate on each call during iteration to avoid stale cache;
-    # if you prefer caching later, uncomment the 3 lines below.
-    # if app.openapi_schema:
-    #     return app.openapi_schema
+    # Regenerate each call while iterating (avoid stale cache).
     raw = get_openapi(
         title=app.title,
         version=app.version,
@@ -172,7 +183,6 @@ def custom_openapi():
         description="Macroeconomic data API",
     )
     spec = _sanitize_openapi_for_actions(raw)
-    # app.openapi_schema = spec
     return spec
 
 app.openapi = custom_openapi
