@@ -13,8 +13,6 @@ from starlette.middleware.gzip import GZipMiddleware
 # Existing routers
 from app.routes import country, debt
 from app.routes import probe as probe_routes
-app.include_router(probe_routes.router)
-
 
 # Optional routers (guarded so the app still boots if files are missing)
 HAVE_COUNTRY_LITE = False
