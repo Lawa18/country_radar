@@ -401,6 +401,14 @@ def _assemble_debt_block(country: str, iso2: str) -> Dict[str, Any]:
     # Normalize
     latest = raw.get("latest") if isinstance(raw.get("latest"), dict) else {}
     latest_period = raw.get("latest_period") or latest.get("period")
+    # Fallbacks for period: prefer explicit 'year', else infer from series keys
+    if not latest_period:
+        latest_period = latest.get("year")
+    if not latest_period and isinstance(series, dict) and series:
+        try:
+            latest_period = max(series.keys())  # years are strings
+        except Exception:
+            latest_period = None
     latest_value  = raw.get("latest_value")  if raw.get("latest_value") is not None else latest.get("value")
     source        = raw.get("source")        or latest.get("source") or "N/A"
     series        = raw.get("series")        or {}
