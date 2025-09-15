@@ -12,6 +12,9 @@ from starlette.middleware.gzip import GZipMiddleware
 
 # Existing routers
 from app.routes import country, debt
+from app.routes import probe as probe_routes
+app.include_router(probe_routes.router)
+
 
 # Optional routers (guarded so the app still boots if files are missing)
 HAVE_COUNTRY_LITE = False
@@ -74,6 +77,7 @@ async def log_requests(request: Request, call_next):
 # Existing routers
 app.include_router(country.router, tags=["country"])
 app.include_router(debt.router, tags=["debt"])
+app.include_router(probe_routes.router)
 
 # Optional: include the lite and probe routers if available
 if HAVE_COUNTRY_LITE:
