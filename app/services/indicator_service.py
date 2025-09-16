@@ -110,25 +110,19 @@ def _choose_monthly_then_annual(
     """
     all_series: Dict[str, Dict[str, Any]] = {}
     # Keep first non-empty
+    # Keep first non-empty monthly-looking series
     for src, ser in candidates:
         if ser:
             all_series[src] = ser
             latest = _latest_from_series(ser)
             if latest:
                 lp, lv = latest
+                # Enforce monthly-looking keys (YYYY-MM)
+                if not _looks_monthly_key(lp):
+                    continue
                 return src, lp, lv, all_series
 
-        # Require monthly-looking keys (YYYY-MM) for monthly candidates
-    def _looks_monthly_key(k: str) -> bool:
-        return isinstance(k, str) and len(k) == 7 and k[4] == "-" and k[:4].isdigit() and k[5:7].isdigit()
-
-    # Peek latest key; if it doesn't look monthly, skip this candidate
-    _latest = _latest_from_series(ser)
-    if _latest:
-        lp, _ = _latest
-        if not _looks_monthly_key(lp):
-            # Not a monthly series after all; try next candidate
-            continue
+    # Nothing available
 
     # Nothing available
     for src, ser in candidates:
