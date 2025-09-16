@@ -117,6 +117,19 @@ def _choose_monthly_then_annual(
             if latest:
                 lp, lv = latest
                 return src, lp, lv, all_series
+
+        # Require monthly-looking keys (YYYY-MM) for monthly candidates
+    def _looks_monthly_key(k: str) -> bool:
+        return isinstance(k, str) and len(k) == 7 and k[4] == "-" and k[:4].isdigit() and k[5:7].isdigit()
+
+    # Peek latest key; if it doesn't look monthly, skip this candidate
+    _latest = _latest_from_series(ser)
+    if _latest:
+        lp, _ = _latest
+        if not _looks_monthly_key(lp):
+            # Not a monthly series after all; try next candidate
+            continue
+
     # Nothing available
     for src, ser in candidates:
         if ser:
@@ -318,19 +331,41 @@ def _assemble_policy_rate(iso2: str) -> Dict[str, Any]:
     Policy rate: ECB MRO monthly for euro area (override) → IMF monthly.
     No WB fallback by design.
     """
+    ecb_ser: Dict[str, float] = {}
+    imf_ser: Dict[str, float] = {}
+
+    # 1) ECB override for euro area
     if iso2 in EURO_AREA_ISO2:
-        ecb_ser = ecb_policy_rate_for_country(iso2) or {}
-        latest = _latest_from_series(ecb_ser)
+        try:
+            # expects monthly series keyed like "YYYY-MM"
+            ecb_ser = ecb_policy_rate_for_country(iso2) or {}
+        except Exception:
+            ecb_ser = {}
+        if ecb_ser:
+            latest = _latest_from_series(ecb_ser)
+            if latest:
+                lp, lv = latest
+                return _build_indicator_block("ECB", lp, lv, {"ECB": ecb_ser})
+        # If ECB empty or failed, fall through to IMF
+
+    # 2) IMF monthly (all countries, incl. euro area as fallback)
+    try:
+        imf_ser = imf_policy_rate_monthly(iso2) or {}
+    except Exception:
+        imf_ser = {}
+    if imf_ser:
+        latest = _latest_from_series(imf_ser)
         if latest:
             lp, lv = latest
-            return _build_indicator_block("ECB", lp, lv, {"ECB": ecb_ser})
-        # if ECB empty, still try IMF before giving up
-    imf_ser = imf_policy_rate_monthly(iso2) or {}
-    latest = _latest_from_series(imf_ser)
-    if latest:
-        lp, lv = latest
-        return _build_indicator_block("IMF", lp, lv, {"IMF": imf_ser})
-    return _build_indicator_block(None, None, None, {"IMF": imf_ser} if imf_ser else {})
+            return _build_indicator_block("IMF", lp, lv, {"IMF": imf_ser})
+
+    # 3) Nothing available
+    series_map: Dict[str, Dict[str, float]] = {}
+    if ecb_ser:
+        series_map["ECB"] = ecb_ser
+    if imf_ser:
+        series_map["IMF"] = imf_ser
+    return _build_indicator_block(None, None, None, series_map)
 
 def _assemble_gdp_growth(iso2: str, iso3: str) -> Dict[str, Any]:
     """
