@@ -99,42 +99,62 @@ def _latest_from_series(series: Dict[str, Any]) -> Optional[Tuple[str, float]]:
     items.sort(key=lambda kv: _parse_period_key(kv[0]))  # ascending
     return items[-1]
 
-def _choose_monthly_then_annual(
-    candidates: List[Tuple[str, Dict[str, Any]]],
-    annual_fallback: Optional[Tuple[str, Dict[str, Any]]] = None,
-) -> Tuple[Optional[str], Optional[str], Optional[float], Dict[str, Dict[str, Any]]]:
+def _choose_monthly_then_annual(monthly_candidates, annual_fallback) -> tuple:
     """
-    Given a list of (source_name, series_dict) monthly candidates, return the first non-empty one.
-    If all monthly are empty, use annual_fallback if provided.
-    Returns: (source, latest_period, latest_value, all_series_by_source)
+    Pick the first usable monthly series, otherwise fall back to annual.
+    Robust to either:
+      - dict: {"IMF": {...}, "Eurostat": {...}}
+      - list/tuple: [("IMF", {...}), ("Eurostat", {...})]
+    Returns (source_str, latest_period_str, latest_value_float, all_series_map)
     """
-    all_series: Dict[str, Dict[str, Any]] = {}
-    # Keep first non-empty
+    # Helper: monthly-looking key "YYYY-MM"
+    def _looks_monthly_key(k: str) -> bool:
+        return isinstance(k, str) and len(k) == 7 and k[4] == "-" and k[:4].isdigit() and k[5:7].isdigit()
+
+    # Normalize candidates to a list of (src, ser)
+    norm: list[tuple[str, dict]] = []
+    if isinstance(monthly_candidates, dict):
+        # preserve the caller's ordering if it's an OrderedDict; plain dict order is insertion order in 3.7+
+        for src, ser in monthly_candidates.items():
+            norm.append((src, ser or {}))
+    else:
+        # assume iterable of pairs
+        for item in monthly_candidates or []:
+            try:
+                src, ser = item
+            except Exception:
+                continue
+            norm.append((str(src), ser or {}))
+
+    all_series: dict[str, dict] = {}
+
     # Keep first non-empty monthly-looking series
-    for src, ser in candidates:
-        if ser:
-            all_series[src] = ser
-            latest = _latest_from_series(ser)
-            if latest:
-                lp, lv = latest
-                # Enforce monthly-looking keys (YYYY-MM)
-                if not _looks_monthly_key(lp):
-                    continue
-                return src, lp, lv, all_series
+    for src, ser in norm:
+        if not ser:
+            continue
+        all_series[src] = ser
+        latest = _latest_from_series(ser)
+        if not latest:
+            continue
+        lp, lv = latest
+        # Require monthly-looking key (YYYY-MM) for "monthly" selectors
+        if not _looks_monthly_key(lp):
+            # This guards against accidentally selecting annual series as monthly
+            continue
+        return src, lp, lv, all_series
 
-    # Nothing available
+    # Nothing monthly usable → fall back to annual
+    # annual_fallback is already a {year: value} dict (or {})
+    # We still return a consistent tuple; if annual is empty, callers will handle N/A.
+    src = "WorldBank"
+    latest = _latest_from_series(annual_fallback or {})
+    if latest:
+        lp, lv = latest  # lp is "YYYY"
+        all_series[src] = annual_fallback or {}
+        return src, lp, lv, all_series
 
-    # Nothing available
-    for src, ser in candidates:
-        if ser:
-            all_series[src] = ser
-    if annual_fallback and annual_fallback[1]:
-        all_series[annual_fallback[0]] = annual_fallback[1]
-        latest = _latest_from_series(annual_fallback[1])
-        if latest:
-            lp, lv = latest
-            return annual_fallback[0], lp, lv, all_series
-    return None, None, None, all_series
+    # Truly nothing
+    return "N/A", None, None, all_series
 
 # --------- Providers (import defensively so missing functions don't crash app) ---------
 # Country code resolver
