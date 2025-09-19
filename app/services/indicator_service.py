@@ -102,10 +102,11 @@ def _latest_from_series(series: Dict[str, Any]) -> Optional[Tuple[str, float]]:
 def _choose_monthly_then_annual(monthly_candidates, annual_fallback) -> tuple:
     """
     Pick the first usable monthly series, otherwise fall back to annual.
-    Robust to either:
+    Accepts monthly_candidates as:
       - dict: {"IMF": {...}, "Eurostat": {...}}
-      - list/tuple: [("IMF", {...}), ("Eurostat", {...})]
-    Returns (source_str, latest_period_str, latest_value_float, all_series_map)
+      - list of (label, series): [("IMF", {...}), ("Eurostat", {...})]
+      - list of series (no labels): [ {...}, {...} ]  -> auto-labels: IMF, Eurostat, Source3...
+    Returns (source_str, latest_period_str, latest_value_float, all_series_map) for _build_indicator_block.
     """
     # Helper: monthly-looking key "YYYY-MM"
     def _looks_monthly_key(k: str) -> bool:
@@ -114,17 +115,22 @@ def _choose_monthly_then_annual(monthly_candidates, annual_fallback) -> tuple:
     # Normalize candidates to a list of (src, ser)
     norm: list[tuple[str, dict]] = []
     if isinstance(monthly_candidates, dict):
-        # preserve the caller's ordering if it's an OrderedDict; plain dict order is insertion order in 3.7+
+        # Dict preserves insertion order in Py3.7+
         for src, ser in monthly_candidates.items():
-            norm.append((src, ser or {}))
-    else:
-        # assume iterable of pairs
-        for item in monthly_candidates or []:
-            try:
-                src, ser = item
-            except Exception:
-                continue
             norm.append((str(src), ser or {}))
+    elif isinstance(monthly_candidates, (list, tuple)):
+        if monthly_candidates and isinstance(monthly_candidates[0], (list, tuple)) and len(monthly_candidates[0]) == 2 and isinstance(monthly_candidates[0][0], str):
+            # Already a list of (label, series)
+            for src, ser in monthly_candidates:
+                norm.append((str(src), ser or {}))
+        else:
+            # Plain list of series with no labels → auto-label
+            default_labels = ["IMF", "Eurostat", "Source3", "Source4"]
+            for i, ser in enumerate(monthly_candidates):
+                label = default_labels[i] if i < len(default_labels) else f"Source{i+1}"
+                norm.append((label, ser or {}))
+    else:
+        norm = []
 
     all_series: dict[str, dict] = {}
 
@@ -137,15 +143,13 @@ def _choose_monthly_then_annual(monthly_candidates, annual_fallback) -> tuple:
         if not latest:
             continue
         lp, lv = latest
-        # Require monthly-looking key (YYYY-MM) for "monthly" selectors
+        # Require monthly-looking key (YYYY-MM)
         if not _looks_monthly_key(lp):
-            # This guards against accidentally selecting annual series as monthly
+            # Not a monthly series after all; try next candidate
             continue
         return src, lp, lv, all_series
 
-    # Nothing monthly usable → fall back to annual
-    # annual_fallback is already a {year: value} dict (or {})
-    # We still return a consistent tuple; if annual is empty, callers will handle N/A.
+    # Nothing monthly usable → fall back to annual (years "YYYY")
     src = "WorldBank"
     latest = _latest_from_series(annual_fallback or {})
     if latest:
