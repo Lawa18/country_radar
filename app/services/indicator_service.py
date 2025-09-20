@@ -296,53 +296,102 @@ def _build_indicator_block(source: Optional[str],
 
 def _assemble_cpi(iso2: str, iso3: str) -> Dict[str, Any]:
     """
-    CPI YoY: IMF monthly (preferred) → Eurostat monthly (EU/UK/EEA) → WB annual.
+    CPI YoY: IMF monthly → (EU only) Eurostat monthly → WB annual fallback
     """
-    imf_ser = imf_cpi_yoy_monthly(iso2) or {}
-    eu_ser  = eurostat_hicp_yoy_monthly(iso2) if iso2 in _EU_UK_ISO2 else {}
-    wb_ser  = wb_cpi_yoy_annual(iso3) or {}
-    src, lp, lv, all_ser = _choose_monthly_then_annual(
-        candidates=[("IMF", imf_ser), ("Eurostat", eu_ser)],
-        annual_fallback=("WorldBank", wb_ser),
+    try:
+        imf_ser = imf_cpi_yoy_monthly(iso2) or {}
+    except Exception:
+        imf_ser = {}
+
+    euro_ser: Dict[str, float] = {}
+    if iso2 in _EU_UK_ISO2:
+        try:
+            euro_ser = eurostat_hicp_yoy_monthly(iso2) or {}
+        except Exception:
+            euro_ser = {}
+
+    try:
+        wb_ser = wb_cpi_yoy_annual(iso3) or {}
+    except Exception:
+        wb_ser = {}
+
+    src, lp, lv, all_series = _choose_monthly_then_annual(
+        [("IMF", imf_ser), ("Eurostat", euro_ser)],
+        wb_ser,
     )
-    return _build_indicator_block(src, lp, lv, all_ser)
+    # lite: series flattened/omitted; we still pass an empty series map for size
+    return _build_indicator_block(src if src != "N/A" else None, lp, lv, {})
+
 
 def _assemble_unemployment(iso2: str, iso3: str) -> Dict[str, Any]:
     """
-    Unemployment rate: IMF monthly (preferred) → Eurostat monthly (EU/UK/EEA) → WB annual.
+    Unemployment rate: IMF monthly → (EU only) Eurostat monthly → WB annual fallback
     """
-    imf_ser = imf_unemployment_rate_monthly(iso2) or {}
-    eu_ser  = eurostat_unemployment_rate_monthly(iso2) if iso2 in _EU_UK_ISO2 else {}
-    wb_ser  = wb_unemployment_rate_annual(iso3) or {}
-    src, lp, lv, all_ser = _choose_monthly_then_annual(
-        candidates=[("IMF", imf_ser), ("Eurostat", eu_ser)],
-        annual_fallback=("WorldBank", wb_ser),
+    try:
+        imf_ser = imf_unemployment_rate_monthly(iso2) or {}
+    except Exception:
+        imf_ser = {}
+
+    euro_ser: Dict[str, float] = {}
+    if iso2 in _EU_UK_ISO2:
+        try:
+            euro_ser = eurostat_unemployment_rate_monthly(iso2) or {}
+        except Exception:
+            euro_ser = {}
+
+    try:
+        wb_ser = wb_unemployment_rate_annual(iso3) or {}
+    except Exception:
+        wb_ser = {}
+
+    src, lp, lv, all_series = _choose_monthly_then_annual(
+        [("IMF", imf_ser), ("Eurostat", euro_ser)],
+        wb_ser,
     )
-    return _build_indicator_block(src, lp, lv, all_ser)
+    return _build_indicator_block(src if src != "N/A" else None, lp, lv, {})
+
 
 def _assemble_fx(iso2: str, iso3: str) -> Dict[str, Any]:
     """
-    FX LCU/USD: IMF monthly preferred → WB annual fallback.
+    FX (LCU per USD): IMF monthly → WB annual fallback
+    Note: for euro members IMF monthly often ends at 1998-12; WB annual may be newer.
     """
-    imf_ser = imf_fx_usd_monthly(iso2) or {}
-    wb_ser  = wb_fx_rate_usd_annual(iso3) or {}
-    src, lp, lv, all_ser = _choose_monthly_then_annual(
-        candidates=[("IMF", imf_ser)],
-        annual_fallback=("WorldBank", wb_ser),
+    try:
+        imf_ser = imf_fx_usd_monthly(iso2) or {}
+    except Exception:
+        imf_ser = {}
+
+    try:
+        wb_ser = wb_fx_rate_usd_annual(iso3) or {}
+    except Exception:
+        wb_ser = {}
+
+    src, lp, lv, all_series = _choose_monthly_then_annual(
+        [("IMF", imf_ser)],  # no Eurostat FX in current design
+        wb_ser,
     )
-    return _build_indicator_block(src, lp, lv, all_ser)
+    return _build_indicator_block(src if src != "N/A" else None, lp, lv, {})
+
 
 def _assemble_reserves(iso2: str, iso3: str) -> Dict[str, Any]:
     """
-    Reserves (USD): IMF monthly preferred → WB annual fallback.
+    Reserves (USD): IMF monthly → WB annual fallback
     """
-    imf_ser = imf_reserves_usd_monthly(iso2) or {}
-    wb_ser  = wb_reserves_usd_annual(iso3) or {}
-    src, lp, lv, all_ser = _choose_monthly_then_annual(
-        candidates=[("IMF", imf_ser)],
-        annual_fallback=("WorldBank", wb_ser),
+    try:
+        imf_ser = imf_reserves_usd_monthly(iso2) or {}
+    except Exception:
+        imf_ser = {}
+
+    try:
+        wb_ser = wb_reserves_usd_annual(iso3) or {}
+    except Exception:
+        wb_ser = {}
+
+    src, lp, lv, all_series = _choose_monthly_then_annual(
+        [("IMF", imf_ser)],
+        wb_ser,
     )
-    return _build_indicator_block(src, lp, lv, all_ser)
+    return _build_indicator_block(src if src != "N/A" else None, lp, lv, {})
 
 def _assemble_policy_rate(iso2: str) -> Dict[str, Any]:
     """
