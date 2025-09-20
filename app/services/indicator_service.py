@@ -16,6 +16,47 @@ class _TTLCache:
         self.ttl = ttl_seconds
         self._store: Dict[str, Tuple[float, Any]] = {}
 
+
+
+def _format_debt_for_lite_block(raw: dict) -> dict:
+    """
+    Normalize debt payload so lite/debt block always reflects the newest series point.
+    Does not remove fields; returns the standard debt block shape expected by lite.
+    """
+    series = raw.get("series") or {}
+    # ensure string keys
+    if isinstance(series, dict):
+        series = {str(k): v for k, v in series.items()}
+    latest = raw.get("latest") if isinstance(raw.get("latest"), dict) else {}
+
+    # derive period
+    latest_period = raw.get("latest_period") or latest.get("period") or latest.get("year")
+    if not latest_period and series:
+        try:
+            latest_period = max(series.keys())  # keys are strings
+        except Exception:
+            latest_period = None
+
+    # derive value: prefer the value at selected period in series
+    latest_value = raw.get("latest_value")
+    if latest_value is None and isinstance(latest, dict):
+        latest_value = latest.get("value")
+    if latest_period and isinstance(series, dict) and latest_period in series and series[latest_period] is not None:
+        try:
+            latest_value = float(series[latest_period])
+        except Exception:
+            pass
+
+    source = raw.get("source") or latest.get("source") or "N/A"
+
+    return {
+        "latest_value": latest_value,
+        "latest_period": latest_period,
+        "source": source or "N/A",
+        "series": {},  # lite omits history
+        "latest": {"period": latest_period, "value": latest_value, "source": source or "N/A"},
+    }
+
     def get(self, key: str) -> Any:
         ent = self._store.get(key)
         if not ent:
