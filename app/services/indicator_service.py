@@ -436,15 +436,38 @@ def _assemble_policy_rate(iso2: str) -> Dict[str, Any]:
 
 def _assemble_gdp_growth(iso2: str, iso3: str) -> Dict[str, Any]:
     """
-    GDP growth: IMF quarterly (preferred) → WB annual.
+    GDP growth: IMF quarterly → WB annual fallback
     """
-    imf_ser = imf_gdp_growth_quarterly(iso2) or {}
-    wb_ser  = wb_gdp_growth_annual_pct(iso3) or {}
-    src, lp, lv, all_ser = _choose_monthly_then_annual(
-        candidates=[("IMF", imf_ser)],
-        annual_fallback=("WorldBank", wb_ser),
-    )
-    return _build_indicator_block(src, lp, lv, all_ser)
+    def _looks_quarterly_key(k: str) -> bool:
+        # e.g. "2025-Q2"
+        return isinstance(k, str) and len(k) == 7 and k[4:6] == "-Q" and k[:4].isdigit() and k[6].isdigit()
+
+    # Try IMF quarterly first
+    try:
+        imf_q = imf_gdp_growth_quarterly(iso2) or {}
+    except Exception:
+        imf_q = {}
+
+    if imf_q:
+        latest = _latest_from_series(imf_q)
+        if latest:
+            lp, lv = latest
+            if _looks_quarterly_key(lp):
+                return _build_indicator_block("IMF", lp, lv, {})  # lite: omit history
+
+    # Fallback: WB annual
+    try:
+        wb_a = wb_gdp_growth_annual_pct(iso3) or {}
+    except Exception:
+        wb_a = {}
+
+    if wb_a:
+        latest = _latest_from_series(wb_a)
+        if latest:
+            lp, lv = latest  # "YYYY"
+            return _build_indicator_block("WorldBank", lp, lv, {})
+
+    return _build_indicator_block(None, None, None, {})
 
 def _assemble_cab_pct_gdp(iso3: str) -> Dict[str, Any]:
     """
