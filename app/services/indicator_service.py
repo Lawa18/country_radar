@@ -74,6 +74,43 @@ def _format_debt_for_lite_block(raw: dict) -> dict:
 
 _payload_cache = _TTLCache(ttl_seconds=3600)  # assembled payloads ~1h
 
+# --- TTL cache hardening (append-only) ---------------------------------------
+# Ensure _TTLCache has working get()/set() even if earlier edits dropped them.
+try:
+    _TTLCache  # type: ignore[name-defined]
+except NameError:
+    from typing import Any, Dict, Tuple
+    import time
+    class _TTLCache:  # minimal, compatible
+        def __init__(self, ttl_seconds: int = 3600) -> None:
+            self.ttl = ttl_seconds
+            self._store: Dict[str, Tuple[float, Any]] = {}
+
+# Monkey-patch in get()/set() if missing (no-ops if already present)
+if not hasattr(_TTLCache, "get"):
+    from typing import Any
+    import time
+    def __ttl_get(self, key: str):
+        ent = getattr(self, "_store", {}).get(key)
+        if not ent:
+            return None
+        ts, val = ent
+        if (time.time() - ts) > getattr(self, "ttl", 0):
+            try:
+                del self._store[key]
+            except Exception:
+                pass
+            return None
+        return val
+    _TTLCache.get = __ttl_get  # type: ignore[attr-defined]
+
+if not hasattr(_TTLCache, "set"):
+    def __ttl_set(self, key: str, value: Any) -> None:
+        if not hasattr(self, "_store"):
+            self._store = {}  # type: ignore[assignment]
+        self._store[key] = (time.time(), value)
+    _TTLCache.set = __ttl_set  # type: ignore[attr-defined]
+# ---------------------------------------------------------------------------
 
 # --------- Small helpers ---------
 def _safe_float(v: Any) -> Optional[float]:
