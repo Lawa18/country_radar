@@ -16,8 +16,6 @@ class _TTLCache:
         self.ttl = ttl_seconds
         self._store: Dict[str, Tuple[float, Any]] = {}
 
-
-
 def _format_debt_for_lite_block(raw: dict) -> dict:
     """
     Normalize debt payload so lite/debt block always reflects the newest series point.
