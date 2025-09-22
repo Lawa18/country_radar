@@ -632,7 +632,10 @@ def build_country_payload(country: str) -> Dict[str, Any]:
       - Policy rate: ECB (euro area) → IMF; no WB fallback.
     """
     cache_key = f"country_payload::{country}"
-    cached = _payload_cache.get(cache_key)
+    try:
+        cached = _payload_cache.get(cache_key)
+    except Exception:
+        cached = None
     if cached is not None:
         return cached
 
@@ -661,7 +664,10 @@ def build_country_payload(country: str) -> Dict[str, Any]:
             },
             "error": "Invalid country name",
         }
+        try:
         _payload_cache.set(cache_key, payload)
+    except Exception:
+        pass
         return payload
 
     iso2 = codes.get("iso_alpha_2")
@@ -730,5 +736,8 @@ def build_country_payload(country: str) -> Dict[str, Any]:
         "debt": debt_block,
     }
 
-    _payload_cache.set(cache_key, payload)
+    try:
+        _payload_cache.set(cache_key, payload)
+    except Exception:
+        pass
     return payload
