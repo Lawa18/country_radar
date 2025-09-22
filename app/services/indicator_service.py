@@ -664,11 +664,11 @@ def build_country_payload(country: str) -> Dict[str, Any]:
             },
             "error": "Invalid country name",
         }
-        try:
+    try:
         _payload_cache.set(cache_key, payload)
     except Exception:
         pass
-        return payload
+    return payload
 
     iso2 = codes.get("iso_alpha_2")
     iso3 = codes.get("iso_alpha_3")
