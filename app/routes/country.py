@@ -108,7 +108,7 @@ def country_lite(country: str = Query(..., description="Full country name, e.g.,
     except Exception as e:
         return JSONResponse({"ok": False, "error": f"indicator_service import failed: {e}"}, status_code=500)
 
-    # Try a few likely builder names
+    # Try common lite builders first, then your known full builder `build_country_payload`
     candidates = [
         "get_country_lite",
         "country_lite",
@@ -116,37 +116,40 @@ def country_lite(country: str = Query(..., description="Full country name, e.g.,
         "build_country_lite",
         "get_country_compact",
         "country_compact",
+        # known full builder in this project:
+        "build_country_payload",  # accepts (country) only
     ]
-    func: Optional[Callable[[str], Dict[str, Any]]] = None
+
+    func = None
     for name in candidates:
         f = getattr(_svc, name, None)
         if callable(f):
-            func = f  # type: ignore[assignment]
+            func = f
             break
 
+    if not func:
+        # Fallbacks to full builder variants with/without params, if present
+        for name in ("country_data", "build_country_data", "assemble_country_data", "get_country_data", "make_country_data"):
+            f = getattr(_svc, name, None)
+            if callable(f):
+                func = f
+                break
+
+    if not func:
+        return JSONResponse({"ok": False, "error": "No lite builder found and no full builder fallback available."}, status_code=500)
+
+    # Invoke, trying (country, series="none") first, then (country) only
     try:
-        if func:
-            payload = func(country)  # expected: latest-only bundle
-        else:
-            # Fallback: call the full builder if available, requesting latest-only
-            if hasattr(_svc, "country_data"):
-                payload = _svc.country_data(country=country, series="none")
-            elif hasattr(_svc, "build_country_data"):
-                payload = _svc.build_country_data(country=country, series="none")
-            else:
-                return JSONResponse(
-                    {"ok": False, "error": "No lite builder found and no full builder fallback available."},
-                    status_code=500,
-                )
-    except TypeError:
-        # Some builders accept only positional (country)
-        payload = func(country) if func else {"ok": False, "error": "Lite builder invocation failed."}
+        try:
+            payload = func(country=country, series="none")  # works for country_data-style signatures
+        except TypeError:
+            payload = func(country)  # works for build_country_payload(country)
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
     if not isinstance(payload, dict):
         payload = {"result": payload}
-    if "country" not in payload:
-        payload["country"] = country
+    payload.setdefault("country", country)
     return JSONResponse(payload)
+
 # --- end append-only block ---
