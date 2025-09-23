@@ -99,57 +99,76 @@ from fastapi.responses import JSONResponse
 def __action_probe() -> Dict[str, Any]:
     return {"ok": True, "path": "/__action_probe"}
 
-# Latest-only compact bundle for GPT reliability
+# --- append-only: probe + lite endpoints -------------------------------
+from typing import Any, Callable, Dict, Optional
+from fastapi import Query
+from fastapi.responses import JSONResponse
+
+# Reuse the existing router object (it already exists in this module)
+
+@router.get("/__action_probe")
+def __action_probe() -> Dict[str, Any]:
+    # simple local probe for connectivity/debug
+    return {"ok": True, "path": "/__action_probe"}
+
 @router.get("/v1/country-lite")
 def country_lite(country: str = Query(..., description="Full country name, e.g., Germany")) -> JSONResponse:
-    # Lazy import to avoid hard failures on startup
+    """
+    Latest-only compact bundle. Tries a lite builder; falls back to your full builder.
+    """
     try:
         from app.services import indicator_service as _svc
     except Exception as e:
         return JSONResponse({"ok": False, "error": f"indicator_service import failed: {e}"}, status_code=500)
 
-    # Try common lite builders first, then your known full builder `build_country_payload`
-    candidates = [
+    # Try common lite builders first
+    for name in (
         "get_country_lite",
         "country_lite",
         "assemble_country_lite",
         "build_country_lite",
         "get_country_compact",
         "country_compact",
-        # known full builder in this project:
-        "build_country_payload",  # accepts (country) only
-    ]
-
-    func = None
-    for name in candidates:
+    ):
         f = getattr(_svc, name, None)
         if callable(f):
-            func = f
+            try:
+                # try signature with series="none" first; fallback to (country)
+                try:
+                    payload = f(country=country, series="none")
+                except TypeError:
+                    payload = f(country)
+            except Exception as e:
+                return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
             break
-
-    if not func:
-        # Fallbacks to full builder variants with/without params, if present
-        for name in ("country_data", "build_country_data", "assemble_country_data", "get_country_data", "make_country_data"):
+    else:
+        # Known full builders in this codebase
+        for name in (
+            "country_data",
+            "build_country_data",
+            "assemble_country_data",
+            "get_country_data",
+            "make_country_data",
+            "build_country_payload",  # your common full builder: build_country_payload(country)
+        ):
             f = getattr(_svc, name, None)
             if callable(f):
-                func = f
+                try:
+                    try:
+                        payload = f(country=country, series="none")
+                    except TypeError:
+                        payload = f(country)
+                except Exception as e:
+                    return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
                 break
-
-    if not func:
-        return JSONResponse({"ok": False, "error": "No lite builder found and no full builder fallback available."}, status_code=500)
-
-    # Invoke, trying (country, series="none") first, then (country) only
-    try:
-        try:
-            payload = func(country=country, series="none")  # works for country_data-style signatures
-        except TypeError:
-            payload = func(country)  # works for build_country_payload(country)
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        else:
+            return JSONResponse(
+                {"ok": False, "error": "No lite builder found and no full builder fallback available."},
+                status_code=500,
+            )
 
     if not isinstance(payload, dict):
         payload = {"result": payload}
     payload.setdefault("country", country)
     return JSONResponse(payload)
-
-# --- end append-only block ---
+# --- end append-only block -------------------------------------------
