@@ -109,12 +109,12 @@ def country_data(country: str = Query(..., description="Full country name, e.g.,
     return build_country_payload(country)
 
 # ---------------------- append-only below ----------------------
-from typing import Any, Callable, Dict, Optional
+from typing import Any
 from fastapi.responses import JSONResponse
 
 # Simple probe so Actions/curl can confirm wiring
 @router.get("/__action_probe")
-def __action_probe():
+def __action_probe() -> dict[str, Any]:
     return {"ok": True, "path": "/__action_probe"}
 
 # Latest-only compact bundle for GPT reliability
@@ -161,4 +161,3 @@ def country_lite(country: str = Query(..., description="Full country name, e.g.,
     payload.setdefault("country", country)
     return JSONResponse(payload)
 # -------------------- end append-only block --------------------
-
