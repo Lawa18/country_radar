@@ -99,61 +99,46 @@ from fastapi.responses import JSONResponse
 def __action_probe() -> Dict[str, Any]:
     return {"ok": True, "path": "/__action_probe"}
 
-# --- append-only: probe + lite endpoints -------------------------------
+from fastapi import APIRouter, Query
+from app.services.indicator_service import build_country_payload
+
+router = APIRouter()
+
+@router.get("/country-data")
+def country_data(country: str = Query(..., description="Full country name, e.g., Germany")):
+    return build_country_payload(country)
+
+# ---------------------- append-only below ----------------------
 from typing import Any, Callable, Dict, Optional
-from fastapi import Query
 from fastapi.responses import JSONResponse
 
-# Reuse the existing router object (it already exists in this module)
-
+# Simple probe so Actions/curl can confirm wiring
 @router.get("/__action_probe")
-def __action_probe() -> Dict[str, Any]:
-    # simple local probe for connectivity/debug
+def __action_probe():
     return {"ok": True, "path": "/__action_probe"}
 
+# Latest-only compact bundle for GPT reliability
 @router.get("/v1/country-lite")
-def country_lite(country: str = Query(..., description="Full country name, e.g., Germany")) -> JSONResponse:
+def country_lite(country: str = Query(..., description="Full country name, e.g., Germany")):
     """
-    Latest-only compact bundle. Tries a lite builder; falls back to your full builder.
+    Tries a lite builder if present; otherwise falls back to the existing
+    full builder `build_country_payload(country)` and returns that.
     """
     try:
         from app.services import indicator_service as _svc
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": f"indicator_service import failed: {e}"}, status_code=500)
-
-    # Try common lite builders first
-    for name in (
-        "get_country_lite",
-        "country_lite",
-        "assemble_country_lite",
-        "build_country_lite",
-        "get_country_compact",
-        "country_compact",
-    ):
-        f = getattr(_svc, name, None)
-        if callable(f):
-            try:
-                # try signature with series="none" first; fallback to (country)
-                try:
-                    payload = f(country=country, series="none")
-                except TypeError:
-                    payload = f(country)
-            except Exception as e:
-                return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-            break
-    else:
-        # Known full builders in this codebase
+        # Prefer lite-style builders if available (safe if missing)
         for name in (
-            "country_data",
-            "build_country_data",
-            "assemble_country_data",
-            "get_country_data",
-            "make_country_data",
-            "build_country_payload",  # your common full builder: build_country_payload(country)
+            "get_country_lite",
+            "country_lite",
+            "assemble_country_lite",
+            "build_country_lite",
+            "get_country_compact",
+            "country_compact",
         ):
             f = getattr(_svc, name, None)
             if callable(f):
                 try:
+                    # some lite builders accept series="none"; others only (country)
                     try:
                         payload = f(country=country, series="none")
                     except TypeError:
@@ -162,13 +147,18 @@ def country_lite(country: str = Query(..., description="Full country name, e.g.,
                     return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
                 break
         else:
-            return JSONResponse(
-                {"ok": False, "error": "No lite builder found and no full builder fallback available."},
-                status_code=500,
-            )
+            # Fallback to your known full builder
+            payload = build_country_payload(country)
+    except Exception:
+        # Final fallback: call full builder directly
+        try:
+            payload = build_country_payload(country)
+        except Exception as e2:
+            return JSONResponse({"ok": False, "error": f"{e2}"}, status_code=500)
 
     if not isinstance(payload, dict):
         payload = {"result": payload}
     payload.setdefault("country", country)
     return JSONResponse(payload)
-# --- end append-only block -------------------------------------------
+# -------------------- end append-only block --------------------
+
