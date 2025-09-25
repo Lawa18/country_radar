@@ -106,6 +106,9 @@ router = APIRouter()
 
 @router.get("/country-data")
 def country_data(country: str = Query(..., description="Full country name, e.g., Germany")):
+    """
+    Returns the assembled country payload with indicators and debt.
+    """
     return build_country_payload(country)
 
 # ---------------------- append-only below ----------------------
