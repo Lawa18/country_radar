@@ -16,6 +16,9 @@ from app.providers.wb_provider import (
     wb_reserves_usd_annual, wb_gdp_growth_annual_pct,
 )
 
+# NEW: used by /v1/country-lite response
+from fastapi.responses import JSONResponse
+
 router = APIRouter()
 
 def _latest_key(d: Dict[str, float]) -> Optional[str]:
@@ -86,3 +89,49 @@ def probe_series(country: str = Query(...)):
     }
 
     return {"ok": True, **out}
+
+# ---------------------- appended endpoints (keep existing code above) --------
+
+@router.get("/__action_probe", summary="Connectivity probe")
+def __action_probe():
+    return {"ok": True, "path": "/__action_probe"}
+
+@router.get("/v1/country-lite", summary="Latest-only compact bundle")
+def country_lite(country: str = Query(..., description="Full country name, e.g., Germany")):
+    """
+    Tries a lite builder if present; otherwise falls back to the full builder.
+    We keep this tolerant and dependency-light to avoid 5xxs to Actions.
+    """
+    try:
+        from app.services import indicator_service as _svc
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"indicator_service import failed: {e}"}, status_code=500)
+
+    payload = None
+    for name in (
+        "get_country_lite","country_lite","assemble_country_lite",
+        "build_country_lite","get_country_compact","country_compact",
+        # fallbacks: full builders, then your known build_country_payload
+        "country_data","build_country_data","assemble_country_data","get_country_data","make_country_data",
+        "build_country_payload",
+    ):
+        f = getattr(_svc, name, None)
+        if callable(f):
+            try:
+                try:
+                    payload = f(country=country, series="none")  # if supported
+                except TypeError:
+                    payload = f(country)                        # fallback
+            except Exception as e:
+                return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+            break
+
+    if payload is None:
+        return JSONResponse({"ok": False, "error": "No lite builder found and no full builder fallback available."}, status_code=500)
+
+    if not isinstance(payload, dict):
+        payload = {"result": payload}
+    payload.setdefault("country", country)
+    return JSONResponse(payload)
+# -------------------- end appended endpoints --------------------------------
+
