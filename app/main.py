@@ -233,5 +233,52 @@ def __country_lite_passthrough(country: str = Query(..., description="Full count
         payload = {"result": payload}
     payload.setdefault("country", country)
     return JSONResponse(payload)
+
+# --- append-only: always-on probe + app-level lite endpoint ------------------
+from fastapi import Query
+from fastapi.responses import JSONResponse
+
+@app.get("/__action_probe")
+def __action_probe():
+    # Always-on probe even if a router import fails
+    return {"ok": True, "path": "/__action_probe"}
+
+@app.get("/v1/country-lite")
+def __country_lite_passthrough(country: str = Query(..., description="Full country name, e.g., Germany")):
+    """
+    App-level passthrough that builds the latest-only bundle.
+    Tries lite builders if present; falls back to your full builder.
+    """
+    try:
+        from app.services import indicator_service as _svc
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": f"indicator_service import failed: {e}"}, status_code=500)
+
+    payload = None
+    # Prefer lite-style builders, then fall back to full builders (incl. build_country_payload)
+    for name in (
+        "get_country_lite","country_lite","assemble_country_lite",
+        "build_country_lite","get_country_compact","country_compact",
+        "country_data","build_country_data","assemble_country_data","get_country_data","make_country_data",
+        "build_country_payload",
+    ):
+        f = getattr(_svc, name, None)
+        if callable(f):
+            try:
+                try:
+                    payload = f(country=country, series="none")
+                except TypeError:
+                    payload = f(country)
+            except Exception as e:
+                return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+            break
+
+    if payload is None:
+        return JSONResponse({"ok": False, "error": "No lite builder found and no full builder fallback available."}, status_code=500)
+
+    if not isinstance(payload, dict):
+        payload = {"result": payload}
+    payload.setdefault("country", country)
+    return JSONResponse(payload)
 # ---------------------------------------------------------------------------
 
