@@ -96,34 +96,42 @@ def probe_series(country: str = Query(...)):
 def __action_probe():
     return {"ok": True, "path": "/__action_probe"}
 
-@router.get("/v1/country-lite", summary="Latest-only compact bundle")
+@router.get("/v1/country-lite")
 def country_lite(country: str = Query(..., description="Full country name, e.g., Germany")):
     """
-    Tries a lite builder if present; otherwise falls back to the full builder.
-    We keep this tolerant and dependency-light to avoid 5xxs to Actions.
+    Prefer the modern monthly-first builder; fall back only if not present.
     """
     try:
         from app.services import indicator_service as _svc
     except Exception as e:
         return JSONResponse({"ok": False, "error": f"indicator_service import failed: {e}"}, status_code=500)
 
-    payload = None
-    for name in (
+    # 1) Strong preference: the monthly-first builder you’ve been iterating on
+    PREFERRED = ("build_country_payload",)
+
+    # 2) Other plausible lite/full builders (in decreasing preference)
+    FALLBACKS = (
         "get_country_lite","country_lite","assemble_country_lite",
         "build_country_lite","get_country_compact","country_compact",
-        # fallbacks: full builders, then your known build_country_payload
         "country_data","build_country_data","assemble_country_data","get_country_data","make_country_data",
-        "build_country_payload",
-    ):
+    )
+
+    payload = None
+
+    # Try preferred first
+    for name in PREFERRED + FALLBACKS:
         f = getattr(_svc, name, None)
-        if callable(f):
+        if not callable(f):
+            continue
+        try:
+            # Most of your builders accept country= and series=; try that first.
             try:
-                try:
-                    payload = f(country=country, series="none")  # if supported
-                except TypeError:
-                    payload = f(country)                        # fallback
-            except Exception as e:
-                return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+                payload = f(country=country, series="none")
+            except TypeError:
+                payload = f(country)  # older signatures
+        except Exception as e:
+            return JSONResponse({"ok": False, "error": f"{name} failed: {e}"}, status_code=500)
+        else:
             break
 
     if payload is None:
@@ -133,4 +141,3 @@ def country_lite(country: str = Query(..., description="Full country name, e.g.,
         payload = {"result": payload}
     payload.setdefault("country", country)
     return JSONResponse(payload)
-# -------------------- end appended endpoints --------------------------------
