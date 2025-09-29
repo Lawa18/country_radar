@@ -58,7 +58,7 @@ async def log_requests(request: Request, call_next):
 # Mount the routers you actually use
 app.include_router(country.router, tags=["country"])
 app.include_router(debt.router, tags=["debt"])
-app.include_router(probe_routes.router, tags=["probe"])
+app.include_router(probe_routes.router, tags=["probe"])  # <-- ensure this line is present
 
 @app.get("/ping")
 def ping():
@@ -112,7 +112,7 @@ def _force_response_schema_object(spec: Dict[str, Any], path: str, method: str =
         "type": "object",
         "properties": {},
         "additionalProperties": True,
-        "title": f"Response {path} {method.upper()}",
+        "title": f"Response {path} {method.UPPER()}",
     }
 
 def _mounted_paths() -> Set[str]:
