@@ -99,17 +99,35 @@ from fastapi.responses import JSONResponse
 def __action_probe() -> Dict[str, Any]:
     return {"ok": True, "path": "/__action_probe"}
 
-from fastapi import APIRouter, Query
-from app.services.indicator_service import build_country_payload
+# --- Legacy shim: keep old behavior available without overriding the main route ---
+# NOTE: Do NOT re-declare `router` here; we reuse the existing router from above.
+# If you still need the legacy, direct call, expose it on a different path.
+try:
+    from app.services.indicator_service import build_country_payload as _legacy_build_country_payload
+except Exception:
+    _legacy_build_country_payload = None  # optional; legacy handler below will guard
 
-router = APIRouter()
-
-@router.get("/country-data")
-def country_data(country: str = Query(..., description="Full country name, e.g., Germany")):
+@router.get("/country-data-legacy")
+def country_data_legacy(
+    country: str = Query(..., description="Full country name, e.g., Germany")
+):
     """
-    Returns the assembled country payload with indicators and debt.
+    Legacy endpoint that calls the old build_country_payload(country) signature directly.
+    Kept only to avoid breaking old references. Prefer /country-data with series/keep.
     """
-    return build_country_payload(country)
+    if _legacy_build_country_payload is None:
+        return JSONResponse(
+            {"ok": False, "error": "legacy build_country_payload is unavailable"},
+            status_code=500,
+        )
+    try:
+        payload = _legacy_build_country_payload(country)  # old signature
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    if not isinstance(payload, dict):
+        payload = {"result": payload}
+    payload.setdefault("country", country)
+    return payload
 
 # ---------------------- append-only below ----------------------
 from typing import Any
