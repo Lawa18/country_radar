@@ -61,7 +61,6 @@ def _assemble_country_payload(country: str, series: str, keep: int) -> Dict[str,
         detail="No compatible country assembly function found in indicator_service.",
     )
 
-
 @router.get("/country-data")
 def get_country_data(
     country: str = Query(..., description="Full country name, e.g., Sweden"),
@@ -76,6 +75,25 @@ def get_country_data(
     Full macro bundle. This route passes 'series' and 'keep' when supported by the
     underlying indicator_service function; otherwise it only passes 'country'.
     """
+    # ... inside get_country_data(...) after you built `payload` and before `return payload`:
+
+    # --- TEMP DIAGNOSTIC: show which builder and file were used -------------
+    import inspect
+    try:
+        from app.services import indicator_service as _svc  # safe lazy import
+        fn = getattr(_svc, "build_country_payload", None)
+        if callable(fn):
+            dbg = payload.setdefault("_debug", {})
+            dbg["builder"] = {
+                "indicator_service_file": getattr(_svc, "__file__", None),
+                "builder_file": inspect.getsourcefile(fn),
+                "signature": str(inspect.signature(fn)),
+            }
+    except Exception:
+        # never fail the response for diagnostics
+        pass
+    # ------------------------------------------------------------------------
+    
     try:
         payload = _assemble_country_payload(country=country, series=series, keep=keep)
         if not isinstance(payload, dict):
