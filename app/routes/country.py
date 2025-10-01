@@ -32,7 +32,6 @@ def _call_service_with_supported_kwargs(func, **kwargs) -> Any:
         # Re-raise as HTTPException to show a clean error to the client.
         raise HTTPException(status_code=500, detail=f"indicator_service call error: {e}")
 
-
 def _assemble_country_payload(country: str, series: str, keep: int) -> Dict[str, Any]:
     """
     Try multiple indicator_service entrypoints and call them safely
@@ -72,40 +71,82 @@ def get_country_data(
     ),
 ) -> Dict[str, Any]:
     """
-    Full macro bundle. This route passes 'series' and 'keep' when supported by the
-    underlying indicator_service function; otherwise it only passes 'country'.
+    Full macro bundle. This route prefers the monthly-first builder from
+    indicator_service. It passes `series` and `keep` when supported, and
+    falls back to legacy (country-only) signatures if needed.
     """
-    # ... inside get_country_data(...) after you built `payload` and before `return payload`:
+    try:
+        # Lazy import to avoid circulars / stale imports
+        from app.services import indicator_service as _svc  # type: ignore
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"country-data import error: {e}")
 
-    # --- TEMP DIAGNOSTIC: show which builder and file were used -------------
-    import inspect
+    # Try modern names first, then older ones; the first callable wins.
+    CANDIDATES = (
+        # strongly preferred modern builders you’ve been working on
+        "build_country_payload_v2",
+        "assemble_country_payload",
+        "assemble_country_data_v2",
+        "build_country_data_v2",
+        # common alternates
+        "get_country_data_v2",
+        "country_data_v2",
+        "get_country_bundle",
+        "build_country_bundle",
+        # legacy names (often return the skeleton)
+        "build_country_payload",
+        "build_country_data",
+        "assemble_country_data",
+        "get_country_data",
+        "make_country_data",
+    )
+
+    fn = None
+    chosen = None
+    for name in CANDIDATES:
+        cand = getattr(_svc, name, None)
+        if callable(cand):
+            fn = cand
+            chosen = name
+            break
+
+    if fn is None:
+        raise HTTPException(
+            status_code=500,
+            detail="No country-data builder found on indicator_service. "
+                   "Expected one of: " + ", ".join(CANDIDATES),
+        )
+
+    # Call with modern kwargs if possible; otherwise fall back to (country).
     try:
-        from app.services import indicator_service as _svc  # safe lazy import
-        fn = getattr(_svc, "build_country_payload", None)
-        if callable(fn):
-            dbg = payload.setdefault("_debug", {})
-            dbg["builder"] = {
-                "indicator_service_file": getattr(_svc, "__file__", None),
-                "builder_file": inspect.getsourcefile(fn),
-                "signature": str(inspect.signature(fn)),
-            }
-    except Exception:
-        # never fail the response for diagnostics
-        pass
-    # ------------------------------------------------------------------------
-    
-    try:
-        payload = _assemble_country_payload(country=country, series=series, keep=keep)
-        if not isinstance(payload, dict):
-            raise ValueError("indicator_service returned a non-dict payload")
-        payload.setdefault("country", country)
-        payload.setdefault("series_mode", series)
-        return payload
+        try:
+            payload = fn(country=country, series=series, keep=keep)  # type: ignore[call-arg]
+        except TypeError:
+            payload = fn(country)  # type: ignore[misc]
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"country-data error: {e}")
+        raise HTTPException(status_code=500, detail=f"{chosen} failed: {e}")
 
+    if not isinstance(payload, dict):
+        payload = {"result": payload}
+
+    # Diagnostics to confirm which builder/file executed (harmless to leave on)
+    try:
+        import inspect
+        dbg = payload.setdefault("_debug", {})
+        dbg["builder"] = {
+            "name": chosen,
+            "indicator_service_file": getattr(_svc, "__file__", None),
+            "builder_file": inspect.getsourcefile(fn),
+            "signature": str(inspect.signature(fn)),
+        }
+    except Exception:
+        pass
+
+    payload.setdefault("country", country)
+    payload.setdefault("series_mode", series)
+    return payload
 
 # --- Country Radar: added probe + lite endpoints (append-only) ---
 from typing import Any, Callable, Dict, Optional
