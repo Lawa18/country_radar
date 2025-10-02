@@ -60,8 +60,11 @@ def _assemble_country_payload(country: str, series: str, keep: int) -> Dict[str,
         detail="No compatible country assembly function found in indicator_service.",
     )
 
-@router.get("/country-data")
-def get_country_data(
+from typing import Dict, Any, Literal
+from fastapi import HTTPException, Query
+
+@router.get("/country-data", tags=["country"], summary="Country Data")
+def country_data(
     country: str = Query(..., description="Full country name, e.g., Sweden"),
     series: Literal["none", "mini", "full"] = Query(
         "mini", description='Timeseries size (none = latest only, "mini" ~ 5y)'
@@ -71,30 +74,28 @@ def get_country_data(
     ),
 ) -> Dict[str, Any]:
     """
-    Full macro bundle. Prefer the monthly-first builder in indicator_service.
-    Passes `series` and `keep` when supported; falls back to legacy signature.
+    Full macro bundle. Prefer a modern monthly-first builder in indicator_service.
+    Pass `series` and `keep` when supported; fall back to legacy (country) signature.
     """
-    from fastapi import HTTPException
-
-    # Lazy import to avoid circulars or stale imports
+    # Lazy import to avoid circulars/stale imports
     try:
         from app.services import indicator_service as _svc  # type: ignore
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"country-data import error: {e}")
 
-    # Try modern names first, then older ones; the first callable wins.
+    # Try modern names first, then older ones; first callable wins.
     CANDIDATES = (
-        # strongly preferred modern builders
+        # strongly preferred modern builders (add your actual name here when you have it)
         "build_country_payload_v2",
         "assemble_country_payload",
         "assemble_country_data_v2",
         "build_country_data_v2",
-        # common alternates
+        # plausible alternates
         "get_country_data_v2",
         "country_data_v2",
         "get_country_bundle",
         "build_country_bundle",
-        # legacy names (often return the skeleton)
+        # legacy last (this is your current export)
         "build_country_payload",
         "build_country_data",
         "assemble_country_data",
@@ -107,8 +108,7 @@ def get_country_data(
     for name in CANDIDATES:
         cand = getattr(_svc, name, None)
         if callable(cand):
-            fn = cand
-            chosen = name
+            fn, chosen = cand, name
             break
 
     if fn is None:
@@ -132,7 +132,7 @@ def get_country_data(
     if not isinstance(payload, dict):
         payload = {"result": payload}
 
-    # Diagnostics: show which builder/file executed (harmless to leave)
+    # Diagnostics: show which builder/file executed
     try:
         import inspect
         dbg = payload.setdefault("_debug", {})
