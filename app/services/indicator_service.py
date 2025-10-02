@@ -307,6 +307,223 @@ def build_country_payload_v2(country: str, series: Literal["none","mini","full"]
 
     return payload
 
-# Alias legacy export name to the modern builder so existing routes pick it up.
-build_country_payload = build_country_payload_v2  # type: ignore[assignment]
-# === End of append-only override block ===
+# === Country Radar: append-only modern builder + legacy name override =========
+# This block does not remove or edit earlier code. It *redefines* the export
+# name `build_country_payload` at the end of the module so existing routes use
+# the monthly-first logic automatically.
+
+from typing import Dict, Any, Optional, Literal
+
+def _cr_latest_key(d: Dict[str, float]) -> Optional[str]:
+    if not d: 
+        return None
+    try:
+        return max(d.keys())
+    except Exception:
+        return None
+
+def _cr_latest(d: Dict[str, float]) -> Optional[tuple[str, float]]:
+    k = _cr_latest_key(d)
+    if k is None:
+        return None
+    v = d.get(k)
+    return (k, v) if v is not None else None
+
+def _cr_trim(d: Dict[str, float], keep: int) -> Dict[str, float]:
+    if not isinstance(d, dict) or keep <= 0:
+        return {}
+    try:
+        ks = sorted(d.keys())[-keep:]
+        return {k: d[k] for k in ks if d[k] is not None}
+    except Exception:
+        return {}
+
+def _cr_block(source: Optional[str], latest: Optional[tuple[str, float]], series: Dict[str, Dict[str, float]]) -> Dict[str, Any]:
+    if latest:
+        p, v = latest
+        return {"latest_value": v, "latest_period": p, "source": source or "N/A", "series": series}
+    return {"latest_value": None, "latest_period": None, "source": "N/A", "series": series}
+
+def build_country_payload_modern(country: str, series: Literal["none","mini","full"]="mini", keep: int=60) -> Dict[str, Any]:
+    # Lazy imports to avoid boot failures if a provider is missing
+    from app.utils.country_codes import resolve_country_codes
+
+    # Providers
+    try:
+        from app.providers.imf_provider import (
+            imf_cpi_yoy_monthly, imf_unemployment_rate_monthly,
+            imf_fx_usd_monthly, imf_reserves_usd_monthly,
+            imf_policy_rate_monthly, imf_gdp_growth_quarterly,
+        )
+    except Exception:
+        imf_cpi_yoy_monthly = imf_unemployment_rate_monthly = None
+        imf_fx_usd_monthly = imf_reserves_usd_monthly = None
+        imf_policy_rate_monthly = imf_gdp_growth_quarterly = None
+
+    try:
+        from app.providers.eurostat_provider import (
+            eurostat_hicp_yoy_monthly, eurostat_unemployment_rate_monthly,
+        )
+    except Exception:
+        eurostat_hicp_yoy_monthly = eurostat_unemployment_rate_monthly = None
+
+    try:
+        from app.providers.ecb_provider import ecb_policy_rate_for_country
+    except Exception:
+        ecb_policy_rate_for_country = None
+
+    try:
+        from app.providers.wb_provider import (
+            wb_cpi_yoy_annual, wb_unemployment_rate_annual, wb_fx_rate_usd_annual,
+            wb_reserves_usd_annual, wb_gdp_growth_annual_pct,
+            wb_current_account_balance_pct_gdp_annual, wb_government_effectiveness_annual,
+        )
+    except Exception:
+        wb_cpi_yoy_annual = wb_unemployment_rate_annual = None
+        wb_fx_rate_usd_annual = wb_reserves_usd_annual = None
+        wb_gdp_growth_annual_pct = None
+        wb_current_account_balance_pct_gdp_annual = wb_government_effectiveness_annual = None
+
+    EURO_AREA_ISO2 = {
+        "AT","BE","CY","DE","EE","ES","FI","FR","GR","IE","IT","LT","LU","LV","MT","NL","PT","SI","SK"
+    }
+    EU_EEA_UK_ISO2 = {
+        "AT","BE","BG","HR","CY","CZ","DE","DK","EE","ES","FI","FR","GR","EL","HU","IE",
+        "IT","LT","LU","LV","MT","NL","PL","PT","RO","SE","SI","SK","IS","NO","LI","GB"
+    }
+
+    codes = resolve_country_codes(country) or {}
+    iso2, iso3 = codes.get("iso_alpha_2"), codes.get("iso_alpha_3")
+    include_series = series != "none"
+    keep_n = keep if series == "full" else (keep if series == "mini" else 0)
+
+    out: Dict[str, Any] = {"country": country, "iso2": iso2, "iso3": iso3, "indicators": {}}
+
+    # CPI YoY: IMF monthly → Eurostat monthly (EU/EEA/UK) → WB annual
+    cpi_src, cpi_series, cpi_latest = None, {}, None
+    if imf_cpi_yoy_monthly:
+        s = imf_cpi_yoy_monthly(iso2) or {}
+        if s: cpi_src, cpi_latest = "IMF", _cr_latest(s); 
+        if include_series and s: cpi_series["IMF"] = _cr_trim(s, keep_n)
+    if cpi_latest is None and eurostat_hicp_yoy_monthly and iso2 in EU_EEA_UK_ISO2:
+        s = eurostat_hicp_yoy_monthly(iso2) or {}
+        if s: cpi_src, cpi_latest = "Eurostat", _cr_latest(s)
+        if include_series and s: cpi_series["Eurostat"] = _cr_trim(s, keep_n)
+    if cpi_latest is None and wb_cpi_yoy_annual:
+        s = wb_cpi_yoy_annual(iso3) or {}
+        if s: cpi_src, cpi_latest = "WorldBank", _cr_latest(s)
+        if include_series and s: cpi_series["WorldBank"] = _cr_trim(s, keep_n)
+    out["indicators"]["cpi_yoy"] = _cr_block(cpi_src, cpi_latest, cpi_series)
+
+    # Unemployment: IMF monthly → Eurostat monthly (EU/EEA/UK) → WB annual
+    u_src, u_series, u_latest = None, {}, None
+    if imf_unemployment_rate_monthly:
+        s = imf_unemployment_rate_monthly(iso2) or {}
+        if s: u_src, u_latest = "IMF", _cr_latest(s)
+        if include_series and s: u_series["IMF"] = _cr_trim(s, keep_n)
+    if u_latest is None and eurostat_unemployment_rate_monthly and iso2 in EU_EEA_UK_ISO2:
+        s = eurostat_unemployment_rate_monthly(iso2) or {}
+        if s: u_src, u_latest = "Eurostat", _cr_latest(s)
+        if include_series and s: u_series["Eurostat"] = _cr_trim(s, keep_n)
+    if u_latest is None and wb_unemployment_rate_annual:
+        s = wb_unemployment_rate_annual(iso3) or {}
+        if s: u_src, u_latest = "WorldBank", _cr_latest(s)
+        if include_series and s: u_series["WorldBank"] = _cr_trim(s, keep_n)
+    out["indicators"]["unemployment_rate"] = _cr_block(u_src, u_latest, u_series)
+
+    # FX (LCU/USD): IMF monthly → WB annual
+    fx_src, fx_series, fx_latest = None, {}, None
+    if imf_fx_usd_monthly:
+        s = imf_fx_usd_monthly(iso2) or {}
+        if s: fx_src, fx_latest = "IMF", _cr_latest(s)
+        if include_series and s: fx_series["IMF"] = _cr_trim(s, keep_n)
+    if fx_latest is None and wb_fx_rate_usd_annual:
+        s = wb_fx_rate_usd_annual(iso3) or {}
+        if s: fx_src, fx_latest = "WorldBank", _cr_latest(s)
+        if include_series and s: fx_series["WorldBank"] = _cr_trim(s, keep_n)
+    out["indicators"]["fx_rate_usd"] = _cr_block(fx_src, fx_latest, fx_series)
+
+    # Reserves (USD): IMF monthly → WB annual
+    r_src, r_series, r_latest = None, {}, None
+    if imf_reserves_usd_monthly:
+        s = imf_reserves_usd_monthly(iso2) or {}
+        if s: r_src, r_latest = "IMF", _cr_latest(s)
+        if include_series and s: r_series["IMF"] = _cr_trim(s, keep_n)
+    if r_latest is None and wb_reserves_usd_annual:
+        s = wb_reserves_usd_annual(iso3) or {}
+        if s: r_src, r_latest = "WorldBank", _cr_latest(s)
+        if include_series and s: r_series["WorldBank"] = _cr_trim(s, keep_n)
+    out["indicators"]["reserves_usd"] = _cr_block(r_src, r_latest, r_series)
+
+    # Policy rate: ECB for euro-area → IMF monthly (no WB fallback)
+    p_src, p_series, p_latest = None, {}, None
+    if iso2 in EURO_AREA_ISO2 and ecb_policy_rate_for_country:
+        s = ecb_policy_rate_for_country(iso2) or {}
+        if s: p_src, p_latest = "ECB", _cr_latest(s)
+        if include_series and s: p_series["ECB"] = _cr_trim(s, keep_n)
+    if p_latest is None and imf_policy_rate_monthly:
+        s = imf_policy_rate_monthly(iso2) or {}
+        if s: p_src, p_latest = "IMF", _cr_latest(s)
+        if include_series and s: p_series["IMF"] = _cr_trim(s, keep_n)
+    out["indicators"]["policy_rate"] = _cr_block(p_src, p_latest, p_series)
+
+    # GDP growth: IMF quarterly → WB annual
+    g_src, g_series, g_latest = None, {}, None
+    if imf_gdp_growth_quarterly:
+        s = imf_gdp_growth_quarterly(iso2) or {}
+        if s: g_src, g_latest = "IMF", _cr_latest(s)
+        if include_series and s: g_series["IMF_quarterly"] = _cr_trim(s, keep_n)
+    if g_latest is None and wb_gdp_growth_annual_pct:
+        s = wb_gdp_growth_annual_pct(iso3) or {}
+        if s: g_src, g_latest = "WorldBank", _cr_latest(s)
+        if include_series and s: g_series["WB_annual"] = _cr_trim(s, keep_n)
+    out["indicators"]["gdp_growth"] = _cr_block(g_src, g_latest, g_series)
+
+    # Annual stable: CAB %GDP, Government Effectiveness
+    cab_src = gov_src = None
+    cab_series = gov_series = {}
+    cab_latest = gov_latest = None
+    if wb_current_account_balance_pct_gdp_annual:
+        s = wb_current_account_balance_pct_gdp_annual(iso3) or {}
+        if s: cab_src, cab_latest = "WorldBank", _cr_latest(s)
+        if include_series and s: cab_series["WorldBank"] = _cr_trim(s, keep_n)
+    out["indicators"]["current_account_balance_pct_gdp"] = _cr_block(cab_src, cab_latest, cab_series)
+
+    if wb_government_effectiveness_annual:
+        s = wb_government_effectiveness_annual(iso3) or {}
+        if s: gov_src, gov_latest = "WorldBank", _cr_latest(s)
+        if include_series and s: gov_series["WorldBank"] = _cr_trim(s, keep_n)
+    out["indicators"]["government_effectiveness"] = _cr_block(gov_src, gov_latest, gov_series)
+
+    # Debt block: use your existing service if available
+    debt_block = {"latest_value": None, "latest_period": None, "source": "N/A", "series": {}, "latest": {"period": None, "value": None, "source": "N/A"}}
+    try:
+        from app.services import debt_service as _debt
+        for name in ("get_debt_ratio_for_country","debt_latest_for_country","get_debt_for_country","get_debt","build_debt_block"):
+            f = getattr(_debt, name, None)
+            if callable(f):
+                try:
+                    try:
+                        d = f(iso2=iso2, iso3=iso3, country=country)  # type: ignore
+                    except TypeError:
+                        try:
+                            d = f(country)  # type: ignore
+                        except TypeError:
+                            d = f(iso3 or iso2)  # type: ignore
+                    if isinstance(d, dict) and d:
+                        debt_block = d
+                        break
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    out["debt"] = debt_block
+
+    return out
+
+# Keep the old public name but point it to the modern builder (legacy signature preserved)
+def build_country_payload(country: str) -> Dict[str, Any]:  # type: ignore[override]
+    # Default to "mini" history and keep=60 for reliability
+    return build_country_payload_modern(country, series="mini", keep=60)
+
+# === End append-only override =================================================
