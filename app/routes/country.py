@@ -1,67 +1,48 @@
 # app/routes/country.py
 from __future__ import annotations
 
-from typing import Any, Dict, Literal
+from typing import Any, Dict, Literal, Optional
 from fastapi import APIRouter, HTTPException, Query
-import inspect
-
-# Import the module so we can select among multiple entrypoints.
-from app.services import indicator_service as svc
+from fastapi.responses import JSONResponse
 
 router = APIRouter()
 
 
-def _call_service_with_supported_kwargs(func, **kwargs) -> Any:
+def _choose_indicator_builder() -> tuple[Optional[callable], Optional[str], Optional[str]]:
     """
-    Call `func` with only the kwargs it actually accepts.
-    This prevents 'unexpected keyword argument' errors when older
-    service functions don't take (series, keep).
+    Load app.services.indicator_service and pick the best available builder.
+    Returns (fn, chosen_name, svc_file) or (None, None, svc_file_if_loaded).
     """
     try:
-        sig = inspect.signature(func)
-        accepted = set(sig.parameters.keys())
-        filtered = {k: v for k, v in kwargs.items() if k in accepted}
-        # If 'country' isn't in accepted but the function takes a single positional,
-        # fall back to positional call with the country value.
-        if "country" not in accepted and len(sig.parameters) == 1:
-            only_param = next(iter(sig.parameters.values()))
-            if only_param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
-                return func(kwargs.get("country"))
-        return func(**filtered)
-    except TypeError as e:
-        # Re-raise as HTTPException to show a clean error to the client.
-        raise HTTPException(status_code=500, detail=f"indicator_service call error: {e}")
+        from app.services import indicator_service as _svc  # type: ignore
+    except Exception:
+        return (None, None, None)
 
-def _assemble_country_payload(country: str, series: str, keep: int) -> Dict[str, Any]:
-    """
-    Try multiple indicator_service entrypoints and call them safely
-    with only the kwargs they accept.
-    """
     candidates = (
-        "get_country_data",          # preferred new name
-        "assemble_country_data",     # older
-        "build_country_payload",     # legacy, often only (country)
-    )
-    for name in candidates:
-        func = getattr(svc, name, None)
-        if callable(func):
-            result = _call_service_with_supported_kwargs(
-                func,
-                country=country,
-                series=series,
-                keep=keep,
-            )
-            if isinstance(result, dict):
-                return result
-            # If the service returns non-dict, wrap a minimal object for Actions validators
-            return {"country": country, "series_mode": series, "data": result}
-    raise HTTPException(
-        status_code=500,
-        detail="No compatible country assembly function found in indicator_service.",
+        # Strongly preferred modern builders (add your actual modern name if different)
+        "build_country_payload_v2",
+        "assemble_country_payload",
+        "assemble_country_data_v2",
+        "build_country_data_v2",
+        # Other plausible alternates
+        "get_country_data_v2",
+        "country_data_v2",
+        "get_country_bundle",
+        "build_country_bundle",
+        # Legacy names (your current export is build_country_payload)
+        "build_country_payload",
+        "build_country_data",
+        "assemble_country_data",
+        "get_country_data",
+        "make_country_data",
     )
 
-from typing import Dict, Any, Literal
-from fastapi import HTTPException, Query
+    for name in candidates:
+        fn = getattr(_svc, name, None)
+        if callable(fn):
+            return (fn, name, getattr(_svc, "__file__", None))
+    return (None, None, getattr(_svc, "__file__", None))
+
 
 @router.get("/country-data", tags=["country"], summary="Country Data")
 def country_data(
@@ -74,48 +55,18 @@ def country_data(
     ),
 ) -> Dict[str, Any]:
     """
-    Full macro bundle. Prefer a modern monthly-first builder in indicator_service.
-    Pass `series` and `keep` when supported; fall back to legacy (country) signature.
+    Full macro bundle. Prefers a modern monthly-first builder in indicator_service,
+    passing `series` and `keep` when supported; falls back to legacy (country-only) signature.
     """
-    # Lazy import to avoid circulars/stale imports
-    try:
-        from app.services import indicator_service as _svc  # type: ignore
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"country-data import error: {e}")
-
-    # Try modern names first, then older ones; first callable wins.
-    CANDIDATES = (
-        # strongly preferred modern builders (add your actual name here when you have it)
-        "build_country_payload_v2",
-        "assemble_country_payload",
-        "assemble_country_data_v2",
-        "build_country_data_v2",
-        # plausible alternates
-        "get_country_data_v2",
-        "country_data_v2",
-        "get_country_bundle",
-        "build_country_bundle",
-        # legacy last (this is your current export)
-        "build_country_payload",
-        "build_country_data",
-        "assemble_country_data",
-        "get_country_data",
-        "make_country_data",
-    )
-
-    fn = None
-    chosen = None
-    for name in CANDIDATES:
-        cand = getattr(_svc, name, None)
-        if callable(cand):
-            fn, chosen = cand, name
-            break
-
+    fn, chosen, svc_file = _choose_indicator_builder()
     if fn is None:
         raise HTTPException(
             status_code=500,
-            detail="No suitable country-data builder found on indicator_service. "
-                   "Expected one of: " + ", ".join(CANDIDATES),
+            detail=(
+                "No suitable country-data builder found on indicator_service. "
+                "Export a modern builder (e.g., build_country_payload_v2(country, series, keep)) "
+                "or keep build_country_payload(country) available as a fallback."
+            ),
         )
 
     # Call with modern kwargs if possible; otherwise fall back to (country).
@@ -132,16 +83,18 @@ def country_data(
     if not isinstance(payload, dict):
         payload = {"result": payload}
 
-    # Diagnostics: show which builder/file executed
+    # Debug: which builder/file executed (safe to keep)
     try:
         import inspect
-        dbg = payload.setdefault("_debug", {})
-        dbg["builder"] = {
-            "name": chosen,
-            "indicator_service_file": getattr(_svc, "__file__", None),
-            "builder_file": inspect.getsourcefile(fn),
-            "signature": str(inspect.signature(fn)),
-        }
+        payload.setdefault("_debug", {}).setdefault("builder", {})
+        payload["_debug"]["builder"].update(
+            {
+                "name": chosen,
+                "indicator_service_file": svc_file,
+                "builder_file": inspect.getsourcefile(fn),
+                "signature": str(inspect.signature(fn)),
+            }
+        )
     except Exception:
         pass
 
@@ -149,96 +102,34 @@ def country_data(
     payload.setdefault("series_mode", series)
     return payload
 
-# --- Country Radar: added probe + lite endpoints (append-only) ---
-from typing import Any, Callable, Dict, Optional
-from fastapi import Query
-from fastapi.responses import JSONResponse
 
-# Probe endpoint for builder/API connectivity
-@router.get("/__action_probe")
-def __action_probe() -> Dict[str, Any]:
-    return {"ok": True, "path": "/__action_probe"}
-
-# --- Legacy shim: keep old behavior available without overriding the main route ---
-# NOTE: Do NOT re-declare `router` here; we reuse the existing router from above.
-# If you still need the legacy, direct call, expose it on a different path.
+# --- Optional: keep the old behavior on a separate path ----------------------
+# This preserves the simple "legacy" call that always uses build_country_payload(country)
 try:
-    from app.services.indicator_service import build_country_payload as _legacy_build_country_payload
+    from app.services.indicator_service import build_country_payload as _legacy_build  # type: ignore
 except Exception:
-    _legacy_build_country_payload = None  # optional; legacy handler below will guard
+    _legacy_build = None
 
-@router.get("/country-data-legacy")
+@router.get("/country-data-legacy", tags=["country"], summary="Country Data (legacy)")
 def country_data_legacy(
     country: str = Query(..., description="Full country name, e.g., Germany")
 ):
     """
-    Legacy endpoint that calls the old build_country_payload(country) signature directly.
-    Kept only to avoid breaking old references. Prefer /country-data with series/keep.
+    Legacy behavior: directly calls build_country_payload(country).
+    Useful for debugging or parity checks with the old implementation.
     """
-    if _legacy_build_country_payload is None:
+    if _legacy_build is None:
         return JSONResponse(
             {"ok": False, "error": "legacy build_country_payload is unavailable"},
             status_code=500,
         )
     try:
-        payload = _legacy_build_country_payload(country)  # old signature
+        payload = _legacy_build(country)
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
     if not isinstance(payload, dict):
         payload = {"result": payload}
     payload.setdefault("country", country)
     return payload
-
-# ---------------------- append-only below ----------------------
-from typing import Any
-from fastapi.responses import JSONResponse
-
-# Simple probe so Actions/curl can confirm wiring
-@router.get("/__action_probe")
-def __action_probe() -> dict[str, Any]:
-    return {"ok": True, "path": "/__action_probe"}
-
-# Latest-only compact bundle for GPT reliability
-@router.get("/v1/country-lite")
-def country_lite(country: str = Query(..., description="Full country name, e.g., Germany")):
-    """
-    Tries a lite builder if present; otherwise falls back to the existing
-    full builder `build_country_payload(country)` and returns that.
-    """
-    try:
-        from app.services import indicator_service as _svc
-        # Prefer lite-style builders if available (safe if missing)
-        for name in (
-            "get_country_lite",
-            "country_lite",
-            "assemble_country_lite",
-            "build_country_lite",
-            "get_country_compact",
-            "country_compact",
-        ):
-            f = getattr(_svc, name, None)
-            if callable(f):
-                try:
-                    # some lite builders accept series="none"; others only (country)
-                    try:
-                        payload = f(country=country, series="none")
-                    except TypeError:
-                        payload = f(country)
-                except Exception as e:
-                    return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-                break
-        else:
-            # Fallback to your known full builder
-            payload = build_country_payload(country)
-    except Exception:
-        # Final fallback: call full builder directly
-        try:
-            payload = build_country_payload(country)
-        except Exception as e2:
-            return JSONResponse({"ok": False, "error": f"{e2}"}, status_code=500)
-
-    if not isinstance(payload, dict):
-        payload = {"result": payload}
-    payload.setdefault("country", country)
-    return JSONResponse(payload)
-# -------------------- end append-only block --------------------
+# ---------------------------------------------------------------------------
