@@ -76,57 +76,34 @@ def get_country_data(
     falls back to legacy (country-only) signatures if needed.
     """
     try:
-        # Lazy import to avoid circulars / stale imports
-        from app.services import indicator_service as _svc  # type: ignore
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"country-data import error: {e}")
+# inside get_country_data(...), right where you build `payload`:
+from app.services import indicator_service as _svc  # lazy import is fine too
 
-    # Try modern names first, then older ones; the first callable wins.
-    CANDIDATES = (
-        # strongly preferred modern builders you’ve been working on
-        "build_country_payload_v2",
-        "assemble_country_payload",
-        "assemble_country_data_v2",
-        "build_country_data_v2",
-        # common alternates
-        "get_country_data_v2",
-        "country_data_v2",
-        "get_country_bundle",
-        "build_country_bundle",
-        # legacy names (often return the skeleton)
-        "build_country_payload",
-        "build_country_data",
-        "assemble_country_data",
-        "get_country_data",
-        "make_country_data",
-    )
+PREF = (
+    "build_country_payload_v2","assemble_country_payload","assemble_country_data_v2",
+    "build_country_data_v2","get_country_data_v2","country_data_v2","get_country_bundle",
+    "build_country_bundle",
+    # legacy last
+    "build_country_payload","build_country_data","assemble_country_data","get_country_data","make_country_data",
+)
 
-    fn = None
-    chosen = None
-    for name in CANDIDATES:
-        cand = getattr(_svc, name, None)
-        if callable(cand):
-            fn = cand
-            chosen = name
-            break
+fn = None; chosen = None
+for name in PREF:
+    cand = getattr(_svc, name, None)
+    if callable(cand):
+        fn, chosen = cand, name
+        break
 
-    if fn is None:
-        raise HTTPException(
-            status_code=500,
-            detail="No country-data builder found on indicator_service. "
-                   "Expected one of: " + ", ".join(CANDIDATES),
-        )
+if fn is None:
+    raise HTTPException(status_code=500, detail="No suitable country-data builder found in indicator_service")
 
-    # Call with modern kwargs if possible; otherwise fall back to (country).
+try:
     try:
-        try:
-            payload = fn(country=country, series=series, keep=keep)  # type: ignore[call-arg]
-        except TypeError:
-            payload = fn(country)  # type: ignore[misc]
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"{chosen} failed: {e}")
+        payload = fn(country=country, series=series, keep=keep)  # modern signature
+    except TypeError:
+        payload = fn(country)  # legacy signature fallback
+except Exception as e:
+    raise HTTPException(status_code=500, detail=f"{chosen} failed: {e}")
 
     if not isinstance(payload, dict):
         payload = {"result": payload}
