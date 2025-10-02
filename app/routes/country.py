@@ -55,53 +55,26 @@ def country_data(
     ),
 ) -> Dict[str, Any]:
     """
-    Full macro bundle. Prefers a modern monthly-first builder in indicator_service,
-    passing `series` and `keep` when supported; falls back to legacy (country-only) signature.
+    Full macro bundle. Prefers a modern monthly-first builder; falls back to legacy.
     """
-    fn, chosen, svc_file = _choose_indicator_builder()
-    if fn is None:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "No suitable country-data builder found on indicator_service. "
-                "Export a modern builder (e.g., build_country_payload_v2(country, series, keep)) "
-                "or keep build_country_payload(country) available as a fallback."
-            ),
-        )
+    # ⬇️ Put these lines INSIDE the function body (not at module top)
+    from app.services import indicator_service as _svc
 
-    # Call with modern kwargs if possible; otherwise fall back to (country).
+    # Try modern signature first; fall back to legacy (country-only)
     try:
         try:
-            payload = fn(country=country, series=series, keep=keep)  # type: ignore[misc]
+            payload = _svc.build_country_payload(country=country, series=series, keep=keep)  # type: ignore[arg-type]
         except TypeError:
-            payload = fn(country)  # type: ignore[misc]
-    except HTTPException:
-        raise
+            payload = _svc.build_country_payload(country)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"{chosen} failed: {e}")
+        raise HTTPException(status_code=500, detail=f"country-data error: {e}")
 
     if not isinstance(payload, dict):
         payload = {"result": payload}
 
-    # Debug: which builder/file executed (safe to keep)
-    try:
-        import inspect
-        payload.setdefault("_debug", {}).setdefault("builder", {})
-        payload["_debug"]["builder"].update(
-            {
-                "name": chosen,
-                "indicator_service_file": svc_file,
-                "builder_file": inspect.getsourcefile(fn),
-                "signature": str(inspect.signature(fn)),
-            }
-        )
-    except Exception:
-        pass
-
     payload.setdefault("country", country)
     payload.setdefault("series_mode", series)
     return payload
-
 
 # --- Optional: keep the old behavior on a separate path ----------------------
 # This preserves the simple "legacy" call that always uses build_country_payload(country)
