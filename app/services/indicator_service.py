@@ -527,3 +527,37 @@ def build_country_payload(country: str) -> Dict[str, Any]:  # type: ignore[overr
     return build_country_payload_modern(country, series="mini", keep=60)
 
 # === End append-only override =================================================
+
+# ===== Country Radar authoritative override (append-only) =====================
+# Keep the public name stable for routes, but route it to the modern builder.
+# This must be at the *very end* of the file so nothing else can override it.
+
+from typing import Dict, Any
+
+try:
+    build_country_payload_modern  # type: ignore[name-defined]
+except NameError:
+    # Fallback in case the modern builder has a different name in your file;
+    # Adjust the tuple below if you used another modern name.
+    for _name in (
+        "build_country_payload_modern",
+        "build_country_payload_v2",
+        "assemble_country_payload_modern",
+        "assemble_country_payload",
+    ):
+        _cand = globals().get(_name)
+        if callable(_cand):
+            build_country_payload_modern = _cand  # type: ignore[assignment]
+            break
+    else:
+        # As a last resort, keep the legacy implementation (already defined above)
+        # but still expose it under a distinct name so we can see it in introspection.
+        build_country_payload_modern = globals()["build_country_payload"]  # type: ignore[assignment]
+
+def build_country_payload(country: str) -> Dict[str, Any]:  # legacy public API
+    """
+    Authoritative override: make the legacy name call the modern builder.
+    We deliberately ignore 'series'/'keep' here so routes with a fixed signature work.
+    """
+    return build_country_payload_modern(country)  # type: ignore[misc]
+# ==============================================================================
