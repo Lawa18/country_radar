@@ -64,51 +64,75 @@ def _assemble_country_payload(country: str, series: str, keep: int) -> Dict[str,
 def get_country_data(
     country: str = Query(..., description="Full country name, e.g., Sweden"),
     series: Literal["none", "mini", "full"] = Query(
-        "mini", description="Timeseries size (none=latest only)"
+        "mini", description='Timeseries size (none = latest only, "mini" ~ 5y)'
     ),
     keep: int = Query(
         60, ge=0, le=20000, description="Trim timeseries length (points to keep)"
     ),
 ) -> Dict[str, Any]:
     """
-    Full macro bundle. This route prefers the monthly-first builder from
-    indicator_service. It passes `series` and `keep` when supported, and
-    falls back to legacy (country-only) signatures if needed.
+    Full macro bundle. Prefer the monthly-first builder in indicator_service.
+    Passes `series` and `keep` when supported; falls back to legacy signature.
     """
+    from fastapi import HTTPException
+
+    # Lazy import to avoid circulars or stale imports
     try:
-# inside get_country_data(...), right where you build `payload`:
-from app.services import indicator_service as _svc  # lazy import is fine too
+        from app.services import indicator_service as _svc  # type: ignore
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"country-data import error: {e}")
 
-PREF = (
-    "build_country_payload_v2","assemble_country_payload","assemble_country_data_v2",
-    "build_country_data_v2","get_country_data_v2","country_data_v2","get_country_bundle",
-    "build_country_bundle",
-    # legacy last
-    "build_country_payload","build_country_data","assemble_country_data","get_country_data","make_country_data",
-)
+    # Try modern names first, then older ones; the first callable wins.
+    CANDIDATES = (
+        # strongly preferred modern builders
+        "build_country_payload_v2",
+        "assemble_country_payload",
+        "assemble_country_data_v2",
+        "build_country_data_v2",
+        # common alternates
+        "get_country_data_v2",
+        "country_data_v2",
+        "get_country_bundle",
+        "build_country_bundle",
+        # legacy names (often return the skeleton)
+        "build_country_payload",
+        "build_country_data",
+        "assemble_country_data",
+        "get_country_data",
+        "make_country_data",
+    )
 
-fn = None; chosen = None
-for name in PREF:
-    cand = getattr(_svc, name, None)
-    if callable(cand):
-        fn, chosen = cand, name
-        break
+    fn = None
+    chosen = None
+    for name in CANDIDATES:
+        cand = getattr(_svc, name, None)
+        if callable(cand):
+            fn = cand
+            chosen = name
+            break
 
-if fn is None:
-    raise HTTPException(status_code=500, detail="No suitable country-data builder found in indicator_service")
+    if fn is None:
+        raise HTTPException(
+            status_code=500,
+            detail="No suitable country-data builder found on indicator_service. "
+                   "Expected one of: " + ", ".join(CANDIDATES),
+        )
 
-try:
+    # Call with modern kwargs if possible; otherwise fall back to (country).
     try:
-        payload = fn(country=country, series=series, keep=keep)  # modern signature
-    except TypeError:
-        payload = fn(country)  # legacy signature fallback
-except Exception as e:
-    raise HTTPException(status_code=500, detail=f"{chosen} failed: {e}")
+        try:
+            payload = fn(country=country, series=series, keep=keep)  # type: ignore[misc]
+        except TypeError:
+            payload = fn(country)  # type: ignore[misc]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{chosen} failed: {e}")
 
     if not isinstance(payload, dict):
         payload = {"result": payload}
 
-    # Diagnostics to confirm which builder/file executed (harmless to leave on)
+    # Diagnostics: show which builder/file executed (harmless to leave)
     try:
         import inspect
         dbg = payload.setdefault("_debug", {})
