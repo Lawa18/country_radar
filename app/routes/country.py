@@ -106,3 +106,24 @@ def country_data_legacy(
     payload.setdefault("country", country)
     return payload
 # ---------------------------------------------------------------------------
+
+from fastapi import APIRouter
+import inspect
+
+router = APIRouter()
+
+@router.get("/__which_builder")
+def __which_builder():
+    try:
+        from app.services import indicator_service as svc
+        fn = getattr(svc, "build_country_payload", None)
+        if not callable(fn):
+            return {"ok": False, "error": "build_country_payload not callable"}
+        return {
+            "ok": True,
+            "function_str": str(fn),
+            "file": inspect.getsourcefile(fn),
+            "starts_with": "\n".join(inspect.getsource(fn).splitlines()[:8]),
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
