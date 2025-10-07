@@ -1,47 +1,46 @@
-# app/routes/country.py
 from __future__ import annotations
 
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Callable, Dict, Optional, Tuple, Literal
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 router = APIRouter()
 
-
-def _choose_indicator_builder() -> tuple[Optional[callable], Optional[str], Optional[str]]:
-    """
-    Load app.services.indicator_service and pick the best available builder.
-    Returns (fn, chosen_name, svc_file) or (None, None, svc_file_if_loaded).
-    """
+# ---------------------------------------------------------------------------
+# Helper: pick the best available builder on indicator_service
+# Priority:
+#   1) build_country_payload_v2(country, series, keep)  <-- modern, monthly-first
+#   2) assemble_country_payload / build_country_data / assemble_country_data / get_country_data / make_country_data
+#   3) build_country_payload(country)                   <-- legacy fallback (returns placeholders)
+# ---------------------------------------------------------------------------
+def _choose_indicator_builder() -> Tuple[Optional[Callable[..., Any]], str, Optional[str]]:
     try:
-        from app.services import indicator_service as _svc  # type: ignore
-    except Exception:
-        return (None, None, None)
+        from app.services import indicator_service as svc
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"indicator_service import failed: {e}")
 
-    candidates = (
-        # Strongly preferred modern builders (add your actual modern name if different)
+    import inspect
+    svc_file = getattr(svc, "__file__", None)
+
+    candidates: Tuple[str, ...] = (
+        # modern / monthly-first (expects series & keep)
         "build_country_payload_v2",
+        # other plausible builders you may have used earlier
         "assemble_country_payload",
-        "assemble_country_data_v2",
-        "build_country_data_v2",
-        # Other plausible alternates
-        "get_country_data_v2",
-        "country_data_v2",
-        "get_country_bundle",
-        "build_country_bundle",
-        # Legacy names (your current export is build_country_payload)
-        "build_country_payload",
         "build_country_data",
         "assemble_country_data",
         "get_country_data",
         "make_country_data",
+        # legacy fallback (country-only; returns placeholders)
+        "build_country_payload",
     )
 
     for name in candidates:
-        fn = getattr(_svc, name, None)
+        fn = getattr(svc, name, None)
         if callable(fn):
-            return (fn, name, getattr(_svc, "__file__", None))
-    return (None, None, getattr(_svc, "__file__", None))
+            return fn, name, svc_file
+
+    return None, "", svc_file
 
 
 @router.get("/country-data", tags=["country"], summary="Country Data")
@@ -55,75 +54,49 @@ def country_data(
     ),
 ) -> Dict[str, Any]:
     """
-    Full macro bundle. Prefers a modern monthly-first builder; falls back to legacy.
+    Full macro bundle. Prefers a modern monthly-first builder in indicator_service,
+    passing `series` and `keep` when supported; falls back to legacy (country-only) signature.
     """
-    # ⬇️ Put these lines INSIDE the function body (not at module top)
-    from app.services import indicator_service as _svc
+    fn, chosen, svc_file = _choose_indicator_builder()
+    if fn is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "No suitable country-data builder found on indicator_service. "
+                "Export a modern builder (e.g., build_country_payload_v2(country, series, keep)) "
+                "or keep build_country_payload(country) available as a fallback."
+            ),
+        )
 
-    # Try modern signature first; fall back to legacy (country-only)
+    # Call with modern kwargs if possible; otherwise fall back to (country).
     try:
         try:
-            payload = _svc.build_country_payload(country=country, series=series, keep=keep)  # type: ignore[arg-type]
+            payload = fn(country=country, series=series, keep=keep)  # type: ignore[misc]
         except TypeError:
-            payload = _svc.build_country_payload(country)
+            payload = fn(country)  # type: ignore[misc]
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"country-data error: {e}")
+        raise HTTPException(status_code=500, detail=f"{chosen} failed: {e}")
 
     if not isinstance(payload, dict):
         payload = {"result": payload}
+
+    # Debug: which builder/file executed (harmless to keep; helps during deploy)
+    try:
+        import inspect
+        payload.setdefault("_debug", {}).setdefault("builder", {})
+        payload["_debug"]["builder"].update(
+            {
+                "name": chosen,
+                "indicator_service_file": svc_file,
+                "builder_file": inspect.getsourcefile(fn),
+                "signature": str(inspect.signature(fn)),
+            }
+        )
+    except Exception:
+        pass
 
     payload.setdefault("country", country)
     payload.setdefault("series_mode", series)
     return payload
-
-# --- Optional: keep the old behavior on a separate path ----------------------
-# This preserves the simple "legacy" call that always uses build_country_payload(country)
-try:
-    from app.services.indicator_service import build_country_payload as _legacy_build  # type: ignore
-except Exception:
-    _legacy_build = None
-
-@router.get("/country-data-legacy", tags=["country"], summary="Country Data (legacy)")
-def country_data_legacy(
-    country: str = Query(..., description="Full country name, e.g., Germany")
-):
-    """
-    Legacy behavior: directly calls build_country_payload(country).
-    Useful for debugging or parity checks with the old implementation.
-    """
-    if _legacy_build is None:
-        return JSONResponse(
-            {"ok": False, "error": "legacy build_country_payload is unavailable"},
-            status_code=500,
-        )
-    try:
-        payload = _legacy_build(country)
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-
-    if not isinstance(payload, dict):
-        payload = {"result": payload}
-    payload.setdefault("country", country)
-    return payload
-# ---------------------------------------------------------------------------
-
-from fastapi import APIRouter
-import inspect
-
-router = APIRouter()
-
-@router.get("/__which_builder")
-def __which_builder():
-    try:
-        from app.services import indicator_service as svc
-        fn = getattr(svc, "build_country_payload", None)
-        if not callable(fn):
-            return {"ok": False, "error": "build_country_payload not callable"}
-        return {
-            "ok": True,
-            "function_str": str(fn),
-            "file": inspect.getsourcefile(fn),
-            "starts_with": "\n".join(inspect.getsource(fn).splitlines()[:8]),
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
