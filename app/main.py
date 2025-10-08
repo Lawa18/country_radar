@@ -265,3 +265,91 @@ async def _unhandled_exc_handler(_, exc: Exception):
             "version": APP_VERSION,
         },
     )
+# ===== Country Radar additive diagnostics (append to end of app/main.py) =====
+import os, logging
+from typing import Any, Dict, List
+from fastapi.responses import JSONResponse
+from fastapi.openapi.utils import get_openapi
+
+CR_APP_VERSION = os.getenv("CR_VERSION", "2025.10.07-step1c")
+_import_errors: List[str] = []  # populated if you add safe-import later
+
+def _cr_list_routes(_app) -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    for r in _app.routes:
+        methods = sorted(getattr(r, "methods", {"GET"}))
+        entries.append({"path": r.path, "methods": methods})
+    entries.sort(key=lambda x: x["path"])
+    return entries
+
+def _cr_route_exists(_app, path: str, method: str = "GET") -> bool:
+    m = method.upper()
+    for r in _app.routes:
+        if getattr(r, "path", None) == path and m in getattr(r, "methods", {"GET"}):
+            return True
+    return False
+
+# /healthz and root banner (you didn't have them yet)
+@app.get("/healthz", tags=["meta"])
+def _cr_healthz():
+    return {"status": "ok", "version": CR_APP_VERSION}
+
+@app.get("/", tags=["meta"])
+def _cr_root():
+    return {
+        "ok": True,
+        "service": "country-radar",
+        "version": CR_APP_VERSION,
+        "routes": _cr_list_routes(app),
+        "import_errors": _import_errors,
+    }
+
+# Fallback probe ONLY if a router didn't already define it
+if not _cr_route_exists(app, "/__action_probe", "GET"):
+    @app.get("/__action_probe", tags=["diagnostics"])
+    def _cr_action_probe():
+        return {"ok": True, "version": CR_APP_VERSION, "source": "app.main:additive"}
+
+# Startup diagnostics captured inside the running Uvicorn process
+@app.on_event("startup")
+async def _cr_on_startup() -> None:
+    app.state.startup_diagnostics = {
+        "version": CR_APP_VERSION,
+        "routes": _cr_list_routes(app),
+        "import_errors": _import_errors,
+    }
+    logging.getLogger(__name__).info("Startup diagnostics: %s", app.state.startup_diagnostics)
+
+# OpenAPI wrapper: keep your current generator, just tweak servers/schema/version
+try:
+    _cr_orig_openapi = app.openapi  # whatever you defined earlier
+except Exception:
+    _cr_orig_openapi = lambda: get_openapi(title=app.title, version=app.version, routes=app.routes)  # noqa: E731
+
+def _cr_force_object_schema(spec: Dict[str, Any], path: str, method: str = "get") -> None:
+    try:
+        method = method.lower()
+        node = spec.setdefault("paths", {}).setdefault(path, {}).setdefault(method, {})
+        node = node.setdefault("responses", {}).setdefault("200", {}).setdefault("content", {}).setdefault("application/json", {})
+        node["schema"] = {"type": "object", "additionalProperties": True}
+    except Exception:
+        pass
+
+def _cr_openapi():
+    spec = _cr_orig_openapi()
+    # Prefer explicit servers from env (works great behind proxies / GPT)
+    servers_env = os.getenv("OPENAPI_SERVER_URLS")
+    if servers_env:
+        spec["servers"] = [{"url": u.strip()} for u in servers_env.split(",") if u.strip()]
+    else:
+        base = os.getenv("COUNTRY_RADAR_BASE_URL", "http://localhost:8000")
+        spec["servers"] = [{"url": base, "description": "Default"}]
+    # Normalize and make schemas lenient for key endpoints if present
+    spec["openapi"] = "3.1.1"
+    for p in ("/country-data", "/v1/country-lite", "/__action_probe", "/healthz", "/"):
+        if p in (spec.get("paths") or {}):
+            _cr_force_object_schema(spec, p, "get")
+    return spec
+
+app.openapi = _cr_openapi
+# ===== End additive diagnostics =================================================
