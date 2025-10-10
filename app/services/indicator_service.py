@@ -1,295 +1,295 @@
-# app/services/indicator_service.py
+# app/services/indicator_service.py — modern builder (IMF→WB, optional Eurostat),
+# series=mini|full, keep=N days, with _debug traces and debt integration.
 from __future__ import annotations
 
-from typing import Dict, Any, Optional, Tuple
+import os
+import socket
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 
-# --- Utilities ---------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-def _latest_kv(d: Optional[Dict[str, float]]) -> Tuple[Optional[str], Optional[float]]:
-    if not isinstance(d, dict) or not d:
+def _parse_period_key(p: str) -> Tuple[int, int, int]:
+    """Sort 'YYYY', 'YYYY-MM', 'YYYY-Qn' as (Y,M,Q)."""
+    try:
+        if "-Q" in p:
+            y, q = p.split("-Q", 1)
+            return (int(y), 0, int(q))
+        if "-" in p:
+            y, m = p.split("-", 1)
+            return (int(y), int(m), 0)
+        return (int(p), 0, 0)
+    except Exception:
+        return (0, 0, 0)
+
+
+def _latest(series: Optional[Mapping[str, Any]]) -> Tuple[Optional[str], Optional[float]]:
+    if not isinstance(series, Mapping) or not series:
         return None, None
+    keys = sorted(series.keys(), key=_parse_period_key)
+    k = keys[-1]
     try:
-        k = max(d.keys())
-        return k, d.get(k)
+        v = float(series[k])
     except Exception:
-        return None, None
+        v = None
+    return k, v
 
-def _blank_latest(value_key: str = "value", period_key: str = "date", source: Optional[str] = None) -> Dict[str, Any]:
-    return {value_key: None, period_key: None, "source": source}
 
-def _blank_block() -> Dict[str, Any]:
-    return {"latest": _blank_latest(), "series": {}}
+def _trim_points(series: Optional[Mapping[str, Any]], n_points: int) -> Dict[str, Any]:
+    if not isinstance(series, Mapping) or n_points <= 0:
+        return {}
+    items = sorted(series.items(), key=lambda kv: _parse_period_key(kv[0]))
+    if n_points < len(items):
+        items = items[-n_points:]
+    return {k: v for k, v in items}
 
-# --- Country codes -----------------------------------------------------------
 
-def resolve_country_codes(name: str) -> Optional[Dict[str, str]]:
+def _route_env_flag(name: str, default_true: bool = True) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default_true
+    return str(v).lower() not in {"0", "false", "no", "off"}
+
+
+def _host_resolves(host: str) -> bool:
     try:
-        from app.utils.country_codes import resolve_country_codes as _rc
-        return _rc(name)
-    except Exception:
-        return None
+        socket.getaddrinfo(host, 443)
+        return True
+    except OSError:
+        return False
 
-# --- Optional: debt payload --------------------------------------------------
 
-def compute_debt_payload(country: str) -> Dict[str, Any]:
-    """
-    Try to load a richer debt payload if available; otherwise return blanks.
-    Expected (best case) keys:
-      - government_debt: {"latest":{...}, "series":{...}}
-      - nominal_gdp:     {"latest":{...}, "series":{...}}
-      - debt_to_gdp:     {"latest":{...}, "series":{...}}
-      - debt_to_gdp_series: {...}  (optional convenience)
-    """
+def _resolve_iso(country: str) -> Dict[str, Optional[str]]:
+    result = {"name": country, "iso_alpha_2": None, "iso_alpha_3": None, "iso_numeric": None}
     try:
-        from app.services.debt_service import compute_debt_payload as _cdp  # type: ignore
-        out = _cdp(country) or {}
-        # Normalize shapes to avoid KeyErrors
-        if "government_debt" not in out:
-            out["government_debt"] = _blank_block()
-        if "nominal_gdp" not in out:
-            out["nominal_gdp"] = _blank_block()
-        if "debt_to_gdp" not in out:
-            out["debt_to_gdp"] = _blank_block()
-        out.setdefault("debt_to_gdp_series", out.get("debt_to_gdp", {}).get("series") or {})
-        return out
-    except Exception:
-        return {
-            "government_debt": _blank_block(),
-            "nominal_gdp": _blank_block(),
-            "debt_to_gdp": _blank_block(),
-            "debt_to_gdp_series": {},
-        }
-
-# --- Providers (import defensively) -----------------------------------------
-
-def _load_providers():
-    p: Dict[str, Any] = {}
-    # IMF monthly
-    try:
-        from app.providers.imf_provider import (
-            imf_cpi_yoy_monthly,
-            imf_unemployment_rate_monthly,
-            imf_fx_usd_monthly,
-            imf_reserves_usd_monthly,
-            imf_policy_rate_monthly,
-            imf_gdp_growth_quarterly,
-        )
-        p.update(locals())
+        from app.utils import country_codes as cc  # type: ignore
+        for fn in ("resolve_country", "name_to_iso", "get_iso_codes", "lookup_country", "resolve"):
+            f = getattr(cc, fn, None)
+            if callable(f):
+                try:
+                    out = f(country)
+                    if isinstance(out, Mapping):
+                        result.update({
+                            "name": out.get("name", country),
+                            "iso_alpha_2": out.get("iso_alpha_2") or out.get("iso2"),
+                            "iso_alpha_3": out.get("iso_alpha_3") or out.get("iso3"),
+                            "iso_numeric": out.get("iso_numeric") or out.get("isonum"),
+                        })
+                        return result
+                except Exception:
+                    pass
     except Exception:
         pass
+    return result
 
-    # Eurostat monthly (EU overrides for CPI/unemployment if present)
+
+# ---------------------------------------------------------------------------
+# Provider wrapper (try several function names and kw variants)
+# ---------------------------------------------------------------------------
+
+def _call_provider(module_name: str, candidates: Iterable[str], **kwargs) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    dbg: Dict[str, Any] = {"module": module_name, "tried": []}
     try:
-        from app.providers.eurostat_provider import (
-            eurostat_hicp_yoy_monthly,
-            eurostat_unemployment_rate_monthly,
-        )
-        p.update(locals())
-    except Exception:
-        pass
+        mod = __import__(module_name, fromlist=["*"])  # type: ignore
+    except Exception as e:
+        dbg["error"] = f"import_failed: {e}"
+        return None, dbg
 
-    # ECB policy (for euro area/GB logic is handled by caller if needed)
-    try:
-        from app.providers.ecb_provider import ecb_policy_rate_for_country
-        p.update(locals())
-    except Exception:
-        pass
+    kw_variants = [kwargs]
+    if "country" in kwargs:
+        kw = dict(kwargs)
+        kw["name"] = kw.pop("country")
+        kw_variants.append(kw)
+    if "iso2" in kwargs:
+        kw = dict(kwargs)
+        kw["code"] = kw.pop("iso2")
+        kw_variants.append(kw)
 
-    # World Bank annual fallbacks
-    try:
-        from app.providers.wb_provider import (
-            wb_current_account_balance_pct_gdp_annual,
-            wb_government_effectiveness_annual,
-        )
-        p.update(locals())
-    except Exception:
-        pass
+    for fn in candidates:
+        f = getattr(mod, fn, None)
+        if not callable(f):
+            dbg["tried"].append({fn: "missing"})
+            continue
+        for kv in kw_variants:
+            try:
+                series = f(**kv)
+                dbg["tried"].append({fn: {"ok": True}})
+                if isinstance(series, Mapping):
+                    return dict(series), dbg
+                if isinstance(series, (list, tuple)):
+                    return {str(i): v for i, v in enumerate(series)}, dbg
+                return {"value": series}, dbg
+            except Exception as e:
+                dbg["tried"].append({fn: {"error": str(e)}})
+    return None, dbg
 
-    return p
 
-# --- Indicator assembly ------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Indicator config
+# ---------------------------------------------------------------------------
 
-_EU_UK_ISO2 = {
-    "AT","BE","BG","HR","CY","CZ","DE","DK","EE","ES","FI","FR","GR","EL","HU","IE",
-    "IT","LT","LU","LV","MT","NL","PL","PT","RO","SE","SI","SK","IS","NO","LI","GB"
+_INDICATORS = {
+    "cpi_yoy": {
+        "imf": ("get_cpi_yoy_monthly", "get_cpi_yoy"),
+        "wb": ("get_cpi_inflation_annual",),
+        "eurostat": ("get_hicp_yoy_iso2", "hicp_yoy_iso2", "get_hicp_yoy"),
+        "freq": "monthly",
+    },
+    "unemployment_rate": {
+        "imf": ("get_unemployment_rate_monthly", "get_unemployment_rate"),
+        "wb": ("get_unemployment_annual",),
+        "eurostat": ("get_unemployment_rate_iso2", "unemployment_rate_iso2", "get_unemployment_rate"),
+        "freq": "monthly",
+    },
+    "fx_rate_usd": {
+        "imf": ("get_fx_rate_usd",),
+        "wb": ("get_fx_official_annual",),
+        "freq": "monthly",
+    },
+    "reserves_usd": {
+        "imf": ("get_reserves_usd",),
+        "wb": ("get_reserves_annual",),
+        "freq": "monthly",
+    },
+    "policy_rate": {
+        "imf": ("get_policy_rate",),
+        "wb": (),
+        "freq": "monthly",
+    },
+    "gdp_growth": {
+        "imf": ("get_gdp_growth_quarterly",),
+        "wb": ("get_gdp_growth_annual",),
+        "freq": "quarterly",
+    },
 }
 
-def _indicators_for(country: str, iso2: str, iso3: str) -> Dict[str, Any]:
+_MINI_SET = ("cpi_yoy", "unemployment_rate", "fx_rate_usd", "reserves_usd", "policy_rate", "gdp_growth")
+
+
+def _points_for_keep(freq: str, keep_days: int) -> int:
+    if keep_days <= 0:
+        return 0
+    if freq == "monthly":
+        # ~30 days each
+        return max(1, round(keep_days / 30))
+    if freq == "quarterly":
+        return max(1, round(keep_days / 90))
+    # annual or unknown
+    return max(1, round(keep_days / 365))
+
+
+# ---------------------------------------------------------------------------
+# Public API: modern builder
+# ---------------------------------------------------------------------------
+
+def build_country_payload_v2(country: str, series: str = "full", keep: int = 180) -> Dict[str, Any]:
+    """Modern builder with IMF primary, WB fallback, optional Eurostat.
+
+    * series: 'mini' for a lighter payload, 'full' for all configured indicators
+    * keep: trims historical points to the last N days worth (approx by freq)
     """
-    Assemble the indicator block with monthly-first preference.
-    Keys we return (match your UI): cpi_yoy, unemployment_rate, fx_rate_usd, reserves_usd,
-    policy_rate, gdp_growth, current_account_balance_pct_gdp, government_effectiveness.
-    Each sub-block: {"latest_value":..., "latest_period":..., "source": "...", "series": {}}
-    """
-    P = _load_providers()
-    out: Dict[str, Any] = {}
+    iso = _resolve_iso(country)
+    eurostat_enabled = _route_env_flag("EUROSTAT_ENABLED", True)
+    eurostat_host = os.getenv("EUROSTAT_HOST", "data-api.ec.europa.eu")
+    eurostat_ok = eurostat_enabled and _host_resolves(eurostat_host)
 
-    # CPI YoY (IMF monthly; Eurostat override for EU/EEA/UK if available)
-    latest_period, latest_value, src = None, None, "N/A"
-    ser = {}
-    if "imf_cpi_yoy_monthly" in P:
-        ser = (P["imf_cpi_yoy_monthly"](iso2) or {})
-        lp, lv = _latest_kv(ser)
-        latest_period, latest_value, src = lp, lv, "IMF"
-    if iso2 in _EU_UK_ISO2 and "eurostat_hicp_yoy_monthly" in P:
-        eu = P["eurostat_hicp_yoy_monthly"](iso2) or {}
-        lp, lv = _latest_kv(eu)
-        # prefer the fresher of IMF vs Eurostat
-        if lp and (not latest_period or lp > latest_period):
-            latest_period, latest_value, src = lp, lv, "Eurostat"
-            ser = eu
-    out["cpi_yoy"] = {
-        "latest_value": latest_value,
-        "latest_period": latest_period,
-        "source": src,
-        "series": {},
+    chosen = _MINI_SET if str(series).lower() == "mini" else tuple(_INDICATORS.keys())
+
+    indicators: Dict[str, Any] = {}
+    source_trace: Dict[str, Any] = {}
+
+    for key in chosen:
+        cfg = _INDICATORS[key]
+        freq = cfg.get("freq", "monthly")
+
+        # IMF first
+        ser, dbg_imf = _call_provider("app.providers.imf_provider", cfg["imf"], country=country)
+        src = None
+        if isinstance(ser, Mapping) and ser:
+            src = "IMF"
+        else:
+            # Eurostat (if viable and defined for this indicator)
+            ser = None
+            dbg_es = {"skipped": True}
+            if eurostat_ok and cfg.get("eurostat"):
+                ser, dbg_es = _call_provider("app.providers.eurostat_provider", cfg["eurostat"], iso2=iso.get("iso_alpha_2") or "")
+                if isinstance(ser, Mapping) and ser:
+                    src = "Eurostat"
+            # World Bank fallback (annual)
+            if not src:
+                ser, dbg_wb = _call_provider("app.providers.wb_provider", cfg["wb"], country=country)
+                if isinstance(ser, Mapping) and ser:
+                    src = "WorldBank"
+                source_trace[key] = {"imf": dbg_imf, "eurostat": (dbg_es if eurostat_ok else {"enabled": False}), "wb": (dbg_wb if 'dbg_wb' in locals() else {})}
+            else:
+                source_trace[key] = {"imf": dbg_imf, "eurostat": (dbg_es if eurostat_ok else {"enabled": False}), "wb": {}}
+        if src == "IMF":
+            source_trace[key] = {"imf": dbg_imf, "eurostat": {"skipped": not eurostat_ok}, "wb": {}}
+
+        # Normalize & trim
+        trimmed: Dict[str, Any] = {}
+        if isinstance(ser, Mapping):
+            # coerce to float where possible
+            _ser = {}
+            for k, v in ser.items():
+                try:
+                    _ser[str(k)] = float(v)
+                except Exception:
+                    _ser[str(k)] = v
+            trimmed = _trim_points(_ser, _points_for_keep(freq, keep))
+
+        latest_period, latest_value = _latest(trimmed or ser)
+        indicators[key] = {
+            "series": trimmed,
+            "latest_period": latest_period,
+            "latest_value": latest_value,
+            "source": src,
+            "freq": freq,
+        }
+
+    # Debt integration (reuse existing helper without changing its schema)
+    debt_payload = None
+    try:
+        from app.routes.debt import compute_debt_payload  # type: ignore
+        debt_payload = compute_debt_payload(country=country)
+    except Exception:
+        try:
+            from app.services.indicator_service import compute_debt_payload  # type: ignore
+            if callable(compute_debt_payload):
+                debt_payload = compute_debt_payload(country=country)
+        except Exception:
+            debt_payload = None
+
+    out: Dict[str, Any] = {
+        "ok": True,
+        "country": country,
+        "iso_codes": iso,
+        "series_mode": series,
+        "keep_days": keep,
+        "indicators": indicators,
+        "_debug": {
+            "builder": {
+                "used": "build_country_payload_v2",
+                "module": __name__,
+            },
+            "source_trace": source_trace,
+            "eurostat": {"enabled": eurostat_enabled, "host": eurostat_host, "dns": bool(eurostat_ok)},
+        },
     }
 
-    # Unemployment rate (IMF monthly; Eurostat override for EU/EEA/UK)
-    ser = {}
-    latest_period, latest_value, src = None, None, "N/A"
-    if "imf_unemployment_rate_monthly" in P:
-        ser = P["imf_unemployment_rate_monthly"](iso2) or {}
-        lp, lv = _latest_kv(ser)
-        latest_period, latest_value, src = lp, lv, "IMF"
-    if iso2 in _EU_UK_ISO2 and "eurostat_unemployment_rate_monthly" in P:
-        eu = P["eurostat_unemployment_rate_monthly"](iso2) or {}
-        lp, lv = _latest_kv(eu)
-        if lp and (not latest_period or lp > latest_period):
-            latest_period, latest_value, src = lp, lv, "Eurostat"
-            ser = eu
-    out["unemployment_rate"] = {
-        "latest_value": latest_value,
-        "latest_period": latest_period,
-        "source": src,
-        "series": {},
-    }
-
-    # FX rate to USD (IMF monthly)
-    ser = {}
-    latest_period, latest_value, src = None, None, "N/A"
-    if "imf_fx_usd_monthly" in P:
-        ser = P["imf_fx_usd_monthly"](iso2) or {}
-        lp, lv = _latest_kv(ser)
-        latest_period, latest_value, src = lp, lv, "IMF"
-    out["fx_rate_usd"] = {
-        "latest_value": latest_value,
-        "latest_period": latest_period,
-        "source": src,
-        "series": {},
-    }
-
-    # Reserves USD (IMF monthly)
-    ser = {}
-    latest_period, latest_value, src = None, None, "N/A"
-    if "imf_reserves_usd_monthly" in P:
-        ser = P["imf_reserves_usd_monthly"](iso2) or {}
-        lp, lv = _latest_kv(ser)
-        latest_period, latest_value, src = lp, lv, "IMF"
-    out["reserves_usd"] = {
-        "latest_value": latest_value,
-        "latest_period": latest_period,
-        "source": src,
-        "series": {},
-    }
-
-    # Policy rate (ECB override for EU area if available; else IMF monthly)
-    ser = {}
-    latest_period, latest_value, src = None, None, "N/A"
-    used = False
-    if iso2 in _EU_UK_ISO2 and "ecb_policy_rate_for_country" in P:
-        ecb = P["ecb_policy_rate_for_country"](iso2) or {}
-        lp, lv = _latest_kv(ecb)
-        if lp:
-            latest_period, latest_value, src = lp, lv, "ECB"
-            used = True
-    if (not used) and "imf_policy_rate_monthly" in P:
-        ser = P["imf_policy_rate_monthly"](iso2) or {}
-        lp, lv = _latest_kv(ser)
-        latest_period, latest_value, src = lp, lv, "IMF"
-    out["policy_rate"] = {
-        "latest_value": latest_value,
-        "latest_period": latest_period,
-        "source": src,
-        "series": {},
-    }
-
-    # GDP growth (IMF quarterly preferred)
-    ser = {}
-    latest_period, latest_value, src = None, None, "N/A"
-    if "imf_gdp_growth_quarterly" in P:
-        ser = P["imf_gdp_growth_quarterly"](iso2) or {}
-        lp, lv = _latest_kv(ser)
-        latest_period, latest_value, src = lp, lv, "IMF"
-    out["gdp_growth"] = {
-        "latest_value": latest_value,
-        "latest_period": latest_period,
-        "source": src,
-        "series": {},
-    }
-
-    # Current account balance % GDP (WB annual)
-    ser = {}
-    latest_period, latest_value, src = None, None, "N/A"
-    if "wb_current_account_balance_pct_gdp_annual" in P:
-        ser = P["wb_current_account_balance_pct_gdp_annual"](iso3) or {}
-        lp, lv = _latest_kv(ser)
-        latest_period, latest_value, src = lp, lv, "WorldBank"
-    out["current_account_balance_pct_gdp"] = {
-        "latest_value": latest_value,
-        "latest_period": latest_period,
-        "source": src,
-        "series": {},
-    }
-
-    # Government effectiveness (WB annual)
-    ser = {}
-    latest_period, latest_value, src = None, None, "N/A"
-    if "wb_government_effectiveness_annual" in P:
-        ser = P["wb_government_effectiveness_annual"](iso3) or {}
-        lp, lv = _latest_kv(ser)
-        latest_period, latest_value, src = lp, lv, "WorldBank"
-    out["government_effectiveness"] = {
-        "latest_value": latest_value,
-        "latest_period": latest_period,
-        "source": src,
-        "series": {},
-    }
+    if isinstance(debt_payload, Mapping):
+        for key in ("government_debt", "nominal_gdp", "debt_to_gdp", "debt_to_gdp_series"):
+            if key in debt_payload:
+                out[key] = debt_payload[key]
 
     return out
 
-# --- Public entrypoint (keeps same signature your route expects) --------------
 
-def build_country_payload(country: str) -> Dict[str, Any]:
-    """
-    The only function your /country-data route calls right now.
-    It resolves codes, builds indicators (monthly-first), and merges the debt block
-    (if available). It never throws: on any failure it returns a safe skeleton.
-    """
-    codes = resolve_country_codes(country)
-    if not codes:
-        return {"error": "Invalid country name", "country": country}
+# ---------------------------------------------------------------------------
+# Legacy compatibility shim (optional): if older code imports build_country_payload
+# ---------------------------------------------------------------------------
 
-    iso2, iso3 = codes["iso_alpha_2"], codes["iso_alpha_3"]
-
-    # Debt block (won’t crash if service missing)
-    debt_bundle = compute_debt_payload(country)
-
-    # Indicators
-    indicators = _indicators_for(country, iso2, iso3)
-
-    return {
-        "country": country,
-        "iso_codes": {
-            "name": country,
-            "iso_alpha_2": iso2,
-            "iso_alpha_3": iso3,
-            "iso_numeric": codes.get("iso_numeric"),
-        },
-        # leave this for compatibility
-        "imf_data": {},
-        # debt bundle (as produced by debt_service or blanks)
-        **debt_bundle,
-        # indicators for the UI
-        "additional_indicators": indicators,
-    }
+def build_country_payload(country: str, series: str = "full", keep: int = 180) -> Dict[str, Any]:
+    """Compatibility wrapper to the modern builder."""
+    return build_country_payload_v2(country=country, series=series, keep=keep)
