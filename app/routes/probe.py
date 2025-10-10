@@ -1,143 +1,362 @@
+# app/routes/probe.py — diagnostics & lite payload (additive, robust)
 from __future__ import annotations
-from fastapi import APIRouter, Query
-from typing import Dict, Any, Optional, Tuple
 
-from app.utils.country_codes import resolve_country_codes
-from app.providers.imf_provider import (
-    imf_cpi_yoy_monthly, imf_unemployment_rate_monthly,
-    imf_fx_usd_monthly, imf_reserves_usd_monthly, imf_policy_rate_monthly,
-    imf_gdp_growth_quarterly,
-)
-from app.providers.eurostat_provider import (
-    eurostat_hicp_yoy_monthly, eurostat_unemployment_rate_monthly,
-)
-from app.providers.wb_provider import (
-    wb_cpi_yoy_annual, wb_unemployment_rate_annual, wb_fx_rate_usd_annual,
-    wb_reserves_usd_annual, wb_gdp_growth_annual_pct,
-)
+import os
+import socket
+import time
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
-# NEW: used by /v1/country-lite response
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
 router = APIRouter()
 
-def _latest_key(d: Dict[str, float]) -> Optional[str]:
-    if not d: return None
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+def _parse_period_key(p: str) -> Tuple[int, int, int]:
+    """Sort periods like 'YYYY', 'YYYY-MM', 'YYYY-Qn'. Returns (Y,M,Q)."""
     try:
-        return max(d.keys())
+        if "-Q" in p:
+            y, q = p.split("-Q", 1)
+            return (int(y), 0, int(q))
+        if "-" in p:
+            y, m = p.split("-", 1)
+            return (int(y), int(m), 0)
+        return (int(p), 0, 0)
     except Exception:
-        return None
+        return (0, 0, 0)
 
-@router.get("/__probe_series")
-def probe_series(country: str = Query(...)):
-    codes = resolve_country_codes(country)
-    if not codes:
-        return {"ok": False, "error": "invalid_country"}
-    iso2, iso3 = codes["iso_alpha_2"], codes["iso_alpha_3"]
 
-    out: Dict[str, Any] = {"country": country, "iso2": iso2, "iso3": iso3, "series": {}}
+def _summary(series: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(series, Mapping) or not series:
+        return {"len": 0, "latest": None}
+    keys = sorted(series.keys(), key=_parse_period_key)
+    return {"len": len(keys), "latest": keys[-1]}
 
-    # CPI
-    imf_cpi = imf_cpi_yoy_monthly(iso2) or {}
-    eu_cpi  = eurostat_hicp_yoy_monthly(iso2) or {}
-    wb_cpi  = wb_cpi_yoy_annual(iso3) or {}
-    out["series"]["cpi"] = {
-        "IMF": {"len": len(imf_cpi), "latest": _latest_key(imf_cpi)},
-        "Eurostat": {"len": len(eu_cpi), "latest": _latest_key(eu_cpi)},
-        "WB_annual": {"len": len(wb_cpi), "latest": _latest_key(wb_cpi)},
-    }
 
-    # Unemployment
-    imf_u = imf_unemployment_rate_monthly(iso2) or {}
-    eu_u  = eurostat_unemployment_rate_monthly(iso2) or {}
-    wb_u  = wb_unemployment_rate_annual(iso3) or {}
-    out["series"]["unemployment"] = {
-        "IMF": {"len": len(imf_u), "latest": _latest_key(imf_u)},
-        "Eurostat": {"len": len(eu_u), "latest": _latest_key(eu_u)},
-        "WB_annual": {"len": len(wb_u), "latest": _latest_key(wb_u)},
-    }
+def _route_env_flag(name: str, default_true: bool = True) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default_true
+    return str(v).lower() not in {"0", "false", "no", "off"}
 
-    # FX
-    imf_fx = imf_fx_usd_monthly(iso2) or {}
-    wb_fx  = wb_fx_rate_usd_annual(iso3) or {}
-    out["series"]["fx"] = {
-        "IMF": {"len": len(imf_fx), "latest": _latest_key(imf_fx)},
-        "WB_annual": {"len": len(wb_fx), "latest": _latest_key(wb_fx)},
-    }
 
-    # Reserves
-    imf_r = imf_reserves_usd_monthly(iso2) or {}
-    wb_r  = wb_reserves_usd_annual(iso3) or {}
-    out["series"]["reserves"] = {
-        "IMF": {"len": len(imf_r), "latest": _latest_key(imf_r)},
-        "WB_annual": {"len": len(wb_r), "latest": _latest_key(wb_r)},
-    }
-
-    # Policy rate
-    imf_pol = imf_policy_rate_monthly(iso2) or {}
-    out["series"]["policy_rate"] = {
-        "IMF": {"len": len(imf_pol), "latest": _latest_key(imf_pol)},
-        # ECB override happens higher up; we only need to see if IMF has data here
-    }
-
-    # GDP growth
-    imf_gdp_q = imf_gdp_growth_quarterly(iso2) or {}
-    wb_gdp_a  = wb_gdp_growth_annual_pct(iso3) or {}
-    out["series"]["gdp_growth"] = {
-        "IMF_quarterly": {"len": len(imf_gdp_q), "latest": _latest_key(imf_gdp_q)},
-        "WB_annual": {"len": len(wb_gdp_a), "latest": _latest_key(wb_gdp_a)},
-    }
-
-    return {"ok": True, **out}
-
-# ---------------------- appended endpoints (keep existing code above) --------
-
-@router.get("/__action_probe", summary="Connectivity probe")
-def __action_probe():
-    return {"ok": True, "path": "/__action_probe"}
-
-@router.get("/v1/country-lite")
-def country_lite(country: str = Query(..., description="Full country name, e.g., Germany")):
-    """
-    Prefer the modern monthly-first builder; fall back only if not present.
-    """
+def _host_resolves(host: str) -> bool:
     try:
-        from app.services import indicator_service as _svc
+        socket.getaddrinfo(host, 443)
+        return True
+    except socket.gaierror:
+        return False
+
+
+def _resolve_iso(country: str) -> Dict[str, Optional[str]]:
+    """Best-effort ISO resolution without assuming exact util names."""
+    result = {"name": country, "iso_alpha_2": None, "iso_alpha_3": None, "iso_numeric": None}
+    try:
+        from app.utils import country_codes as cc  # type: ignore
+        for fn in ("resolve_country", "name_to_iso", "get_iso_codes", "lookup_country", "resolve"):
+            f = getattr(cc, fn, None)
+            if callable(f):
+                try:
+                    out = f(country)
+                    if isinstance(out, Mapping):
+                        result.update({
+                            "name": out.get("name", country),
+                            "iso_alpha_2": out.get("iso_alpha_2") or out.get("iso2"),
+                            "iso_alpha_3": out.get("iso_alpha_3") or out.get("iso3"),
+                            "iso_numeric": out.get("iso_numeric") or out.get("isonum"),
+                        })
+                        return result
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return result
+
+
+def _call_provider(module_name: str, candidates: Iterable[str], **kwargs) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """Try several function names & kwarg spellings; return (series, debug)."""
+    dbg: Dict[str, Any] = {"module": module_name, "tried": []}
+    try:
+        mod = __import__(module_name, fromlist=["*"])  # type: ignore
     except Exception as e:
-        return JSONResponse({"ok": False, "error": f"indicator_service import failed: {e}"}, status_code=500)
+        dbg["error"] = f"import_failed: {e}"
+        return None, dbg
 
-    # 1) Strong preference: the monthly-first builder you’ve been iterating on
-    PREFERRED = ("build_country_payload",)
+    # Try several kw spellings commonly seen in this repo
+    kw_variants = [kwargs]
+    if "country" in kwargs:
+        kw = dict(kwargs)
+        kw["name"] = kw.pop("country")
+        kw_variants.append(kw)
+    if "iso2" in kwargs:
+        kw = dict(kwargs)
+        kw["code"] = kw.pop("iso2")
+        kw_variants.append(kw)
 
-    # 2) Other plausible lite/full builders (in decreasing preference)
-    FALLBACKS = (
-        "get_country_lite","country_lite","assemble_country_lite",
-        "build_country_lite","get_country_compact","country_compact",
-        "country_data","build_country_data","assemble_country_data","get_country_data","make_country_data",
+    for fn in candidates:
+        f = getattr(mod, fn, None)
+        if not callable(f):
+            dbg["tried"].append({fn: "missing"})
+            continue
+        for kv in kw_variants:
+            t0 = time.time()
+            try:
+                series = f(**kv)
+                dbg["tried"].append({fn: {"ok": True, "ms": round((time.time()-t0)*1000,1)}})
+                if isinstance(series, Mapping):
+                    return dict(series), dbg
+                # allow providers that return full payloads
+                if isinstance(series, (list, tuple)):
+                    return {str(i): v for i, v in enumerate(series)}, dbg
+                # as a last resort, wrap scalar
+                return {"value": series}, dbg
+            except Exception as e:
+                dbg["tried"].append({fn: {"error": str(e)}})
+    return None, dbg
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@router.get("/__action_probe")
+def action_probe(request: Request):
+    return {
+        "ok": True,
+        "version": getattr(request.app, "version", None),
+        "source": "app.routes.probe",
+        "path": "/__action_probe",
+    }
+
+
+@router.get("/__probe_series", summary="Probe Series")
+def probe_series(country: str = Query(..., description="Full country name, e.g., Germany")):
+    iso = _resolve_iso(country)
+
+    # IMF fetches
+    imf_cpi, imf_cpi_dbg = _call_provider(
+        "app.providers.imf_provider",
+        ("get_cpi_yoy_monthly", "get_cpi_yoy", "cpi_yoy_monthly", "cpi_yoy"),
+        country=country,
+    )
+    imf_ue, imf_ue_dbg = _call_provider(
+        "app.providers.imf_provider",
+        ("get_unemployment_rate_monthly", "get_unemployment_rate", "unemployment_rate_monthly", "unemployment_rate"),
+        country=country,
+    )
+    imf_fx, imf_fx_dbg = _call_provider(
+        "app.providers.imf_provider",
+        ("get_fx_rate_usd", "fx_rate_usd"),
+        country=country,
+    )
+    imf_res, imf_res_dbg = _call_provider(
+        "app.providers.imf_provider",
+        ("get_reserves_usd", "reserves_usd"),
+        country=country,
+    )
+    imf_pol, imf_pol_dbg = _call_provider(
+        "app.providers.imf_provider",
+        ("get_policy_rate", "policy_rate"),
+        country=country,
+    )
+    imf_gdpq, imf_gdpq_dbg = _call_provider(
+        "app.providers.imf_provider",
+        ("get_gdp_growth_quarterly", "gdp_growth_quarterly"),
+        country=country,
     )
 
-    payload = None
+    # World Bank (annual fallbacks)
+    wb_cpi, wb_cpi_dbg = _call_provider(
+        "app.providers.wb_provider",
+        ("get_cpi_inflation_annual", "cpi_inflation_annual"),
+        country=country,
+    )
+    wb_ue, wb_ue_dbg = _call_provider(
+        "app.providers.wb_provider",
+        ("get_unemployment_annual", "unemployment_annual"),
+        country=country,
+    )
+    wb_fx, wb_fx_dbg = _call_provider(
+        "app.providers.wb_provider",
+        ("get_fx_official_annual", "fx_official_annual"),
+        country=country,
+    )
+    wb_res, wb_res_dbg = _call_provider(
+        "app.providers.wb_provider",
+        ("get_reserves_annual", "reserves_annual"),
+        country=country,
+    )
+    wb_gdp, wb_gdp_dbg = _call_provider(
+        "app.providers.wb_provider",
+        ("get_gdp_growth_annual", "gdp_growth_annual"),
+        country=country,
+    )
 
-    # Try preferred first
-    for name in PREFERRED + FALLBACKS:
-        f = getattr(_svc, name, None)
-        if not callable(f):
-            continue
+    # Eurostat (optional + fail-fast)
+    eurostat_enabled = _route_env_flag("EUROSTAT_ENABLED", True)
+    eurostat_host = os.getenv("EUROSTAT_HOST", "data-api.ec.europa.eu")
+
+    es_hicp = es_hicp_dbg = es_ue = es_ue_dbg = None, {}
+    if eurostat_enabled and _host_resolves(eurostat_host):
+        es_hicp, es_hicp_dbg = _call_provider(
+            "app.providers.eurostat_provider",
+            ("get_hicp_yoy_iso2", "hicp_yoy_iso2", "get_hicp_yoy"),
+            iso2=iso.get("iso_alpha_2") or iso.get("iso2") or "",
+        )
+        es_ue, es_ue_dbg = _call_provider(
+            "app.providers.eurostat_provider",
+            ("get_unemployment_rate_iso2", "unemployment_rate_iso2", "get_unemployment_rate"),
+            iso2=iso.get("iso_alpha_2") or iso.get("iso2") or "",
+        )
+    else:
+        es_hicp_dbg = {"skipped": True, "reason": "disabled_or_dns"}
+        es_ue_dbg = {"skipped": True, "reason": "disabled_or_dns"}
+
+    out = {
+        "ok": True,
+        "country": country,
+        "iso2": iso.get("iso_alpha_2"),
+        "iso3": iso.get("iso_alpha_3"),
+        "series": {
+            "cpi": {
+                "IMF": _summary(imf_cpi),
+                "Eurostat": _summary(es_hicp),
+                "WB_annual": _summary(wb_cpi),
+            },
+            "unemployment": {
+                "IMF": _summary(imf_ue),
+                "Eurostat": _summary(es_ue),
+                "WB_annual": _summary(wb_ue),
+            },
+            "fx": {
+                "IMF": _summary(imf_fx),
+                "WB_annual": _summary(wb_fx),
+            },
+            "reserves": {
+                "IMF": _summary(imf_res),
+                "WB_annual": _summary(wb_res),
+            },
+            "policy_rate": {
+                "IMF": _summary(imf_pol),
+            },
+            "gdp_growth": {
+                "IMF_quarterly": _summary(imf_gdpq),
+                "WB_annual": _summary(wb_gdp),
+            },
+        },
+        "_debug": {
+            "imf": {
+                "cpi": imf_cpi_dbg,
+                "unemployment": imf_ue_dbg,
+                "fx": imf_fx_dbg,
+                "reserves": imf_res_dbg,
+                "policy_rate": imf_pol_dbg,
+                "gdp_growth": imf_gdpq_dbg,
+            },
+            "wb": {
+                "cpi": wb_cpi_dbg,
+                "unemployment": wb_ue_dbg,
+                "fx": wb_fx_dbg,
+                "reserves": wb_res_dbg,
+                "gdp_growth": wb_gdp_dbg,
+            },
+            "eurostat": {
+                "hicp": es_hicp_dbg,
+                "unemployment": es_ue_dbg,
+                "enabled": eurostat_enabled,
+                "host": eurostat_host,
+            },
+        },
+    }
+    return JSONResponse(out)
+
+
+@router.get("/v1/country-lite")
+def country_lite(country: str = Query(..., description="Full country name, e.g., Mexico")):
+    iso = _resolve_iso(country)
+
+    # Reuse the same calls as probe but only extract the latest values
+    def _latest_val(series: Optional[Mapping[str, Any]]) -> Tuple[Optional[float], Optional[str]]:
+        if not isinstance(series, Mapping) or not series:
+            return None, None
+        keys = sorted(series.keys(), key=_parse_period_key)
+        k = keys[-1]
         try:
-            # Most of your builders accept country= and series=; try that first.
-            try:
-                payload = f(country=country, series="none")
-            except TypeError:
-                payload = f(country)  # older signatures
+            v = float(series[k])
+        except Exception:
+            v = None
+        return v, k
+
+    imf_cpi, _ = _call_provider("app.providers.imf_provider", ("get_cpi_yoy_monthly", "get_cpi_yoy"), country=country)
+    imf_ue, _ = _call_provider("app.providers.imf_provider", ("get_unemployment_rate_monthly", "get_unemployment_rate"), country=country)
+    imf_fx, _ = _call_provider("app.providers.imf_provider", ("get_fx_rate_usd",), country=country)
+    imf_res, _ = _call_provider("app.providers.imf_provider", ("get_reserves_usd",), country=country)
+    imf_pol, _ = _call_provider("app.providers.imf_provider", ("get_policy_rate",), country=country)
+    imf_gdpq, _ = _call_provider("app.providers.imf_provider", ("get_gdp_growth_quarterly",), country=country)
+
+    # Governance & current account examples (WB)
+    wb_cab, _ = _call_provider("app.providers.wb_provider", ("get_current_account_pct_gdp",), country=country)
+    wb_ge, _ = _call_provider("app.providers.wb_provider", ("get_government_effectiveness",), country=country)
+
+    # Assemble
+    out: Dict[str, Any] = {
+        "country": country,
+        "iso_codes": iso,
+        "imf_data": {},  # reserved for raw bundles if you add them later
+        "latest": {},     # optional lite headline
+        "series": {},     # keep your existing structure if you prefer
+        "source": None,
+        "additional_indicators": {},
+    }
+
+    # Example headline from WB debt ratio if present
+    wb_debt_ratio, _ = _call_provider("app.providers.wb_provider", ("get_debt_ratio_annual", "debt_ratio_annual"), country=country)
+    if isinstance(wb_debt_ratio, Mapping) and wb_debt_ratio:
+        v, k = _latest_val(wb_debt_ratio)
+        if k is not None:
+            out["latest"] = {"year": k, "value": v, "source": "World Bank (ratio)"}
+            out["series"] = {k: v} if v is not None else {}
+            out["source"] = "World Bank (ratio)"
+
+    # Additional indicators (latest only)
+    for label, ser in (
+        ("cpi_yoy", imf_cpi),
+        ("unemployment_rate", imf_ue),
+        ("fx_rate_usd", imf_fx),
+        ("reserves_usd", imf_res),
+        ("policy_rate", imf_pol),
+        ("gdp_growth", imf_gdpq),
+        ("current_account_balance_pct_gdp", wb_cab),
+        ("government_effectiveness", wb_ge),
+    ):
+        v, k = _latest_val(ser)
+        if k is not None:
+            out["additional_indicators"][label] = {
+                "latest_value": v,
+                "latest_period": k,
+                "source": "IMF" if label in {"cpi_yoy","unemployment_rate","fx_rate_usd","reserves_usd","policy_rate","gdp_growth"} else "WorldBank",
+                "series": {},  # keep lite small
+            }
+
+    # Debt integration (reuse your debt helper if available)
+    try:
+        # Preferred: function inside routes.debt (commit mentioned compute_debt_payload)
+        from app.routes.debt import compute_debt_payload  # type: ignore
+        debt_payload = compute_debt_payload(country=country)
+    except Exception:
+        # Fallback: maybe services has it
+        try:
+            from app.services.indicator_service import compute_debt_payload  # type: ignore
+            debt_payload = compute_debt_payload(country=country)
         except Exception as e:
-            return JSONResponse({"ok": False, "error": f"{name} failed: {e}"}, status_code=500)
-        else:
-            break
+            debt_payload = None
+            out.setdefault("_debug", {})["debt_error"] = str(e)
 
-    if payload is None:
-        return JSONResponse({"ok": False, "error": "No lite builder found and no full builder fallback available."}, status_code=500)
+    if isinstance(debt_payload, Mapping):
+        for key in ("government_debt", "nominal_gdp", "debt_to_gdp", "debt_to_gdp_series"):
+            if key in debt_payload:
+                out[key] = debt_payload[key]
 
-    if not isinstance(payload, dict):
-        payload = {"result": payload}
-    payload.setdefault("country", country)
-    return JSONResponse(payload)
+    return JSONResponse(out)
