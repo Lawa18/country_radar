@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Literal
+
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 
@@ -31,7 +32,7 @@ def _flex_call_builder(builder, country: str, series: str, keep: int):
 def country_data(
     country: str = Query(..., description="Full country name, e.g., Sweden"),
     series: Literal["none", "mini", "full"] = Query(
-        "mini", description='Timeseries size (none = latest only, "mini" ~ 5y)'
+        "mini", description='Timeseries size (none = latest only, "mini" ~ 5y, "full" = full history)'
     ),
     keep: int = Query(
         180, ge=1, le=3650, description="Keep N days of history (approx by freq)"
@@ -83,6 +84,25 @@ def country_data(
     if not isinstance(payload, dict):
         payload = {"result": payload}
 
+    # If builder didn't include debt blocks, enrich using existing helper(s)
+    if not any(k in payload for k in ("government_debt", "debt_to_gdp", "nominal_gdp")):
+        debt_payload = None
+        try:
+            # Preferred: reuse the existing route helper if present
+            from app.routes.debt import compute_debt_payload  # type: ignore
+            debt_payload = compute_debt_payload(country=country)
+        except Exception:
+            try:
+                # Fallback: service-level helper, if available
+                from app.services.indicator_service import compute_debt_payload  # type: ignore
+                debt_payload = compute_debt_payload(country=country)
+            except Exception:
+                debt_payload = None
+        if isinstance(debt_payload, dict):
+            for key in ("government_debt", "nominal_gdp", "debt_to_gdp", "debt_to_gdp_series"):
+                if key in debt_payload:
+                    payload[key] = debt_payload[key]
+
     if debug:
         dbg = payload.setdefault("_debug", {})
         try:
@@ -101,7 +121,7 @@ def country_data(
             },
         )
 
-    # Ensure friendly top-level fields
+    # Friendly top-level fields
     payload.setdefault("country", country)
     payload.setdefault("series_mode", series)
     payload.setdefault("keep_days", keep)
