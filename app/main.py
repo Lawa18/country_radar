@@ -52,22 +52,6 @@ async def log_requests(request: Request, call_next):
         dur_ms = (time.time() - start) * 1000.0
         print(f"[req] {request.method} {path}?{request.query_params} ua={ua} -> {resp.status_code} {dur_ms:.1f}ms")
     return resp
-    
-try:
-    # tries to import app/routes/debt_bundle.py (must define `router = APIRouter()`)
-    from app.routes import debt_bundle as _cr_debt_bundle
-except Exception as _e:
-    _cr_debt_bundle = None
-    print("[init] WARNING: debt_bundle router not available:", _e)
-else:
-    try:
-        app.include_router(_cr_debt_bundle.router, tags=["debt"])
-        try:
-            print("[init] debt_bundle router mounted from:", _cr_debt_bundle.__file__)
-        except Exception:
-            print("[init] debt_bundle router mounted")
-    except Exception as _e2:
-        print("[init] WARNING: could not include debt_bundle router:", _e2)
 
 # ----------------------------------------------------------------------------
 # Routers (safe include) — avoids hard failures and records problems
