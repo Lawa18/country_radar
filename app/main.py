@@ -17,21 +17,21 @@ APP_TITLE = "Country Radar API"
 APP_VERSION = os.getenv("CR_VERSION", "2025.10.07-step1b")
 
 # --- Create app
-app = FastAPI(title=APP_TITLE, version=APP_VERSION, openapi_url="/openapi.json")
+ = FastAPI(title=_TITLE, version=_VERSION, openapi_url="/openapi.json")
 
 # ----------------------------------------------------------------------------
 # Middleware
 # ----------------------------------------------------------------------------
-app.add_middleware(
+.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+.add_middleware(GZipMiddleware, minimum_size=1000)
 
-@app.middleware("http")
+@.middleware("http")
 async def log_requests(request: Request, call_next):
     path = request.url.path
     ua = request.headers.get("user-agent", "")
@@ -52,6 +52,22 @@ async def log_requests(request: Request, call_next):
         dur_ms = (time.time() - start) * 1000.0
         print(f"[req] {request.method} {path}?{request.query_params} ua={ua} -> {resp.status_code} {dur_ms:.1f}ms")
     return resp
+    
+try:
+    # tries to import app/routes/debt_bundle.py (must define `router = APIRouter()`)
+    from app.routes import debt_bundle as _cr_debt_bundle
+except Exception as _e:
+    _cr_debt_bundle = None
+    print("[init] WARNING: debt_bundle router not available:", _e)
+else:
+    try:
+        app.include_router(_cr_debt_bundle.router, tags=["debt"])
+        try:
+            print("[init] debt_bundle router mounted from:", _cr_debt_bundle.__file__)
+        except Exception:
+            print("[init] debt_bundle router mounted")
+    except Exception as _e2:
+        print("[init] WARNING: could not include debt_bundle router:", _e2)
 
 # ----------------------------------------------------------------------------
 # Routers (safe include) — avoids hard failures and records problems
@@ -62,26 +78,26 @@ def _include_router_safely(label: str, import_path: str, attr: str = "router") -
     try:
         module = __import__(import_path, fromlist=[attr])
         router = getattr(module, attr)
-        app.include_router(router)
+        .include_router(router)
         print(f"[init] {label} router mounted from: {module.__file__}")
         # list a few of its routes
         try:
             routes = []
             for r in router.routes:  # type: ignore[attr-defined]
                 methods = sorted(getattr(r, "methods", {"GET"}))
-                routes.append((r.path, methods))
+                routes.end((r.path, methods))
             print(f"[init] {label} routes: {routes}")
         except Exception:
             pass
     except Exception as e:
         msg = f"Failed to include {label} ({import_path}.{attr}): {e}"
         logging.exception(msg)
-        import_errors.append(msg)
+        import_errors.end(msg)
 
 # Always try these first; if probe fails, we'll add fallbacks later.
-_include_router_safely("probe", "app.routes.probe")
-_include_router_safely("country", "app.routes.country")
-_include_router_safely("debt", "app.routes.debt")
+_include_router_safely("probe", ".routes.probe")
+_include_router_safely("country", ".routes.country")
+_include_router_safely("debt", ".routes.debt")
 
 # ----------------------------------------------------------------------------
 # Helpers to inspect/ensure routes (prevents duplicates)
@@ -89,16 +105,16 @@ _include_router_safely("debt", "app.routes.debt")
 
 def _list_routes() -> List[Dict[str, Any]]:
     entries: List[Dict[str, Any]] = []
-    for r in app.routes:
+    for r in .routes:
         methods = sorted(getattr(r, "methods", {"GET"}))
-        entries.append({"path": r.path, "methods": methods})
+        entries.end({"path": r.path, "methods": methods})
     entries.sort(key=lambda x: x["path"])
     return entries
 
 
 def _route_exists(path: str, method: str = "GET") -> bool:
     m = method.upper()
-    for r in app.routes:
+    for r in .routes:
         if getattr(r, "path", None) == path and m in getattr(r, "methods", {"GET"}):
             return True
     return False
@@ -106,7 +122,7 @@ def _route_exists(path: str, method: str = "GET") -> bool:
 # ----------------------------------------------------------------------------
 # Core meta endpoints
 # ----------------------------------------------------------------------------
-@app.get("/ping", tags=["meta"])  # simple health
+@.get("/ping", tags=["meta"])  # simple health
 def ping():
     return {"status": "ok"}
 
