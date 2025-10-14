@@ -228,3 +228,15 @@ def debt_latest(
         "series": series,
         "source": latest.get("source"),
     }
+
+# --- diagnostics: prove what's live ---
+@router.get("/__debt_diag", summary="Diag for debt router")
+def __debt_diag():
+    import inspect, hashlib, importlib
+    mod = importlib.import_module(__name__)
+    path = inspect.getsourcefile(mod)
+    src  = inspect.getsource(mod)
+    md5  = hashlib.md5(src.encode("utf-8")).hexdigest()
+    funcs = sorted([n for n,v in mod.__dict__.items() if callable(v) and getattr(v, "__module__", "").endswith(".routes.debt")])
+    return {"module": __name__, "file": path, "md5": md5, "functions": funcs}
+
