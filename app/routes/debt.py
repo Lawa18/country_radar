@@ -1,4 +1,4 @@
-# app/routes/debt.py — merged: native builder (IMF→WB) + legacy service fallback
+# app/routes/debt.py — merged: keep legacy /v1/debt (debt_latest); add /v1/debt-bundle with full bundle
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
@@ -25,6 +25,7 @@ def _parse_period_key(p: str) -> Tuple[int, int, int]:
     except Exception:
         return (0, 0, 0)
 
+
 def _coerce_numeric_dict(d: Optional[Mapping[str, Any]]) -> Dict[str, float]:
     out: Dict[str, float] = {}
     if not isinstance(d, Mapping):
@@ -36,6 +37,7 @@ def _coerce_numeric_dict(d: Optional[Mapping[str, Any]]) -> Dict[str, float]:
             # skip non-numeric
             continue
     return out
+
 
 def _to_annual(d: Mapping[str, float]) -> Dict[str, float]:
     """Collapse monthly/quarterly dict to annual by taking the latest period in each year."""
@@ -52,12 +54,14 @@ def _to_annual(d: Mapping[str, float]) -> Dict[str, float]:
             by_year[year] = (k, v)
     return {y: v for y, (_, v) in sorted(by_year.items(), key=lambda kv: int(kv[0]))}
 
+
 def _latest(d: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
     if not d:
         return None, None
     ks = sorted(d.keys(), key=_parse_period_key)
     k = ks[-1]
     return k, d[k]
+
 
 def _align_ratio(num: Mapping[str, float], den: Mapping[str, float]) -> Dict[str, float]:
     out: Dict[str, float] = {}
@@ -67,6 +71,7 @@ def _align_ratio(num: Mapping[str, float], den: Mapping[str, float]) -> Dict[str
             continue
         out[y] = (nv / dv) * 100.0
     return out
+
 
 def _call_provider(module_name: str, candidates: Iterable[str], **kwargs) -> Tuple[Dict[str, float], Dict[str, Any]]:
     """
@@ -97,20 +102,22 @@ def _call_provider(module_name: str, candidates: Iterable[str], **kwargs) -> Tup
                 dbg["tried"].append({fn: {"ok": True}})
                 return _coerce_numeric_dict(data), dbg
             except Exception as e:
-                dbg["tried"].append({fn: {"error": str(e)}})
+                dbg["tried"].append({fn: {"error\": str(e)}})
     return {}, dbg
+
 
 def _pack(series: Mapping[str, float], source: Optional[str]) -> Dict[str, Any]:
     period, value = _latest(series)
     return {"latest": {"value": value, "date": period, "source": source}, "series": dict(series)}
 
+
 # -----------------------------------------------------------------------------
-# Public: native reusable builder
+# Public: native reusable builder (IMF → WB; compute if needed)
 # -----------------------------------------------------------------------------
 
 def compute_debt_payload(country: str) -> Dict[str, Any]:
     """
-    Returns a dict with:
+    Returns:
       - government_debt: {latest{value,date,source}, series{year:value}}
       - nominal_gdp:     {latest{value,date,source}, series{year:value}}
       - debt_to_gdp:     {latest{value,date,source}, series{year:value}}
@@ -119,7 +126,7 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
     """
     debug: Dict[str, Any] = {}
 
-    # 1) Direct debt/GDP ratio (prefer IMF)
+    # 1) Direct debt/GDP ratio (prefer IMF; fallback WB)
     imf_ratio, dbg_imf_ratio = _call_provider(
         "app.providers.imf_provider",
         (
@@ -175,7 +182,7 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
     gdp_nominal = _to_annual(imf_gdp_nom or wb_gdp_nom)
     gdp_nominal_src = "IMF" if imf_gdp_nom else ("WorldBank" if wb_gdp_nom else None)
 
-    # 3) Compute ratio if direct missing
+    # 3) Compute ratio if direct missing/sparse
     ratio_series = direct_ratio or _align_ratio(debt_nominal, gdp_nominal)
     ratio_src = direct_ratio_src or (f"computed:{debt_nominal_src or 'NA'}/{gdp_nominal_src or 'NA'}")
 
@@ -192,49 +199,65 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
     }
     return out
 
+
 # -----------------------------------------------------------------------------
-# Endpoint — native builder first; legacy service fallback
+# Routes
 # -----------------------------------------------------------------------------
 
-@router.get("/v1/debt", summary="Debt bundle (IMF→WB)", tags=["debt"])
+@router.get("/v1/debt-bundle", summary="Debt bundle (IMF→WB, full)", tags=["debt"])
 def debt_bundle(
     country: str = Query(..., description="Full country name, e.g., Mexico"),
     debug: bool = Query(False, description="Include provider traces under _debug"),
 ) -> Dict[str, Any]:
-    # 1) Try native builder
+    """Full bundle for modern callers and for reuse in other routes."""
     try:
         result = compute_debt_payload(country=country)
-        if not debug:
-            result.pop("_debug", None)
-        result.setdefault("ok", True)
-        result.setdefault("country", country)
-        return result
-    except Exception as native_err:
-        native_error = str(native_err)
-
-    # 2) Fallback to legacy service behaviour (your current file’s behavior)
-    try:
-        from app.services import debt_service as ds  # lazy import
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to import app.services.debt_service: {e}")
+        return JSONResponse(status_code=500, content={"ok": False, "error": str(e)})
+    if not debug:
+        result.pop("_debug", None)
+    result.setdefault("ok", True)
+    result.setdefault("country", country)
+    return result
 
-    # Try a few likely function names for compatibility (preserve your old code intent)
-    for name in (
-        "compute_debt_payload",
-        "build_debt_payload",
-        "get_debt_payload",
-        "debt_payload_for_country",
-    ):
-        fn = getattr(ds, name, None)
-        if callable(fn):
-            try:
-                payload = fn(country)  # legacy may return ratio-only; that's OK
-                return payload
-            except Exception as e:
-                raise HTTPException(status_code=502, detail=f"debt_service.{name} error: {e}")
 
-    # If all else fails, surface the native error to help debugging
-    raise HTTPException(
-        status_code=500,
-        detail=f"No supported debt payload function found in app.services.debt_service; and native builder failed: {native_error}",
-    )
+@router.get("/v1/debt", summary="Debt (legacy latest ratio)", tags=["debt"])
+def debt_latest(
+    country: str = Query(..., description="Full country name, e.g., Mexico"),
+) -> Dict[str, Any]:
+    """
+    Preserve your legacy behavior. If your old service exists, delegate to it.
+    Otherwise, fall back to the native builder but return a ratio-only payload
+    to keep the legacy schema compatible.
+    """
+    # 1) Legacy passthrough (keeps existing behavior one-to-one)
+    try:
+        from app.services import debt_service as ds  # type: ignore
+        for name in ("debt_latest", "compute_debt_payload", "build_debt_payload", "get_debt_payload"):
+            fn = getattr(ds, name, None)
+            if callable(fn):
+                return fn(country)
+    except Exception:
+        # It's okay if the legacy service isn't present/usable.
+        pass
+
+    # 2) Fallback to native builder, but adapt to legacy output shape
+    try:
+        full = compute_debt_payload(country=country)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"debt_latest fallback failed: {e}")
+
+    # Choose a best-effort ratio to mirror the old simple payload
+    ratio = full.get("debt_to_gdp", {})
+    latest = ratio.get("latest", {})
+    series = full.get("debt_to_gdp_series", {})
+
+    return {
+        "latest": {
+            "year": latest.get("date"),
+            "value": latest.get("value"),
+            "source": latest.get("source"),
+        },
+        "series": series,
+        "source": latest.get("source"),
+    }
