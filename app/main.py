@@ -17,21 +17,21 @@ APP_TITLE = "Country Radar API"
 APP_VERSION = os.getenv("CR_VERSION", "2025.10.07-step1b")
 
 # --- Create app
- = FastAPI(title=_TITLE, version=_VERSION, openapi_url="/openapi.json")
+app = FastAPI(title=APP_TITLE, version=APP_VERSION, openapi_url="/openapi.json")
 
 # ----------------------------------------------------------------------------
 # Middleware
 # ----------------------------------------------------------------------------
-.add_middleware(
+app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-.add_middleware(GZipMiddleware, minimum_size=1000)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-@.middleware("http")
+@app.middleware("http")
 async def log_requests(request: Request, call_next):
     path = request.url.path
     ua = request.headers.get("user-agent", "")
@@ -62,26 +62,26 @@ def _include_router_safely(label: str, import_path: str, attr: str = "router") -
     try:
         module = __import__(import_path, fromlist=[attr])
         router = getattr(module, attr)
-        .include_router(router)
+        app.include_router(router)
         print(f"[init] {label} router mounted from: {module.__file__}")
         # list a few of its routes
         try:
             routes = []
             for r in router.routes:  # type: ignore[attr-defined]
                 methods = sorted(getattr(r, "methods", {"GET"}))
-                routes.end((r.path, methods))
+                routes.append((r.path, methods))
             print(f"[init] {label} routes: {routes}")
         except Exception:
             pass
     except Exception as e:
         msg = f"Failed to include {label} ({import_path}.{attr}): {e}"
         logging.exception(msg)
-        import_errors.end(msg)
+        import_errors.append(msg)
 
 # Always try these first; if probe fails, we'll add fallbacks later.
-_include_router_safely("probe", ".routes.probe")
-_include_router_safely("country", ".routes.country")
-_include_router_safely("debt", ".routes.debt")
+_include_router_safely("probe", "app.routes.probe")
+_include_router_safely("country", "app.routes.country")
+_include_router_safely("debt", "app.routes.debt")
 
 # ----------------------------------------------------------------------------
 # Helpers to inspect/ensure routes (prevents duplicates)
@@ -89,16 +89,16 @@ _include_router_safely("debt", ".routes.debt")
 
 def _list_routes() -> List[Dict[str, Any]]:
     entries: List[Dict[str, Any]] = []
-    for r in .routes:
+    for r in app.routes:
         methods = sorted(getattr(r, "methods", {"GET"}))
-        entries.end({"path": r.path, "methods": methods})
+        entries.append({"path": r.path, "methods": methods})
     entries.sort(key=lambda x: x["path"])
     return entries
 
 
 def _route_exists(path: str, method: str = "GET") -> bool:
     m = method.upper()
-    for r in .routes:
+    for r in app.routes:
         if getattr(r, "path", None) == path and m in getattr(r, "methods", {"GET"}):
             return True
     return False
@@ -106,7 +106,7 @@ def _route_exists(path: str, method: str = "GET") -> bool:
 # ----------------------------------------------------------------------------
 # Core meta endpoints
 # ----------------------------------------------------------------------------
-@.get("/ping", tags=["meta"])  # simple health
+@app.get("/ping", tags=["meta"])  # simple health
 def ping():
     return {"status": "ok"}
 
