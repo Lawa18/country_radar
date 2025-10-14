@@ -1,31 +1,36 @@
-# app/main.py — consolidated, non-destructive, and de-duped
+# app/main.py — clean boot with diagnostics, OpenAPI servers, and safe router mounting
 from __future__ import annotations
 
 import os
 import time
-import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
-from fastapi import FastAPI, Request, Response, Query
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
+from fastapi.openapi.utils import get_openapi
 from starlette.middleware.gzip import GZipMiddleware
 
-# --- App metadata
 APP_TITLE = "Country Radar API"
-APP_VERSION = os.getenv("CR_VERSION", "2025.10.07-step1b")
+APP_VERSION = os.getenv("CR_VERSION", "2025.10.14-step1")
+APP_DESC = "Macroeconomic data API"
 
-# --- Create app
-app = FastAPI(title=APP_TITLE, version=APP_VERSION, openapi_url="/openapi.json")
+# -----------------------------------------------------------------------------
+# App
+# -----------------------------------------------------------------------------
+app = FastAPI(
+    title=APP_TITLE,
+    version=APP_VERSION,
+    description=APP_DESC,
+    openapi_url="/openapi.json",
+)
 
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Middleware
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -35,321 +40,125 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 async def log_requests(request: Request, call_next):
     path = request.url.path
     ua = request.headers.get("user-agent", "")
-    # Silence Render health checks and /ping
-    skip = path == "/ping" or ua.startswith("Render/")
     start = time.time()
     resp: Response = await call_next(request)
 
-    # Trace key endpoints to prove traffic
-    if path.startswith("/__action_probe") or path.startswith("/v1/country-lite") or path.startswith("/country-data"):
-        try:
-            ip = request.client.host if request.client else "-"
-        except Exception:
-            ip = "-"
+    # Light tracing for key endpoints
+    if path in ("/__action_probe", "/v1/country-lite", "/country-data", "/v1/debt", "/v1/debt-bundle"):
+        ip = request.client.host if request.client else "-"
         print(f"[trace] {request.method} {path}?{request.query_params} ua={ua} ip={ip} -> {resp.status_code}")
 
-    if not skip:
-        dur_ms = (time.time() - start) * 1000.0
-        print(f"[req] {request.method} {path}?{request.query_params} ua={ua} -> {resp.status_code} {dur_ms:.1f}ms")
+    dur_ms = (time.time() - start) * 1000.0
+    if not ua.startswith("Render/") and path not in ("/ping",):
+        print(f"[req] {request.method} {path}?{request.query_params} -> {resp.status_code} {dur_ms:.1f}ms")
     return resp
 
-# ----------------------------------------------------------------------------
-# Routers (safe include) — avoids hard failures and records problems
-# ----------------------------------------------------------------------------
-import_errors: List[str] = []
-
-def _include_router_safely(label: str, import_path: str, attr: str = "router") -> None:
+# -----------------------------------------------------------------------------
+# Router mounting (safe / non-fatal)
+# -----------------------------------------------------------------------------
+def _safe_include(label: str, import_path: str, attr: str = "router") -> Tuple[bool, List[Tuple[str, List[str]]]]:
+    """Import a module.router and include it; return (ok, routes)."""
     try:
         module = __import__(import_path, fromlist=[attr])
         router = getattr(module, attr)
-        app.include_router(router)
-        print(f"[init] {label} router mounted from: {module.__file__}")
-        # list a few of its routes
-        try:
-            routes = []
-            for r in router.routes:  # type: ignore[attr-defined]
-                methods = sorted(getattr(r, "methods", {"GET"}))
-                routes.append((r.path, methods))
-            print(f"[init] {label} routes: {routes}")
-        except Exception:
-            pass
+        app.include_router(router, tags=[label])
+
+        routes = []
+        for r in getattr(router, "routes", []):
+            if getattr(r, "path", None) and getattr(r, "methods", None):
+                routes.append((r.path, sorted(list(r.methods))))
+        print(f"[init] {label} router mounted from: {getattr(module, '__file__', import_path)}")
+        print(f"[init] {label} routes: {routes}")
+        return True, routes
     except Exception as e:
-        msg = f"Failed to include {label} ({import_path}.{attr}): {e}"
-        logging.exception(msg)
-        import_errors.append(msg)
+        print(f"[init] WARNING: Failed to mount {label} router from {import_path}: {e}")
+        return False, []
 
-# Always try these first; if probe fails, we'll add fallbacks later.
-_include_router_safely("probe", "app.routes.probe")
-_include_router_safely("country", "app.routes.country")
-_include_router_safely("debt", "app.routes.debt")
+mounted: Dict[str, Any] = {}
+mounted["probe"]   = _safe_include("probe",   "app.routes.probe")
+mounted["country"] = _safe_include("country", "app.routes.country")
+mounted["debt"]    = _safe_include("debt",    "app.routes.debt")
+# Optional new full-bundle debt router; OK if not present yet
+mounted["debt_bundle"] = _safe_include("debt", "app.routes.debt_bundle")
 
-# ----------------------------------------------------------------------------
-# Helpers to inspect/ensure routes (prevents duplicates)
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Health / Root
+# -----------------------------------------------------------------------------
+@app.get("/ping")
+def ping() -> Dict[str, Any]:
+    return {"ok": True, "ts": int(time.time())}
 
-def _list_routes() -> List[Dict[str, Any]]:
-    entries: List[Dict[str, Any]] = []
-    for r in app.routes:
-        methods = sorted(getattr(r, "methods", {"GET"}))
-        entries.append({"path": r.path, "methods": methods})
-    entries.sort(key=lambda x: x["path"])
-    return entries
-
-
-def _route_exists(path: str, method: str = "GET") -> bool:
-    m = method.upper()
-    for r in app.routes:
-        if getattr(r, "path", None) == path and m in getattr(r, "methods", {"GET"}):
-            return True
-    return False
-
-# ----------------------------------------------------------------------------
-# Core meta endpoints
-# ----------------------------------------------------------------------------
-@app.get("/ping", tags=["meta"])  # simple health
-def ping():
-    return {"status": "ok"}
-
-@app.get("/healthz", tags=["meta"])  # k8s-style health
-def healthz():
+@app.get("/healthz")
+def healthz() -> Dict[str, Any]:
     return {"status": "ok", "version": APP_VERSION}
 
-@app.get("/", tags=["meta"])  # banner + quick diagnostics
-def root():
+@app.get("/")
+def root() -> Dict[str, Any]:
+    route_rows = []
+    for r in app.routes:
+        path = getattr(r, "path", None)
+        methods = sorted(list(getattr(r, "methods", []))) if getattr(r, "methods", None) else []
+        route_rows.append({"path": path, "methods": methods})
+    # Collect any mounts that failed
+    import_errors = []
+    for k, v in mounted.items():
+        if isinstance(v, tuple) and v[0] is False:
+            import_errors.append(k)
     return {
         "ok": True,
         "service": "country-radar",
         "version": APP_VERSION,
-        "routes": _list_routes(),
+        "routes": route_rows,
         "import_errors": import_errors,
     }
 
-# ----------------------------------------------------------------------------
-# Ensure critical diagnostics exist (only if missing after router mounts)
-# ----------------------------------------------------------------------------
-if not _route_exists("/__action_probe", "GET"):
-    @app.get("/__action_probe", tags=["diagnostics"])  # fallback only if missing
-    def __action_probe_fallback():
-        return {"ok": True, "version": APP_VERSION, "source": "app.main:fallback"}
-
-if not _route_exists("/v1/country-lite", "GET"):
-    @app.get("/v1/country-lite", tags=["diagnostics"])  # fallback only if missing
-    def __country_lite_fallback(country: str = Query(..., description="Full country name, e.g., Germany")):
-        try:
-            from app.services import indicator_service as _svc  # lazy import, optional
-        except Exception as e:
-            return JSONResponse({"ok": False, "error": f"indicator_service import failed: {e}"}, status_code=500)
-
-        payload = None
-        for name in (
-            # lite-style names
-            "get_country_lite","country_lite","assemble_country_lite","build_country_lite","get_country_compact","country_compact",
-            # legacy full builders fallbacks
-            "country_data","build_country_data","assemble_country_data","get_country_data","make_country_data","build_country_payload",
-        ):
-            f = getattr(_svc, name, None)
-            if callable(f):
-                try:
-                    try:
-                        payload = f(country=country, series="none")
-                    except TypeError:
-                        payload = f(country)
-                except Exception as ex:
-                    return JSONResponse({"ok": False, "error": str(ex)}, status_code=500)
-                break
-        if payload is None:
-            return JSONResponse({"ok": False, "error": "No lite/full builder found in indicator_service."}, status_code=500)
-        if not isinstance(payload, dict):
-            payload = {"result": payload}
-        payload.setdefault("country", country)
-        return JSONResponse(payload)
-
-# ----------------------------------------------------------------------------
-# OpenAPI sanitization for strict validators and GPT Actions
-# ----------------------------------------------------------------------------
-
-def _fix_parameter_schemas(spec: Dict[str, Any]) -> None:
-    paths = spec.get("paths") or {}
-    for _p, item in paths.items():
-        if not isinstance(item, dict):
-            continue
-        for _m, op in item.items():
-            if not isinstance(op, dict):
-                continue
-            params = op.get("parameters")
-            if not isinstance(params, list):
-                continue
-            for p in params:
-                sch = p.get("schema")
-                if isinstance(sch, dict) and isinstance(sch.get("examples"), dict):
-                    sch.pop("examples", None)
-                if sch is None:
-                    p["schema"] = {"type": "string"}
-
-
-def _force_response_schema_object(spec: Dict[str, Any], path: str, method: str = "get") -> None:
-    content = (
-        spec.setdefault("paths", {})
-        .setdefault(path, {})
-        .setdefault(method, {})
-        .setdefault("responses", {})
-        .setdefault("200", {})
-        .setdefault("content", {})
-        .setdefault("application/json", {})
-    )
-    content["schema"] = {
-        "type": "object",
-        "properties": {},
-        "additionalProperties": True,
-        "title": f"Response {path} {method.upper()}",
-    }
-
-
-def _sanitize_openapi_for_actions(spec: Dict[str, Any]) -> Dict[str, Any]:
-    servers_env = os.getenv("OPENAPI_SERVER_URLS")
-    if servers_env:
-        servers = [{"url": u.strip()} for u in servers_env.split(",") if u.strip()]
+# -----------------------------------------------------------------------------
+# OpenAPI servers (so GPT hits the right base URL on Render)
+# -----------------------------------------------------------------------------
+def _server_list() -> List[Dict[str, str]]:
+    override = os.getenv("CR_OPENAPI_SERVER_URLS", "")
+    servers: List[Dict[str, str]] = []
+    if override.strip():
+        for url in [u.strip() for u in override.split(",") if u.strip()]:
+            servers.append({"url": url})
     else:
-        base = os.getenv("COUNTRY_RADAR_BASE_URL", "http://localhost:8000")
-        servers = [{"url": base, "description": "Default"}]
-    spec["servers"] = servers
-
-    # Remove HEAD /country-data if present
-    paths = spec.get("paths") or {}
-    cd = paths.get("/country-data")
-    if isinstance(cd, dict):
-        cd.pop("head", None)
-
-    _fix_parameter_schemas(spec)
-    _force_response_schema_object(spec, "/country-data", "get")
-    if _route_exists("/v1/country-lite", "GET"):
-        _force_response_schema_object(spec, "/v1/country-lite", "get")
-    if _route_exists("/__action_probe", "GET"):
-        _force_response_schema_object(spec, "/__action_probe", "get")
-
-    spec["openapi"] = "3.1.1"
-    return spec
-
+        servers.append({"url": os.getenv("CR_BASE_URL", "http://localhost:8000")})
+        rd = os.getenv("RENDER_EXTERNAL_URL")
+        if rd:
+            servers.append({"url": rd})
+    return servers
 
 def custom_openapi():
-    raw = get_openapi(
-        title=app.title,
-        version=app.version,
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=APP_TITLE,
+        version=APP_VERSION,
+        description=APP_DESC,
         routes=app.routes,
-        description="Macroeconomic data API",
     )
-    return _sanitize_openapi_for_actions(raw)
+    schema["servers"] = _server_list()
+    app.openapi_schema = schema
+    return app.openapi_schema
 
-app.openapi = custom_openapi
+app.openapi = custom_openapi  # type: ignore
 
-# ----------------------------------------------------------------------------
-# Startup diagnostics & global JSON error handler
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Startup diagnostics
+# -----------------------------------------------------------------------------
 @app.on_event("startup")
-async def _on_startup() -> None:
+async def _startup_diag():
+    rows = []
+    for r in app.routes:
+        path = getattr(r, "path", None)
+        methods = sorted(list(getattr(r, "methods", []))) if getattr(r, "methods", None) else []
+        ep = getattr(r, "endpoint", None)
+        mod = getattr(ep, "__module__", None) if ep else None
+        fn  = getattr(ep, "__name__", None) if ep else None
+        rows.append({"path": path, "methods": methods, "module": mod, "func": fn})
     app.state.startup_diagnostics = {
         "version": APP_VERSION,
-        "routes": _list_routes(),
-        "import_errors": import_errors,
+        "servers": _server_list(),
+        "routes": rows,
     }
-    logging.getLogger(__name__).info("Startup diagnostics: %s", app.state.startup_diagnostics)
-
-@app.exception_handler(Exception)
-async def _unhandled_exc_handler(_, exc: Exception):
-    logging.exception("Unhandled exception: %s", exc)
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error": "internal_error",
-            "message": str(exc),
-            "version": APP_VERSION,
-        },
-    )
-# ===== Country Radar additive diagnostics (append to end of app/main.py) =====
-import os, logging
-from typing import Any, Dict, List
-from fastapi.responses import JSONResponse
-from fastapi.openapi.utils import get_openapi
-
-CR_APP_VERSION = os.getenv("CR_VERSION", "2025.10.07-step1c")
-_import_errors: List[str] = []  # populated if you add safe-import later
-
-def _cr_list_routes(_app) -> List[Dict[str, Any]]:
-    entries: List[Dict[str, Any]] = []
-    for r in _app.routes:
-        methods = sorted(getattr(r, "methods", {"GET"}))
-        entries.append({"path": r.path, "methods": methods})
-    entries.sort(key=lambda x: x["path"])
-    return entries
-
-def _cr_route_exists(_app, path: str, method: str = "GET") -> bool:
-    m = method.upper()
-    for r in _app.routes:
-        if getattr(r, "path", None) == path and m in getattr(r, "methods", {"GET"}):
-            return True
-    return False
-
-# /healthz and root banner (you didn't have them yet)
-@app.get("/healthz", tags=["meta"])
-def _cr_healthz():
-    return {"status": "ok", "version": CR_APP_VERSION}
-
-@app.get("/", tags=["meta"])
-def _cr_root():
-    return {
-        "ok": True,
-        "service": "country-radar",
-        "version": CR_APP_VERSION,
-        "routes": _cr_list_routes(app),
-        "import_errors": _import_errors,
-    }
-
-# Fallback probe ONLY if a router didn't already define it
-if not _cr_route_exists(app, "/__action_probe", "GET"):
-    @app.get("/__action_probe", tags=["diagnostics"])
-    def _cr_action_probe():
-        return {"ok": True, "version": CR_APP_VERSION, "source": "app.main:additive"}
-
-# Startup diagnostics captured inside the running Uvicorn process
-@app.on_event("startup")
-async def _cr_on_startup() -> None:
-    app.state.startup_diagnostics = {
-        "version": CR_APP_VERSION,
-        "routes": _cr_list_routes(app),
-        "import_errors": _import_errors,
-    }
-    logging.getLogger(__name__).info("Startup diagnostics: %s", app.state.startup_diagnostics)
-
-# OpenAPI wrapper: keep your current generator, just tweak servers/schema/version
-try:
-    _cr_orig_openapi = app.openapi  # whatever you defined earlier
-except Exception:
-    _cr_orig_openapi = lambda: get_openapi(title=app.title, version=app.version, routes=app.routes)  # noqa: E731
-
-def _cr_force_object_schema(spec: Dict[str, Any], path: str, method: str = "get") -> None:
-    try:
-        method = method.lower()
-        node = spec.setdefault("paths", {}).setdefault(path, {}).setdefault(method, {})
-        node = node.setdefault("responses", {}).setdefault("200", {}).setdefault("content", {}).setdefault("application/json", {})
-        node["schema"] = {"type": "object", "additionalProperties": True}
-    except Exception:
-        pass
-
-def _cr_openapi():
-    spec = _cr_orig_openapi()
-    # Prefer explicit servers from env (works great behind proxies / GPT)
-    servers_env = os.getenv("OPENAPI_SERVER_URLS")
-    if servers_env:
-        spec["servers"] = [{"url": u.strip()} for u in servers_env.split(",") if u.strip()]
-    else:
-        base = os.getenv("COUNTRY_RADAR_BASE_URL", "http://localhost:8000")
-        spec["servers"] = [{"url": base, "description": "Default"}]
-    # Normalize and make schemas lenient for key endpoints if present
-    spec["openapi"] = "3.1.1"
-    for p in ("/country-data", "/v1/country-lite", "/__action_probe", "/healthz", "/"):
-        if p in (spec.get("paths") or {}):
-            _cr_force_object_schema(spec, p, "get")
-    return spec
-
-app.openapi = _cr_openapi
-# ===== End additive diagnostics =================================================
+    print("[startup] diagnostics ready")
