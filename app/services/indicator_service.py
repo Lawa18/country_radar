@@ -167,11 +167,7 @@ def build_country_payload_v2(
 
     # CPI YoY
     cpi_series, cpi_src = {}, None
-    c_imf, dbg_imf_cpi = _call_provider(
-        "app.providers.imf_provider",
-        ("get_cpi_yoy_monthly", "cpi_yoy_monthly", "get_cpi_yoy", "cpi_yoy",
-         "get_inflation_cpi_yoy", "inflation_cpi_yoy"),
-        country=country,
+    c_imf, dbg_imf_cpi = _call_provider("app.providers.compat", ("get_cpi_yoy_monthly",), country=country
     )
     if c_imf:
         cpi_series, cpi_src = c_imf, "IMF"
