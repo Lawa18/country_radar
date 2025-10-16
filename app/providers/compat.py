@@ -70,12 +70,15 @@ def _normalize_series(data: Any) -> Dict[str, float]:
     Accept many shapes and normalize to {period_str: float_value}.
     Supported shapes:
       - Mapping[str, number]
-      - Mapping with "series" or "data" key
-      - Sequence of (period, value)
+      - Mapping with "series" / "data" / "values" keys (possibly nested)
+      - Sequence of (period, value) tuples/lists
       - Sequence of dicts with keys like date/period/time and value/val/v/y
+      - Pair of parallel sequences: ([periods...], [values...])
+      - Dict with parallel arrays: {"periods":[...],"values":[...]}, {"x":[...],"y":[...]}
+      - Nested under a country key: {"Mexico": {...}} or {"MEX": {...}}
       - Objects with .to_dict()
     """
-    # Pandas objects or similar with to_dict()
+    # Pandas-like objects with to_dict()
     if hasattr(data, "to_dict") and callable(getattr(data, "to_dict")):
         try:
             data = data.to_dict()
@@ -84,15 +87,57 @@ def _normalize_series(data: Any) -> Dict[str, float]:
 
     out: Dict[str, float] = {}
 
-    # Some providers return {"series": {...}} or {"data": [...]}
+    # Handle None/empty quickly
+    if data is None:
+        return out
+
+    # If the provider returns {"country":{"YYYY-MM": value}}
     if isinstance(data, Mapping):
-        # If explicit "series"
+        # Expand nested country keys
+        for k in ("Mexico", "United States", "Germany"):  # quick common names
+            if k in data and isinstance(data[k], (Mapping, Sequence)):
+                nested = _normalize_series(data[k])
+                if nested:
+                    return nested
+        # Expand possible ISO keys by guessing
+        for k in list(data.keys()):
+            if isinstance(k, str) and (len(k) in (2,3) or k.lower() in ("usa","uk")):
+                if isinstance(data[k], (Mapping, Sequence)):
+                    nested = _normalize_series(data[k])
+                    if nested:
+                        return nested
+
+        # If explicit "series"/"data"/"values"
         for key in ("series", "data", "values"):
             if key in data and isinstance(data[key], (Mapping, Sequence)):
                 nested = _normalize_series(data[key])
                 if nested:
                     return nested
-        # direct mapping {period:value}
+
+        # Dict with arrays: {"periods":[...], "values":[...]} or {"x":[...], "y":[...]}
+        def _map_parallel(a: Sequence, b: Sequence) -> Dict[str, float]:
+            tmp: Dict[str, float] = {}
+            try:
+                n = min(len(a), len(b))
+                for i in range(n):
+                    p = str(a[i])
+                    fv = _coerce_float(b[i])
+                    if fv is not None:
+                        tmp[p] = fv
+            except Exception:
+                pass
+            return tmp
+
+        if "periods" in data and "values" in data and isinstance(data["periods"], Sequence) and isinstance(data["values"], Sequence):
+            tmp = _map_parallel(data["periods"], data["values"])
+            if tmp:
+                return tmp
+        if "x" in data and "y" in data and isinstance(data["x"], Sequence) and isinstance(data["y"], Sequence):
+            tmp = _map_parallel(data["x"], data["y"])
+            if tmp:
+                return tmp
+
+        # Direct mapping {period:value}
         ok = False
         for k, v in data.items():
             fv = _coerce_float(v)
@@ -101,11 +146,12 @@ def _normalize_series(data: Any) -> Dict[str, float]:
                 ok = True
         if ok:
             return out
+
         # mapping with rows (dicts)
-        # ex: {"rows": [{"date": "...", "value": ...}, ...]}
         for key in ("rows", "observations", "points"):
             if key in data and isinstance(data[key], Sequence):
                 return _normalize_series(data[key])
+
         # mapping with only latest
         if "latest_period" in data and "latest_value" in data:
             lp = data.get("latest_period")
@@ -114,14 +160,29 @@ def _normalize_series(data: Any) -> Dict[str, float]:
                 return {str(lp): lv}
         return {}
 
-    # sequence of tuples (period, value)
+    # sequence of tuples (period, value) OR sequence of dicts
     if isinstance(data, Sequence) and not isinstance(data, (str, bytes)):
+        # Case: pair of sequences ([periods...], [values...])
+        if len(data) == 2 and all(isinstance(x, Sequence) and not isinstance(x, (str, bytes)) for x in data):
+            a, b = data[0], data[1]
+            tmp: Dict[str, float] = {}
+            try:
+                n = min(len(a), len(b))
+                for i in range(n):
+                    p = str(a[i])
+                    fv = _coerce_float(b[i])
+                    if fv is not None:
+                        tmp[p] = fv
+                return tmp
+            except Exception:
+                pass
+
+        # General list handling
         tmp: Dict[str, float] = {}
         for row in data:
             if isinstance(row, Mapping):
                 period = _norm_period_from_dict(row)  # date/period or year+month/quarter
                 if period:
-                    # value fields
                     for vk in ("value", "val", "v", "y"):
                         if vk in row:
                             fv = _coerce_float(row[vk])
@@ -161,7 +222,6 @@ def _pick_fn(mod, name_candidates: Iterable[str], substr_hints: Iterable[str]) -
 
 def _call_with_variants(fn: Callable[..., Any], country: str) -> Any:
     iso = _iso_codes(country)
-    # Try most common calling conventions
     variants = [
         {"country": country},
         {"name": country},
@@ -170,7 +230,6 @@ def _call_with_variants(fn: Callable[..., Any], country: str) -> Any:
         {"code": iso.get("iso3") or iso.get("iso2")},
     ]
     for kv in variants:
-        # skip None-valued variants
         if any(v is None for v in kv.values()):
             continue
         try:
@@ -179,7 +238,6 @@ def _call_with_variants(fn: Callable[..., Any], country: str) -> Any:
             continue
         except Exception:
             continue
-    # final attempt: positional
     try:
         return fn(country)
     except Exception:
@@ -224,7 +282,6 @@ def get_reserves_usd_monthly(country: str) -> Dict[str, float]:
     return _call_series(fn, country) if fn else {}
 
 def get_policy_rate_monthly(country: str) -> Dict[str, float]:
-    # Allow IMF or ECB providers; pick best available
     mod = _safe_import("app.providers.imf_provider") or _safe_import("app.providers.ecb_provider")
     fn = _pick_fn(mod,
         ["get_policy_rate_monthly","policy_rate_monthly","get_policy_rate","policy_rate","get_interest_rate_policy","interest_rate_policy"],
@@ -281,7 +338,6 @@ def get_government_effectiveness(country: str) -> Dict[str, float]:
     return _call_series(fn, country) if fn else {}
 
 def get_debt_to_gdp_annual(country: str) -> Dict[str, float]:
-    # Accept either “debt_to_gdp_annual” or “general_gov_debt_pct_gdp”
     mod = _safe_import("app.providers.wb_provider")
     fn = _pick_fn(mod,
         ["get_debt_to_gdp_annual","debt_to_gdp_annual","get_general_gov_debt_pct_gdp","general_gov_debt_pct_gdp"],
