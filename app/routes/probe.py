@@ -262,6 +262,55 @@ def probe_series(
     }
     return resp
 
+@router.get("/__compat_probe", tags=["probe"], summary="Inspect compat normalization for one indicator")
+def compat_probe(
+    indicator: str = Query(..., description="e.g., cpi_yoy, fx_rate_usd, reserves_usd, policy_rate, unemployment_rate, gdp_growth"),
+    freq: str = Query("auto", description="'monthly' or 'annual' or 'auto'"),
+    country: str = Query("Mexico"),
+):
+    """
+    Calls the compat getter for an indicator and returns both the normalized series
+    and a small raw preview to help adapt the normalizer if needed.
+    """
+    import inspect
+    mod = __import__("app.providers.compat", fromlist=["*"])
+    name_map = {
+        ("cpi_yoy","monthly"): "get_cpi_yoy_monthly",
+        ("cpi_yoy","annual"): "get_cpi_annual",
+        ("unemployment_rate","monthly"): "get_unemployment_rate_monthly",
+        ("unemployment_rate","annual"): "get_unemployment_rate_annual",
+        ("fx_rate_usd","monthly"): "get_fx_rate_usd_monthly",
+        ("fx_rate_usd","annual"): "get_fx_official_annual",
+        ("reserves_usd","monthly"): "get_reserves_usd_monthly",
+        ("reserves_usd","annual"): "get_reserves_annual",
+        ("policy_rate","monthly"): "get_policy_rate_monthly",
+        ("gdp_growth","quarterly"): "get_gdp_growth_quarterly",
+        ("gdp_growth","annual"): "get_gdp_growth_annual",
+    }
+    key = None
+    if indicator == "gdp_growth":
+        key = (indicator, "quarterly") if freq in ("auto","quarterly") else (indicator, "annual")
+    else:
+        key = (indicator, "monthly") if freq in ("auto","monthly") else (indicator, "annual")
+    fn_name = name_map.get(key)
+    if not fn_name:
+        return {"error": f"unknown indicator/freq: {indicator}/{freq}"}
+
+    fn = getattr(mod, fn_name, None)
+    if not callable(fn):
+        return {"error": f"compat function not found: {fn_name}"}
+
+    # call compat and try to reconstruct a raw-ish preview by calling underlying providers directly
+    series = fn(country=country)
+    head = dict(list(series.items())[:8])
+
+    return {
+        "indicator": indicator,
+        "compat_fn": fn_name,
+        "country": country,
+        "normalized_len": len(series),
+        "normalized_head": head,
+    }
 
 @router.get("/v1/country-lite", summary="Country Lite", tags=["probe"])
 def country_lite(
