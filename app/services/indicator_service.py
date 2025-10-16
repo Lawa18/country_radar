@@ -1,4 +1,4 @@
-# app/services/indicator_service.py — robust v2 builder with provider name fallbacks
+# app/services/indicator_service.py — v2 builder using provider compat shim
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Literal
@@ -20,7 +20,6 @@ def _coerce_numeric_series(d: Optional[Mapping[str, Any]]) -> Dict[str, float]:
         try:
             out[str(k)] = float(v)
         except Exception:
-            # ignore junk
             pass
     return out
 
@@ -51,24 +50,20 @@ def _trim_by_keep(series: Dict[str, float], keep: int) -> Dict[str, float]:
     keys = sorted(series.keys(), key=_parse_period_key)
     if len(keys) <= keep:
         return series
-    trimmed = {k: series[k] for k in keys[-keep:]}
-    return trimmed
+    return {k: series[k] for k in keys[-keep:]}
 
 def _apply_series_mode(series: Dict[str, float], mode: Literal["none", "mini", "full"], keep: int) -> Dict[str, float]:
     if mode == "none":
-        # keep only the latest point
         if not series:
             return {}
         k, v = _latest(series)
         return {k: v} if k is not None else {}
     if mode == "mini":
-        # ~5y equivalent: caller passes keep, default 60 for monthly, 20 for quarterly
         return _trim_by_keep(series, keep)
-    # full
-    return series
+    return series  # full
 
 def _annualize_latest(d: Mapping[str, float]) -> Dict[str, float]:
-    """Collapse to annual by taking the latest period per year."""
+    """Collapse to annual by taking latest period per year (for WB fallbacks if needed later)."""
     if not d:
         return {}
     by_year: Dict[str, Tuple[str, float]] = {}
@@ -79,13 +74,13 @@ def _annualize_latest(d: Mapping[str, float]) -> Dict[str, float]:
             by_year[y] = (str(k), float(v))
     return {y: v for y, (_, v) in sorted(by_year.items(), key=lambda kv: int(kv[0]))}
 
-# -------------------- provider call with name candidates ----------------------
+# -------------------- provider call helper (fixed interface) ------------------
 
 def _call_provider(module: str, candidates: Iterable[str], **kwargs) -> Tuple[Dict[str, float], Dict[str, Any]]:
     """
-    Try calling functions by several possible names in a module; coerce numeric dict back.
-    Accepts {'country': 'Mexico'} and legacy alias {'name': 'Mexico'}.
-    Returns (series, debug_trace)
+    Call a function by name in a module; coerce dict-of-numbers back.
+    Accepts {'country': 'Mexico'} and also tries legacy {'name': 'Mexico'}.
+    Returns (series, debug_trace).
     """
     dbg: Dict[str, Any] = {"module": module, "tried": []}
     mod = _safe_import(module)
@@ -139,14 +134,13 @@ def build_country_payload_v2(
     keep: int = 60,
 ) -> Dict[str, Any]:
     """
-    Modern monthly-first builder:
-      - IMF first, WB fallbacks, Eurostat optional (off by default due to Render DNS).
-      - Flexible function-name candidates to match legacy/new providers.
-      - series: none|mini|full, keep: trims timeseries length.
+    Modern builder (compat-first):
+      - Uses app.providers.compat for IMF + WB (compat does fuzzy resolution).
+      - series: none|mini|full; keep trims length (60 ≈ 5y monthly, ~20 quarterly).
+      - Eurostat stays disabled by default (Render DNS quirks).
     """
-    # Choose keep defaults by frequency if caller passed the default 60
-    keep_m = keep if keep != 60 else 60         # monthly default ~5y
-    keep_q = max(20, math.ceil(keep / 3))       # quarterly default ~5y
+    keep_m = keep if keep != 60 else 60
+    keep_q = max(20, math.ceil(keep / 3))
 
     out: Dict[str, Any] = {
         "ok": True,
@@ -156,160 +150,88 @@ def build_country_payload_v2(
         "keep_days": keep,
         "indicators": {},
         "_debug": {
-            "builder": {"used": "build_country_payload_v2", "module": __name__},
+            "builder": {
+                "used": "build_country_payload_v2",
+                "module": __name__,
+            },
             "source_trace": {},
-            # Eurostat DNS in Render frequently fails; leave disabled unless enabled via env
-            "eurostat": {"enabled": True, "host": "data-api.ec.europa.eu", "dns": False},
+            "eurostat": {"enabled": False, "host": "data-api.ec.europa.eu", "dns": False},
         },
     }
 
-    eurostat_enabled = False  # keep off by default on Render
-
-    # CPI YoY
+    # -------- CPI YoY (monthly preferred, IMF via compat) --------
     cpi_series, cpi_src = {}, None
-    c_imf, dbg_imf_cpi = _call_provider("app.providers.compat", ("get_cpi_yoy_monthly",), country=country
-    )
+    c_imf, dbg_imf_cpi = _call_provider("app.providers.compat", ("get_cpi_yoy_monthly",), country=country)
     if c_imf:
         cpi_series, cpi_src = c_imf, "IMF"
     else:
-        c_wb, dbg_wb_cpi = _call_provider(
-            "app.providers.wb_provider",
-            ("get_cpi_annual", "cpi_annual", "get_inflation_annual", "inflation_annual"),
-            country=country,
-        )
+        c_wb, dbg_wb_cpi = _call_provider("app.providers.compat", ("get_cpi_annual",), country=country)
         if c_wb:
             cpi_series, cpi_src = _annualize_latest(c_wb), "WorldBank"
         else:
-            dbg_wb_cpi = _call_provider("app.providers.wb_provider", (), country=country)[1]
-    if eurostat_enabled and not cpi_series:
-        c_eu, dbg_eu_cpi = _call_provider(
-            "app.providers.eurostat_provider",
-            ("get_hicp_yoy", "hicp_yoy", "get_cpi_yoy", "cpi_yoy"),
-            country=country,
-        )
-        if c_eu:
-            cpi_series, cpi_src = c_eu, "Eurostat"
-    out["_debug"]["source_trace"]["cpi_yoy"] = {
-        "imf": dbg_imf_cpi,
-        "eurostat": {"enabled": eurostat_enabled},
-        "wb": locals().get("dbg_wb_cpi", {}),
-    }
+            dbg_wb_cpi = _call_provider("app.providers.compat", (), country=country)[1]
+    out["_debug"]["source_trace"]["cpi_yoy"] = {"compat_imf": dbg_imf_cpi, "compat_wb": locals().get("dbg_wb_cpi", {})}
 
-    # Unemployment rate
+    # -------- Unemployment rate --------
     une_series, une_src = {}, None
-    u_imf, dbg_imf_une = _call_provider(
-        "app.providers.imf_provider",
-        ("get_unemployment_rate_monthly", "unemployment_rate_monthly",
-         "get_unemployment_rate", "unemployment_rate"),
-        country=country,
-    )
+    u_imf, dbg_imf_une = _call_provider("app.providers.compat", ("get_unemployment_rate_monthly",), country=country)
     if u_imf:
         une_series, une_src = u_imf, "IMF"
     else:
-        u_wb, dbg_wb_une = _call_provider(
-            "app.providers.wb_provider",
-            ("get_unemployment_rate_annual", "unemployment_rate_annual"),
-            country=country,
-        )
+        u_wb, dbg_wb_une = _call_provider("app.providers.compat", ("get_unemployment_rate_annual",), country=country)
         if u_wb:
             une_series, une_src = _annualize_latest(u_wb), "WorldBank"
         else:
-            dbg_wb_une = _call_provider("app.providers.wb_provider", (), country=country)[1]
-    if eurostat_enabled and not une_series:
-        u_eu, dbg_eu_une = _call_provider(
-            "app.providers.eurostat_provider",
-            ("get_unemployment_rate_monthly", "unemployment_rate_monthly",
-             "get_unemployment_rate", "unemployment_rate"),
-            country=country,
-        )
-        if u_eu:
-            une_series, une_src = u_eu, "Eurostat"
+            dbg_wb_une = _call_provider("app.providers.compat", (), country=country)[1]
     out["_debug"]["source_trace"]["unemployment_rate"] = {
-        "imf": dbg_imf_une,
-        "eurostat": {"enabled": eurostat_enabled},
-        "wb": locals().get("dbg_wb_une", {}),
+        "compat_imf": dbg_imf_une, "compat_wb": locals().get("dbg_wb_une", {})
     }
 
-    # FX rate vs USD (monthly)
+    # -------- FX rate vs USD (monthly) --------
     fx_series, fx_src = {}, None
-    fx_imf, dbg_imf_fx = _call_provider(
-        "app.providers.imf_provider",
-        ("get_fx_rate_usd_monthly", "fx_rate_usd_monthly", "get_fx_rate_usd", "fx_rate_usd",
-         "get_exchange_rate_usd", "exchange_rate_usd"),
-        country=country,
-    )
+    fx_imf, dbg_imf_fx = _call_provider("app.providers.compat", ("get_fx_rate_usd_monthly",), country=country)
     if fx_imf:
         fx_series, fx_src = fx_imf, "IMF"
     else:
-        fx_wb, dbg_wb_fx = _call_provider(
-            "app.providers.wb_provider",
-            ("get_fx_official_annual", "fx_official_annual"),
-            country=country,
-        )
+        fx_wb, dbg_wb_fx = _call_provider("app.providers.compat", ("get_fx_official_annual",), country=country)
         if fx_wb:
             fx_series, fx_src = _annualize_latest(fx_wb), "WorldBank"
         else:
-            dbg_wb_fx = _call_provider("app.providers.wb_provider", (), country=country)[1]
-    out["_debug"]["source_trace"]["fx_rate_usd"] = {
-        "imf": dbg_imf_fx, "wb": locals().get("dbg_wb_fx", {}),
-    }
+            dbg_wb_fx = _call_provider("app.providers.compat", (), country=country)[1]
+    out["_debug"]["source_trace"]["fx_rate_usd"] = {"compat_imf": dbg_imf_fx, "compat_wb": locals().get("dbg_wb_fx", {})}
 
-    # Reserves (USD)
+    # -------- Reserves (USD) --------
     res_series, res_src = {}, None
-    r_imf, dbg_imf_res = _call_provider(
-        "app.providers.imf_provider",
-        ("get_reserves_usd_monthly", "reserves_usd_monthly", "get_reserves_usd", "reserves_usd"),
-        country=country,
-    )
+    r_imf, dbg_imf_res = _call_provider("app.providers.compat", ("get_reserves_usd_monthly",), country=country)
     if r_imf:
         res_series, res_src = r_imf, "IMF"
     else:
-        r_wb, dbg_wb_res = _call_provider(
-            "app.providers.wb_provider",
-            ("get_reserves_annual", "reserves_annual"),
-            country=country,
-        )
+        r_wb, dbg_wb_res = _call_provider("app.providers.compat", ("get_reserves_annual",), country=country)
         if r_wb:
             res_series, res_src = _annualize_latest(r_wb), "WorldBank"
         else:
-            dbg_wb_res = _call_provider("app.providers.wb_provider", (), country=country)[1]
-    out["_debug"]["source_trace"]["reserves_usd"] = {
-        "imf": dbg_imf_res, "wb": locals().get("dbg_wb_res", {}),
-    }
+            dbg_wb_res = _call_provider("app.providers.compat", (), country=country)[1]
+    out["_debug"]["source_trace"]["reserves_usd"] = {"compat_imf": dbg_imf_res, "compat_wb": locals().get("dbg_wb_res", {})}
 
-    # Policy rate
+    # -------- Policy rate --------
     pol_series, pol_src = {}, None
-    p_imf, dbg_imf_pol = _call_provider(
-        "app.providers.imf_provider",
-        ("get_policy_rate_monthly", "policy_rate_monthly", "get_policy_rate", "policy_rate",
-         "get_interest_rate_policy", "interest_rate_policy"),
-        country=country,
-    )
+    p_imf, dbg_imf_pol = _call_provider("app.providers.compat", ("get_policy_rate_monthly",), country=country)
     if p_imf:
         pol_series, pol_src = p_imf, "IMF"
-    out["_debug"]["source_trace"]["policy_rate"] = {"imf": dbg_imf_pol}
+    out["_debug"]["source_trace"]["policy_rate"] = {"compat_imf": dbg_imf_pol}
 
-    # GDP growth (quarterly preferred; WB annual as fallback)
+    # -------- GDP growth (quarterly preferred; WB annual fallback) --------
     gdp_series, gdp_src, gdp_freq = {}, None, "quarterly"
-    gq_imf, dbg_imf_gdpq = _call_provider(
-        "app.providers.imf_provider",
-        ("get_gdp_growth_quarterly", "gdp_growth_quarterly",
-         "get_gdp_qoq_annualized", "gdp_qoq_annualized"),
-        country=country,
-    )
+    gq_imf, dbg_imf_gdpq = _call_provider("app.providers.compat", ("get_gdp_growth_quarterly",), country=country)
     if gq_imf:
         gdp_series, gdp_src = gq_imf, "IMF"
     else:
-        ga_wb, dbg_wb_gdpa = _call_provider(
-            "app.providers.wb_provider",
-            ("get_gdp_growth_annual", "gdp_growth_annual"),
-            country=country,
-        )
+        ga_wb, dbg_wb_gdpa = _call_provider("app.providers.compat", ("get_gdp_growth_annual",), country=country)
         if ga_wb:
             gdp_series, gdp_src, gdp_freq = _annualize_latest(ga_wb), "WorldBank", "annual"
         else:
-            dbg_wb_gdpa = _call_provider("app.providers.wb_provider", (), country=country)[1]
-    out["_debug"]["source_trace"]["gdp_growth"] = {"imf": dbg_imf_gdpq, "wb": locals().get("dbg_wb_gdpa", {})}
+            dbg_wb_gdpa = _call_provider("app.providers.compat", (), country=country)[1]
+    out["_debug"]["source_trace"]["gdp_growth"] = {"compat_imf": dbg_imf_gdpq, "compat_wb": locals().get("dbg_wb_gdpa", {})}
 
     # ---------------- apply series mode & assemble indicators -----------------
 
@@ -327,9 +249,9 @@ def build_country_payload_v2(
 
     # ---------------- debt enrichment (best effort) ---------------------------
 
-    out["government_debt"]   = {"latest": {"value": None, "date": None, "source": None}, "series": {}}
-    out["nominal_gdp"]       = {"latest": {"value": None, "date": None, "source": None}, "series": {}}
-    out["debt_to_gdp"]       = {"latest": {"value": None, "date": None, "source": "computed:NA/NA"}, "series": {}}
+    out["government_debt"]    = {"latest": {"value": None, "date": None, "source": None}, "series": {}}
+    out["nominal_gdp"]        = {"latest": {"value": None, "date": None, "source": None}, "series": {}}
+    out["debt_to_gdp"]        = {"latest": {"value": None, "date": None, "source": "computed:NA/NA"}, "series": {}}
     out["debt_to_gdp_series"] = {}
 
     debt_mod = _safe_import("app.routes.debt_bundle") or _safe_import("app.routes.debt")
@@ -338,9 +260,9 @@ def build_country_payload_v2(
         try:
             bundle = fn(country=country)
             if isinstance(bundle, Mapping):
-                out["government_debt"] = bundle.get("government_debt", out["government_debt"])
-                out["nominal_gdp"]     = bundle.get("nominal_gdp", out["nominal_gdp"])
-                out["debt_to_gdp"]     = bundle.get("debt_to_gdp", out["debt_to_gdp"])
+                out["government_debt"]    = bundle.get("government_debt", out["government_debt"])
+                out["nominal_gdp"]        = bundle.get("nominal_gdp", out["nominal_gdp"])
+                out["debt_to_gdp"]        = bundle.get("debt_to_gdp", out["debt_to_gdp"])
                 out["debt_to_gdp_series"] = bundle.get("debt_to_gdp_series", out["debt_to_gdp_series"])
         except Exception as e:
             out["_debug"].setdefault("debt", {})["error"] = str(e)
@@ -350,8 +272,5 @@ def build_country_payload_v2(
 # --------------------------- legacy fallback ----------------------------------
 
 def build_country_payload(country: str, series: str = "mini", keep: int = 60) -> Dict[str, Any]:
-    """
-    Compatibility wrapper for legacy callers—delegate to v2 with same signature.
-    If older callers pass only (country), FastAPI wrapper in country.py handles it.
-    """
+    """Compatibility wrapper for legacy callers—delegate to v2 with same signature."""
     return build_country_payload_v2(country=country, series=series, keep=keep)
