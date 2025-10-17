@@ -303,6 +303,104 @@ def compat_probe(
         "normalized_head": head,
     }
 
+# --- BEGIN: provider introspection helpers -----------------------------------
+from typing import Any, Dict
+import inspect
+
+def _safe_import(path: str):
+    try:
+        return __import__(path, fromlist=["*"])
+    except Exception:
+        return None
+
+@router.get("/__provider_fns", tags=["probe"], summary="List callables exported by a provider module")
+def provider_fns(module: str):
+    """
+    List top-level callables in a provider module so we can see what's actually deployed.
+    Example: /__provider_fns?module=app.providers.wb_provider_cr
+    """
+    mod = _safe_import(module)
+    if not mod:
+        return {"ok": False, "module": module, "error": "import_failed"}
+    fns = []
+    for name, obj in vars(mod).items():
+        if name.startswith("_"):
+            continue
+        if callable(obj):
+            try:
+                sig = str(inspect.signature(obj))
+            except Exception:
+                sig = "(?)"
+            fns.append({"name": name, "signature": sig})
+    return {"ok": True, "module": module, "count": len(fns), "functions": sorted(fns, key=lambda x: x["name"])}
+
+@router.get("/__provider_raw", tags=["probe"], summary="Call a provider function directly and preview result")
+def provider_raw(
+    module: str,
+    fn: str,
+    country: str = "Mexico",
+):
+    """
+    Call a specific function in a provider with various arg shapes (country/name/iso2/iso3/code)
+    and return a short preview of the raw payload.
+    """
+    mod = _safe_import(module)
+    if not mod:
+        return {"ok": False, "module": module, "fn": fn, "error": "import_failed"}
+    f = getattr(mod, fn, None)
+    if not callable(f):
+        return {"ok": False, "module": module, "fn": fn, "error": "fn_missing"}
+    # variants
+    from app.utils import country_codes as cc
+    codes = (cc.get_country_codes(country) or {}) if hasattr(cc, "get_country_codes") else {}
+    trials = [
+        {"country": country},
+        {"name": country},
+        {"iso2": codes.get("iso_alpha_2")},
+        {"iso3": codes.get("iso_alpha_3")},
+        {"code": codes.get("iso_alpha_3") or codes.get("iso_alpha_2")},
+    ]
+    tried = []
+    res = err = None
+    for kv in trials:
+        if any(v is None for v in kv.values()):
+            continue
+        try:
+            res = f(**kv)
+            tried.append({"kwargs": kv, "ok": True})
+            break
+        except TypeError as e:
+            tried.append({"kwargs": kv, "error": str(e)})
+        except Exception as e:
+            tried.append({"kwargs": kv, "error": f"{type(e).__name__}: {e}"})
+    if res is None:
+        # final positional attempt
+        try:
+            res = f(country)
+            tried.append({"args": [country], "ok": True})
+        except Exception as e:
+            tried.append({"args": [country], "error": f"{type(e).__name__}: {e}"})
+    def _preview(obj: Any, limit: int = 12):
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            keys = list(obj.keys())
+            head = keys[:limit]
+            small = {str(k): obj[k] for k in head}
+            return {"type": "mapping", "len": len(keys), "head_keys": head, "head_values": small}
+        if isinstance(obj, (list, tuple)):
+            return {"type": "sequence", "len": len(obj), "head": list(obj)[:limit]}
+        return {"type": type(obj).__name__, "repr": repr(obj)[:400]}
+    return {
+        "ok": res is not None,
+        "module": module,
+        "fn": fn,
+        "tried": tried,
+        "result_type": None if res is None else type(res).__name__,
+        "result_preview": _preview(res),
+    }
+# --- END: provider introspection helpers -------------------------------------
+
 from typing import Any, Dict, Iterable, Mapping, Sequence
 import inspect
 
