@@ -334,6 +334,12 @@ def provider_fns(module: str):
             fns.append({"name": name, "signature": sig})
     return {"ok": True, "module": module, "count": len(fns), "functions": sorted(fns, key=lambda x: x["name"])}
 
+@router.get("/__codes", tags=["probe"], summary="Show resolved ISO codes for a country")
+def show_codes(country: str = "Mexico"):
+    from app.utils.country_codes import get_country_codes
+    codes = get_country_codes(country)
+    return {"country": country, "codes": codes}
+
 @router.get("/__provider_raw", tags=["probe"], summary="Call a provider function directly and preview result")
 def provider_raw(
     module: str,
