@@ -303,6 +303,125 @@ def compat_probe(
         "normalized_head": head,
     }
 
+from typing import Any, Dict, Iterable, Mapping, Sequence
+import inspect
+
+def _safe_import(path: str):
+    try:
+        return __import__(path, fromlist=["*"])
+    except Exception:
+        return None
+
+def _iso_variants(country: str) -> Dict[str, Any]:
+    try:
+        cc_mod = _safe_import("app.utils.country_codes")
+        if cc_mod and hasattr(cc_mod, "get_country_codes"):
+            c = cc_mod.get_country_codes(country) or {}
+            return {
+                "country": country,
+                "name": country,
+                "iso2": c.get("iso_alpha_2") or c.get("alpha2") or c.get("iso2"),
+                "iso3": c.get("iso_alpha_3") or c.get("alpha3") or c.get("iso3"),
+                "code": c.get("iso_alpha_3") or c.get("alpha3") or c.get("iso3") or c.get("iso_alpha_2"),
+            }
+    except Exception:
+        pass
+    return {"country": country, "name": country, "iso2": None, "iso3": None, "code": None}
+
+def _call_with_variants(fn, country: str):
+    variants = _iso_variants(country)
+    attempts = [
+        {"country": variants["country"]},
+        {"name": variants["name"]},
+        {"iso2": variants["iso2"]} if variants["iso2"] else None,
+        {"iso3": variants["iso3"]} if variants["iso3"] else None,
+        {"code": variants["code"]} if variants["code"] else None,
+    ]
+    for kv in [x for x in attempts if x]:
+        try:
+            return {"args": kv, "result": fn(**kv), "error": None}
+        except TypeError as e:
+            err = str(e)
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+        # try positional as a last resort for this variant
+        try:
+            return {"args": {"positional": list(kv.values())[0]}, "result": fn(list(kv.values())[0]), "error": None}
+        except Exception as e2:
+            err = f"{type(e2).__name__}: {e2}"
+    return {"args": {}, "result": None, "error": err if 'err' in locals() else "no_variant_matched"}
+
+def _preview(obj: Any, limit: int = 12) -> Any:
+    # Make a short, JSON-safe preview
+    try:
+        import pandas as pd  # if present
+        if isinstance(obj, (pd.Series, pd.DataFrame)):
+            obj = obj.to_dict()
+    except Exception:
+        pass
+
+    if obj is None:
+        return None
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, Mapping):
+        keys = list(obj.keys())
+        head = keys[:limit]
+        preview_map = {str(k): obj[k] for k in head}
+        # If mapping-of-mapping, show nested keys for first few
+        nested = {}
+        for k in head:
+            v = obj[k]
+            if isinstance(v, Mapping):
+                nested[str(k)] = list(v.keys())[:5]
+        out = {"type": "mapping", "len": len(keys), "head_keys": head, "head_values": preview_map}
+        if nested:
+            out["nested_keys"] = nested
+        return out
+    if isinstance(obj, Sequence) and not isinstance(obj, (bytes, bytearray, str)):
+        head = list(obj)[:limit]
+        return {"type": "sequence", "len": len(obj), "head": head}
+    # fallback repr
+    return {"type": type(obj).__name__, "repr": repr(obj)[:400]}
+
+@router.get("/__provider_raw", tags=["probe"], summary="Call a provider function directly and preview result")
+def provider_raw(
+    module: str = Query(..., description="e.g., app.providers.imf_provider"),
+    fn_candidates: str = Query(..., description="Comma-separated function names to try, in order"),
+    country: str = Query("Mexico"),
+):
+    """
+    Tries to import `module`, finds the first callable among `fn_candidates`,
+    calls it with multiple argument variants (country/name/iso2/iso3/code or positional),
+    and returns a short preview of the raw return value.
+    """
+    mod = _safe_import(module)
+    if not mod:
+        return {"ok": False, "error": f"import_failed: {module}"}
+    tried = []
+    f = None
+    for name in [s.strip() for s in fn_candidates.split(",") if s.strip()]:
+        cand = getattr(mod, name, None)
+        if callable(cand):
+            f = cand
+            tried.append({name: "callable"})
+            break
+        tried.append({name: "missing"})
+    if not f:
+        return {"ok": False, "module": module, "tried": tried, "error": "no_callable_found"}
+
+    call = _call_with_variants(f, country)
+    res = call["result"]
+    return {
+        "ok": True,
+        "module": module,
+        "fn_used": [k for k,v in tried[-1].items()][0] if tried else None,
+        "call_args": call["args"],
+        "call_error": call["error"],
+        "result_type": type(res).__name__ if res is not None else None,
+        "result_preview": _preview(res, 10),
+    }
+
 @router.get("/v1/country-lite", summary="Country Lite", tags=["probe"])
 def country_lite(
     country: str = Query(..., description="Full country name, e.g., Mexico"),
