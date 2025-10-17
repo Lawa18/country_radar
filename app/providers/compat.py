@@ -1,6 +1,6 @@
 # app/providers/compat.py — robust runtime shim to normalize provider outputs
 from __future__ import annotations
-from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Callable, Sequence, Union
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Callable, Sequence
 import types
 
 # -------------------- small helpers --------------------
@@ -36,15 +36,25 @@ def _coerce_float(x: Any) -> Optional[float]:
     except Exception:
         return None
 
-def _norm_period_from_dict(d: Mapping[str, Any]) -> Optional[str]:
-    # Look for common date/period fields
-    for k in ("date", "period", "time"):
-        if k in d and d[k]:
-            return str(d[k])
-    # Compose year + month or quarter
-    y = d.get("year") or d.get("yr") or d.get("y")
-    m = d.get("month") or d.get("mn") or d.get("m")
-    q = d.get("quarter") or d.get("qtr") or d.get("q")
+def _val_from_mapping(m: Mapping[str, Any]) -> Optional[float]:
+    # Common value keys across providers
+    for vk in ("value","val","v","y","OBS_VALUE","obs_value"):
+        if vk in m:
+            fv = _coerce_float(m[vk])
+            if fv is not None:
+                return fv
+    # Sometimes dict is {"period": "...", "value": ...} and we’ll pick via caller
+    return None
+
+def _period_from_mapping(m: Mapping[str, Any]) -> Optional[str]:
+    # Common period keys
+    for pk in ("date","period","time","TIME_PERIOD","time_period"):
+        if pk in m and m[pk] not in (None, ""):
+            return str(m[pk])
+    # Compose year + month/quarter
+    y = m.get("year") or m.get("yr") or m.get("y")
+    mth = m.get("month") or m.get("mn") or m.get("m")
+    q = m.get("quarter") or m.get("qtr") or m.get("q")
     if y:
         try:
             yi = int(y)
@@ -52,14 +62,12 @@ def _norm_period_from_dict(d: Mapping[str, Any]) -> Optional[str]:
             return None
         if q:
             try:
-                qi = int(q)
-                return f"{yi}-Q{qi}"
+                qi = int(q); return f"{yi}-Q{qi}"
             except Exception:
                 return None
-        if m:
+        if mth:
             try:
-                mi = int(m)
-                return f"{yi}-{mi:02d}"
+                mi = int(mth); return f"{yi}-{mi:02d}"
             except Exception:
                 return None
         return str(yi)
@@ -67,18 +75,18 @@ def _norm_period_from_dict(d: Mapping[str, Any]) -> Optional[str]:
 
 def _normalize_series(data: Any) -> Dict[str, float]:
     """
-    Accept many shapes and normalize to {period_str: float_value}.
-    Supported shapes:
+    Normalize many shapes into {period: float}.
+    Handles:
       - Mapping[str, number]
-      - Mapping with "series" / "data" / "values" keys (possibly nested)
-      - Sequence of (period, value) tuples/lists
-      - Sequence of dicts with keys like date/period/time and value/val/v/y
-      - Pair of parallel sequences: ([periods...], [values...])
-      - Dict with parallel arrays: {"periods":[...],"values":[...]}, {"x":[...],"y":[...]}
-      - Nested under a country key: {"Mexico": {...}} or {"MEX": {...}}
+      - Mapping with nested dict values holding {'value': ...} or OBS_VALUE
+      - Mapping with 'series'/'data'/'values'/'rows'/'observations'/'points'
+      - Dict of parallel arrays: {'periods':[...],'values':[...]} or {'x':[...],'y':[...]}
+      - Sequence of (period, value)
+      - Sequence of dict rows with date/period/time/TIME_PERIOD and value/val/v/y/OBS_VALUE
+      - Nested under country/ISO keys: {'Mexico': {...}}, {'MEX': {...}}
       - Objects with .to_dict()
     """
-    # Pandas-like objects with to_dict()
+    # Pandas-like
     if hasattr(data, "to_dict") and callable(getattr(data, "to_dict")):
         try:
             data = data.to_dict()
@@ -87,103 +95,91 @@ def _normalize_series(data: Any) -> Dict[str, float]:
 
     out: Dict[str, float] = {}
 
-    # Handle None/empty quickly
     if data is None:
         return out
 
-    # If the provider returns {"country":{"YYYY-MM": value}}
+    # Mapping branch
     if isinstance(data, Mapping):
-        # Expand nested country keys
-        for k in ("Mexico", "United States", "Germany"):  # quick common names
-            if k in data and isinstance(data[k], (Mapping, Sequence)):
-                nested = _normalize_series(data[k])
+        # 1) Nested under country/ISO key
+        for k in list(data.keys()):
+            v = data[k]
+            if isinstance(v, (Mapping, Sequence)) and isinstance(k, str) and (len(k) in (2,3) or k.lower() in ("usa","uk","mexico","germany","sweden")):
+                nested = _normalize_series(v)
                 if nested:
                     return nested
-        # Expand possible ISO keys by guessing
-        for k in list(data.keys()):
-            if isinstance(k, str) and (len(k) in (2,3) or k.lower() in ("usa","uk")):
-                if isinstance(data[k], (Mapping, Sequence)):
-                    nested = _normalize_series(data[k])
-                    if nested:
-                        return nested
 
-        # If explicit "series"/"data"/"values"
-        for key in ("series", "data", "values"):
+        # 2) Well-known container keys
+        for key in ("series","data","values","rows","observations","points"):
             if key in data and isinstance(data[key], (Mapping, Sequence)):
                 nested = _normalize_series(data[key])
                 if nested:
                     return nested
 
-        # Dict with arrays: {"periods":[...], "values":[...]} or {"x":[...], "y":[...]}
+        # 3) Parallel arrays
         def _map_parallel(a: Sequence, b: Sequence) -> Dict[str, float]:
             tmp: Dict[str, float] = {}
             try:
                 n = min(len(a), len(b))
                 for i in range(n):
-                    p = str(a[i])
-                    fv = _coerce_float(b[i])
-                    if fv is not None:
-                        tmp[p] = fv
+                    p = str(a[i]); fv = _coerce_float(b[i])
+                    if fv is not None: tmp[p] = fv
             except Exception:
                 pass
             return tmp
-
         if "periods" in data and "values" in data and isinstance(data["periods"], Sequence) and isinstance(data["values"], Sequence):
             tmp = _map_parallel(data["periods"], data["values"])
-            if tmp:
-                return tmp
+            if tmp: return tmp
         if "x" in data and "y" in data and isinstance(data["x"], Sequence) and isinstance(data["y"], Sequence):
             tmp = _map_parallel(data["x"], data["y"])
-            if tmp:
-                return tmp
+            if tmp: return tmp
 
-        # Direct mapping {period:value}
+        # 4) Direct mapping {period: number} OR {period: {'value': number}}
         ok = False
         for k, v in data.items():
-            fv = _coerce_float(v)
-            if fv is not None:
-                out[str(k)] = fv
-                ok = True
+            if isinstance(v, Mapping):
+                fv = _val_from_mapping(v)
+                if fv is not None:
+                    out[str(k)] = fv; ok = True
+            else:
+                fv = _coerce_float(v)
+                if fv is not None:
+                    out[str(k)] = fv; ok = True
         if ok:
             return out
 
-        # mapping with rows (dicts)
-        for key in ("rows", "observations", "points"):
-            if key in data and isinstance(data[key], Sequence):
-                return _normalize_series(data[key])
+        # 5) Latest-only mapping
+        if any(k in data for k in ("latest_period","TIME_PERIOD","time_period")) and any(k in data for k in ("latest_value","OBS_VALUE","obs_value","value","val","v","y")):
+            lp = data.get("latest_period") or data.get("TIME_PERIOD") or data.get("time_period")
+            for vk in ("latest_value","OBS_VALUE","obs_value","value","val","v","y"):
+                if vk in data:
+                    lv = _coerce_float(data[vk]); 
+                    if lp and lv is not None: return {str(lp): lv}
+            return {}
 
-        # mapping with only latest
-        if "latest_period" in data and "latest_value" in data:
-            lp = data.get("latest_period")
-            lv = _coerce_float(data.get("latest_value"))
-            if lp and lv is not None:
-                return {str(lp): lv}
         return {}
 
-    # sequence of tuples (period, value) OR sequence of dicts
+    # Sequence branch
     if isinstance(data, Sequence) and not isinstance(data, (str, bytes)):
-        # Case: pair of sequences ([periods...], [values...])
+        # Pair of sequences ([periods], [values])
         if len(data) == 2 and all(isinstance(x, Sequence) and not isinstance(x, (str, bytes)) for x in data):
-            a, b = data[0], data[1]
+            a, b = data
             tmp: Dict[str, float] = {}
             try:
                 n = min(len(a), len(b))
                 for i in range(n):
-                    p = str(a[i])
-                    fv = _coerce_float(b[i])
-                    if fv is not None:
-                        tmp[p] = fv
+                    p = str(a[i]); fv = _coerce_float(b[i])
+                    if fv is not None: tmp[p] = fv
                 return tmp
             except Exception:
                 pass
 
-        # General list handling
+        # General list of rows
         tmp: Dict[str, float] = {}
         for row in data:
             if isinstance(row, Mapping):
-                period = _norm_period_from_dict(row)  # date/period or year+month/quarter
+                period = _period_from_mapping(row)
                 if period:
-                    for vk in ("value", "val", "v", "y"):
+                    for vk in ("value","val","v","y","OBS_VALUE","obs_value"):
                         if vk in row:
                             fv = _coerce_float(row[vk])
                             if fv is not None:
@@ -191,33 +187,26 @@ def _normalize_series(data: Any) -> Dict[str, float]:
                                 break
                 continue
             if isinstance(row, (list, tuple)) and len(row) >= 2:
-                period = str(row[0])
-                fv = _coerce_float(row[1])
-                if fv is not None:
-                    tmp[period] = fv
+                period = str(row[0]); fv = _coerce_float(row[1])
+                if fv is not None: tmp[period] = fv
         return tmp
 
-    # anything else: nothing
     return {}
 
 def _pick_fn(mod, name_candidates: Iterable[str], substr_hints: Iterable[str]) -> Optional[Callable[..., Any]]:
-    """Find a function: exact candidates first, otherwise fuzzy by substrings."""
     if not mod:
         return None
-    # exact
     for nm in name_candidates:
         fn = getattr(mod, nm, None)
         if callable(fn):
             return fn
-    # fuzzy
     best = None
     for k, v in vars(mod).items():
-        if not callable(v) or k.startswith("_"):
+        if not callable(v) or k.startswith("_"): 
             continue
         name = k.lower()
         if all(s in name for s in substr_hints):
-            best = v
-            break
+            best = v; break
     return best
 
 def _call_with_variants(fn: Callable[..., Any], country: str) -> Any:
@@ -239,7 +228,7 @@ def _call_with_variants(fn: Callable[..., Any], country: str) -> Any:
         except Exception:
             continue
     try:
-        return fn(country)
+        return fn(country)  # positional
     except Exception:
         return None
 
