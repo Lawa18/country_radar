@@ -4,6 +4,12 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Literal
 import math
 
+# add near top of indicator_service.py
+try:
+    from app.services.debt_service import compute_debt_payload as _compute_debt_payload
+except Exception:  # keep the module import non-fatal
+    _compute_debt_payload = None
+
 # ----------------------- utils: imports & coercion ----------------------------
 
 def _safe_import(path: str):
