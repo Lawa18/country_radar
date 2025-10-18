@@ -140,140 +140,162 @@ def build_country_payload_v2(
     keep: int = 60,
 ) -> Dict[str, Any]:
     """
-    Modern builder (compat-first):
-      - Uses app.providers.compat for IMF + WB (compat does fuzzy resolution).
-      - series: none|mini|full; keep trims length (60 ≈ 5y monthly, ~20 quarterly).
-      - Eurostat stays disabled by default (Render DNS quirks).
+    Modern builder: IMF-first monthly/quarterly indicators + debt bundle if available.
+    - `series`: none | mini | full   (affects series trimming)
+    - `keep`:   hard cap on returned points (monthly/quarterly/annual)
     """
-    keep_m = keep if keep != 60 else 60
-    keep_q = max(20, math.ceil(keep / 3))
+    # --- base ISO resolution
+    try:
+        from app.utils.country_codes import get_country_codes
+        iso = get_country_codes(country) or {}
+    except Exception:
+        iso = {"name": country, "iso_alpha_2": None, "iso_alpha_3": None, "iso_numeric": None}
 
-    out: Dict[str, Any] = {
+    # --- payload scaffold
+    payload: Dict[str, Any] = {
         "ok": True,
         "country": country,
-        "iso_codes": _iso_codes(country),
+        "iso_codes": {
+            "name": iso.get("name") or country,
+            "iso_alpha_2": iso.get("iso_alpha_2"),
+            "iso_alpha_3": iso.get("iso_alpha_3"),
+            "iso_numeric": iso.get("iso_numeric"),
+        },
         "series_mode": series,
         "keep_days": keep,
-        "indicators": {},
+        "indicators": {
+            "cpi_yoy":          {"series": {}, "latest_period": None, "latest_value": None, "source": None, "freq": "monthly"},
+            "unemployment_rate":{"series": {}, "latest_period": None, "latest_value": None, "source": None, "freq": "monthly"},
+            "fx_rate_usd":      {"series": {}, "latest_period": None, "latest_value": None, "source": None, "freq": "monthly"},
+            "reserves_usd":     {"series": {}, "latest_period": None, "latest_value": None, "source": None, "freq": "monthly"},
+            "policy_rate":      {"series": {}, "latest_period": None, "latest_value": None, "source": None, "freq": "monthly"},
+            "gdp_growth":       {"series": {}, "latest_period": None, "latest_value": None, "source": None, "freq": "quarterly"},
+        },
         "_debug": {
             "builder": {
-                "used": "build_country_payload_v2",
+                "name": "build_country_payload_v2",
                 "module": __name__,
+                "file": __file__,
+                "signature": "(country: str, series: Literal['none','mini','full']='mini', keep: int=60) -> Dict[str, Any]",
+                "mode": "v2",
             },
             "source_trace": {},
             "eurostat": {"enabled": False, "host": "data-api.ec.europa.eu", "dns": False},
+            "notes": [],
         },
+        # debt placeholders (merged later if available)
+        "government_debt": {"latest": {"value": None, "date": None, "source": None}, "series": {}},
+        "nominal_gdp":     {"latest": {"value": None, "date": None, "source": None}, "series": {}},
+        "debt_to_gdp":     {"latest": {"value": None, "date": None, "source": "computed:NA/NA"}, "series": {}},
+        "debt_to_gdp_series": {},
     }
 
-    # -------- CPI YoY (monthly preferred, IMF via compat) --------
-    cpi_series, cpi_src = {}, None
-    c_imf, dbg_imf_cpi = _call_provider("app.providers.compat", ("get_cpi_yoy_monthly",), country=country)
-    if c_imf:
-        cpi_series, cpi_src = c_imf, "IMF"
-    else:
-        c_wb, dbg_wb_cpi = _call_provider("app.providers.compat", ("get_cpi_annual",), country=country)
-        if c_wb:
-            cpi_series, cpi_src = _annualize_latest(c_wb), "WorldBank"
-        else:
-            dbg_wb_cpi = _call_provider("app.providers.compat", (), country=country)[1]
-    out["_debug"]["source_trace"]["cpi_yoy"] = {"compat_imf": dbg_imf_cpi, "compat_wb": locals().get("dbg_wb_cpi", {})}
-
-    # -------- Unemployment rate --------
-    une_series, une_src = {}, None
-    u_imf, dbg_imf_une = _call_provider("app.providers.compat", ("get_unemployment_rate_monthly",), country=country)
-    if u_imf:
-        une_series, une_src = u_imf, "IMF"
-    else:
-        u_wb, dbg_wb_une = _call_provider("app.providers.compat", ("get_unemployment_rate_annual",), country=country)
-        if u_wb:
-            une_series, une_src = _annualize_latest(u_wb), "WorldBank"
-        else:
-            dbg_wb_une = _call_provider("app.providers.compat", (), country=country)[1]
-    out["_debug"]["source_trace"]["unemployment_rate"] = {
-        "compat_imf": dbg_imf_une, "compat_wb": locals().get("dbg_wb_une", {})
-    }
-
-    # -------- FX rate vs USD (monthly) --------
-    fx_series, fx_src = {}, None
-    fx_imf, dbg_imf_fx = _call_provider("app.providers.compat", ("get_fx_rate_usd_monthly",), country=country)
-    if fx_imf:
-        fx_series, fx_src = fx_imf, "IMF"
-    else:
-        fx_wb, dbg_wb_fx = _call_provider("app.providers.compat", ("get_fx_official_annual",), country=country)
-        if fx_wb:
-            fx_series, fx_src = _annualize_latest(fx_wb), "WorldBank"
-        else:
-            dbg_wb_fx = _call_provider("app.providers.compat", (), country=country)[1]
-    out["_debug"]["source_trace"]["fx_rate_usd"] = {"compat_imf": dbg_imf_fx, "compat_wb": locals().get("dbg_wb_fx", {})}
-
-    # -------- Reserves (USD) --------
-    res_series, res_src = {}, None
-    r_imf, dbg_imf_res = _call_provider("app.providers.compat", ("get_reserves_usd_monthly",), country=country)
-    if r_imf:
-        res_series, res_src = r_imf, "IMF"
-    else:
-        r_wb, dbg_wb_res = _call_provider("app.providers.compat", ("get_reserves_annual",), country=country)
-        if r_wb:
-            res_series, res_src = _annualize_latest(r_wb), "WorldBank"
-        else:
-            dbg_wb_res = _call_provider("app.providers.compat", (), country=country)[1]
-    out["_debug"]["source_trace"]["reserves_usd"] = {"compat_imf": dbg_imf_res, "compat_wb": locals().get("dbg_wb_res", {})}
-
-    # -------- Policy rate --------
-    pol_series, pol_src = {}, None
-    p_imf, dbg_imf_pol = _call_provider("app.providers.compat", ("get_policy_rate_monthly",), country=country)
-    if p_imf:
-        pol_series, pol_src = p_imf, "IMF"
-    out["_debug"]["source_trace"]["policy_rate"] = {"compat_imf": dbg_imf_pol}
-
-    # -------- GDP growth (quarterly preferred; WB annual fallback) --------
-    gdp_series, gdp_src, gdp_freq = {}, None, "quarterly"
-    gq_imf, dbg_imf_gdpq = _call_provider("app.providers.compat", ("get_gdp_growth_quarterly",), country=country)
-    if gq_imf:
-        gdp_series, gdp_src = gq_imf, "IMF"
-    else:
-        ga_wb, dbg_wb_gdpa = _call_provider("app.providers.compat", ("get_gdp_growth_annual",), country=country)
-        if ga_wb:
-            gdp_series, gdp_src, gdp_freq = _annualize_latest(ga_wb), "WorldBank", "annual"
-        else:
-            dbg_wb_gdpa = _call_provider("app.providers.compat", (), country=country)[1]
-    out["_debug"]["source_trace"]["gdp_growth"] = {"compat_imf": dbg_imf_gdpq, "compat_wb": locals().get("dbg_wb_gdpa", {})}
-
-    # ---------------- apply series mode & assemble indicators -----------------
-
-    def _pack(series_dict: Dict[str, float], src: Optional[str], freq: str, mode: str, keepn: int):
-        ser = _apply_series_mode(series_dict, mode, keepn)
-        period, value = _latest(ser)
-        return {"series": ser, "latest_period": period, "latest_value": value, "source": src, "freq": freq}
-
-    out["indicators"]["cpi_yoy"]           = _pack(cpi_series, cpi_src, "monthly",  series, keep_m)
-    out["indicators"]["unemployment_rate"] = _pack(une_series, une_src, "monthly",  series, keep_m)
-    out["indicators"]["fx_rate_usd"]       = _pack(fx_series,  fx_src,  "monthly",  series, keep_m)
-    out["indicators"]["reserves_usd"]      = _pack(res_series, res_src, "monthly",  series, keep_m)
-    out["indicators"]["policy_rate"]       = _pack(pol_series, pol_src, "monthly",  series, keep_m)
-    out["indicators"]["gdp_growth"]        = _pack(gdp_series, gdp_src, gdp_freq,   series, keep_q)
-
-    # ---------------- debt enrichment (best effort) ---------------------------
-
-    out["government_debt"]    = {"latest": {"value": None, "date": None, "source": None}, "series": {}}
-    out["nominal_gdp"]        = {"latest": {"value": None, "date": None, "source": None}, "series": {}}
-    out["debt_to_gdp"]        = {"latest": {"value": None, "date": None, "source": "computed:NA/NA"}, "series": {}}
-    out["debt_to_gdp_series"] = {}
-
-    debt_mod = _safe_import("app.routes.debt_bundle") or _safe_import("app.routes.debt")
-    fn = getattr(debt_mod, "compute_debt_payload", None) if debt_mod else None
-    if callable(fn):
+    # --- trim helper
+    def _trim_series(d: Dict[str, float]) -> Dict[str, float]:
+        if not d:
+            return {}
         try:
-            bundle = fn(country=country)
-            if isinstance(bundle, Mapping):
-                out["government_debt"]    = bundle.get("government_debt", out["government_debt"])
-                out["nominal_gdp"]        = bundle.get("nominal_gdp", out["nominal_gdp"])
-                out["debt_to_gdp"]        = bundle.get("debt_to_gdp", out["debt_to_gdp"])
-                out["debt_to_gdp_series"] = bundle.get("debt_to_gdp_series", out["debt_to_gdp_series"])
-        except Exception as e:
-            out["_debug"].setdefault("debt", {})["error"] = str(e)
+            keys = sorted(d.keys())
+        except Exception:
+            keys = list(d.keys())
+        if series == "none":
+            last = keys[-1]
+            return {last: d[last]}
+        if series == "mini":
+            keys = keys[-min(len(keys), keep):]
+        elif keep and series == "full" and len(keys) > keep:
+            keys = keys[-keep:]
+        return {k: d[k] for k in keys}
 
-    return out
+    # --- indicators via compat (IMF/WB/ECB bridge)
+    try:
+        from app.providers import compat as compat
+        tried: Dict[str, Any] = {}
+
+        def _fill(key: str, getter_name: str, src_label: str):
+            getter = getattr(compat, getter_name, None)
+            tried.setdefault(key, []).append({getter_name: bool(callable(getter))})
+            if not callable(getter):
+                return
+            series_map = getter(country) or {}
+            series_map = _trim_series(series_map)
+            if not series_map:
+                return
+            latest_key = sorted(series_map.keys())[-1]
+            latest_val = series_map[latest_key]
+            payload["indicators"][key]["series"] = series_map
+            payload["indicators"][key]["latest_period"] = latest_key
+            payload["indicators"][key]["latest_value"] = latest_val
+            payload["indicators"][key]["source"] = src_label
+
+        _fill("cpi_yoy",           "get_cpi_yoy_monthly",           "IMF")
+        _fill("unemployment_rate", "get_unemployment_rate_monthly",  "IMF")
+        _fill("fx_rate_usd",       "get_fx_rate_usd_monthly",        "IMF")
+        _fill("reserves_usd",      "get_reserves_usd_monthly",       "IMF")
+        _fill("policy_rate",       "get_policy_rate_monthly",        "IMF/ECB")
+        _fill("gdp_growth",        "get_gdp_growth_quarterly",       "IMF")
+
+        payload["_debug"]["source_trace"].update({
+            "cpi_yoy":           {"compat_imf": {"module": compat.__name__, "tried": tried.get("cpi_yoy", [])}},
+            "unemployment_rate": {"compat_imf": {"module": compat.__name__, "tried": tried.get("unemployment_rate", [])}},
+            "fx_rate_usd":       {"compat_imf": {"module": compat.__name__, "tried": tried.get("fx_rate_usd", [])}},
+            "reserves_usd":      {"compat_imf": {"module": compat.__name__, "tried": tried.get("reserves_usd", [])}},
+            "policy_rate":       {"compat_imf": {"module": compat.__name__, "tried": tried.get("policy_rate", [])}},
+            "gdp_growth":        {"compat_imf": {"module": compat.__name__, "tried": tried.get("gdp_growth", [])}},
+        })
+    except Exception as e:
+        payload["_debug"]["notes"].append(f"indicator_error:{type(e).__name__}:{e}")
+
+    # --- merge debt bundle if available
+    try:
+        if _compute_debt_payload is None:
+            raise RuntimeError("debt_service_unavailable")
+
+        debt = _compute_debt_payload(country)
+
+        # Accept several shapes
+        if isinstance(debt, dict):
+            # direct keys if present
+            for key in ("government_debt", "nominal_gdp", "debt_to_gdp", "debt_to_gdp_series"):
+                if key in debt and isinstance(debt[key], dict):
+                    payload[key] = debt[key]
+
+            # common simple shape
+            if "latest" in debt and "series" in debt and not payload["debt_to_gdp"]["series"]:
+                payload["debt_to_gdp"] = {
+                    "latest": {
+                        "value": (debt.get("latest") or {}).get("value"),
+                        "date":  (debt.get("latest") or {}).get("year") or (debt.get("latest") or {}).get("date"),
+                        "source": (debt.get("latest") or {}).get("source"),
+                    },
+                    "series": debt.get("series") or {},
+                }
+                payload["debt_to_gdp_series"] = debt.get("series") or {}
+        else:
+            payload["_debug"]["notes"].append("debt_payload_unrecognized_shape")
+
+        # trim annual series in debt blocks
+        def _trim_annual(block: Dict[str, Any], field: str):
+            if field not in block or not isinstance(block[field], dict):
+                return
+            d = block[field]
+            keys = sorted(d.keys())
+            if series == "none":
+                keys = keys[-1:]
+            elif series == "mini":
+                keys = keys[-min(len(keys), keep):]
+            elif keep and series == "full" and len(keys) > keep:
+                keys = keys[-keep:]
+            block[field] = {k: d[k] for k in keys}
+
+        _trim_annual(payload["debt_to_gdp"], "series")
+        _trim_annual(payload["government_debt"], "series")
+        _trim_annual(payload["nominal_gdp"], "series")
+
+    except Exception as e:
+        payload["_debug"]["notes"].append(f"debt_error:{type(e).__name__}:{e}")
+
+    return payload
 
 # --------------------------- legacy fallback ----------------------------------
 
