@@ -13,6 +13,25 @@ router = APIRouter(tags=["probe"])
 # Utilities (defensive: never raise in probes)
 # -----------------------------------------------------------------------------
 
+def _compat_series(func_name: str, country: str) -> Dict[str, float]:
+    mod = _safe_import("app.providers.compat")
+    if not mod:
+        return {}
+    fn = getattr(mod, func_name, None)
+    if not callable(fn):
+        return {}
+    try:
+        data = fn(country=country)
+        return _coerce_numeric_series(data)
+    except Exception:
+        return {}
+
+def _latest_pair(series: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
+    if not series:
+        return None, None
+    k, v = _latest(series)
+    return k, v
+
 def _safe_import(module: str):
     try:
         return __import__(module, fromlist=["*"])
@@ -411,108 +430,81 @@ def country_lite(
     country: str = Query(..., description="Full country name, e.g., Mexico"),
 ) -> Dict[str, Any]:
     """
-    Lightweight country snapshot:
-      - ISO codes
-      - Debt-to-GDP (WB ratio preferred; IMF fallback)
-      - A few latest macro indicators (IMF/WB)
-    Always soft-fails and returns what it can.
+    Lightweight snapshot built off the compat layer (which routes to the actual
+    deployed provider functions on Render). Soft-fails and returns what it can.
     """
     iso = _iso_codes(country)
 
-    # Debt-to-GDP ratio (World Bank preferred here for parity with your current outputs)
-    wb_mod = _safe_import("app.providers.wb_provider")
-    imf_mod = _safe_import("app.providers.imf_provider")
+    # ---- Debt-to-GDP via unified service (uses compat/Eurostat/IMF/WB as needed)
+    try:
+        from app.services.debt_service import compute_debt_payload
+        debt = compute_debt_payload(country) or {}
+    except Exception:
+        debt = {}
+    debt_latest = debt.get("latest") or {"year": None, "value": None, "source": "computed:NA/NA"}
+    debt_series = debt.get("series") or {}
 
-    ratio_series, src_ratio_dbg = {}, {}
-    if wb_mod:
-        ratio_series, src_ratio_dbg = _probe_provider(
-            "app.providers.wb_provider",
-            ("get_central_gov_debt_pct_gdp", "central_gov_debt_pct_gdp", "get_debt_to_gdp_annual", "debt_to_gdp_annual"),
-            country=country,
-        )
-    if not ratio_series and imf_mod:
-        ratio_series, src_ratio_dbg = _probe_provider(
-            "app.providers.imf_provider",
-            ("get_debt_to_gdp_annual", "debt_to_gdp_annual", "get_general_gov_debt_pct_gdp", "general_gov_debt_pct_gdp"),
-            country=country,
-        )
-    ratio_series = _to_annual_latest(ratio_series)
-    latest_year, latest_value = _latest(ratio_series)
-    ratio_source = "World Bank (ratio)" if wb_mod and ratio_series else ("IMF (ratio)" if imf_mod and ratio_series else None)
+    # ---- Latest-only indicators via compat (monthly/quarterly where possible)
+    cpi_s  = _compat_series("get_cpi_yoy_monthly", country)
+    une_s  = _compat_series("get_unemployment_rate_monthly", country)
+    fx_s   = _compat_series("get_fx_rate_usd_monthly", country)
+    res_s  = _compat_series("get_reserves_usd_monthly", country)
+    pol_s  = _compat_series("get_policy_rate_monthly", country)
+    gdpq_s = _compat_series("get_gdp_growth_quarterly", country)
 
-    # Additional indicators (latest only)
-    def _latest_only(module: str, fn_candidates: Iterable[str]) -> Tuple[Optional[str], Optional[float], Dict[str, Any], str]:
-        s, dbg = _probe_provider(module, tuple(fn_candidates), country=country)
-        period, value = _latest(s)
-        src = "IMF" if "imf" in module else ("WorldBank" if "wb" in module else "Eurostat")
-        return period, value, dbg, src
+    # Optional WB-style metrics (only if you have compat wrappers deployed)
+    cab_s  = _compat_series("get_current_account_balance_pct_gdp", country)   # optional
+    ge_s   = _compat_series("get_government_effectiveness", country)          # optional
 
-    cpi_p, cpi_v, dbg_cpi, cpi_src = _latest_only(
-        "app.providers.imf_provider",
-        ("get_cpi_yoy_monthly","cpi_yoy_monthly","get_cpi_yoy","cpi_yoy"),
-    )
-    une_p, une_v, dbg_une, une_src = _latest_only(
-        "app.providers.imf_provider",
-        ("get_unemployment_rate_monthly","unemployment_rate_monthly","get_unemployment_rate","unemployment_rate"),
-    )
-    fx_p, fx_v, dbg_fx, fx_src = _latest_only(
-        "app.providers.imf_provider",
-        ("get_fx_rate_usd_monthly","fx_rate_usd_monthly","get_fx_rate_usd","fx_rate_usd"),
-    )
-    res_p, res_v, dbg_res, res_src = _latest_only(
-        "app.providers.imf_provider",
-        ("get_reserves_usd_monthly","reserves_usd_monthly","get_reserves_usd","reserves_usd"),
-    )
-    pol_p, pol_v, dbg_pol, pol_src = _latest_only(
-        "app.providers.imf_provider",
-        ("get_policy_rate_monthly","policy_rate_monthly","get_policy_rate","policy_rate"),
-    )
-    gdpq_p, gdpq_v, dbg_gdpq, gdpq_src = _latest_only(
-        "app.providers.imf_provider",
-        ("get_gdp_growth_quarterly","gdp_growth_quarterly"),
-    )
-
-    cab_p, cab_v, dbg_cab, cab_src = _latest_only(
-        "app.providers.wb_provider",
-        ("get_current_account_balance_pct_gdp","current_account_balance_pct_gdp"),
-    )
-    ge_p, ge_v, dbg_ge, ge_src = _latest_only(
-        "app.providers.wb_provider",
-        ("get_government_effectiveness","government_effectiveness"),
-    )
+    cpi_p,  cpi_v  = _latest_pair(cpi_s)
+    une_p,  une_v  = _latest_pair(une_s)
+    fx_p,   fx_v   = _latest_pair(fx_s)
+    res_p,  res_v  = _latest_pair(res_s)
+    pol_p,  pol_v  = _latest_pair(pol_s)
+    gdpq_p, gdpq_v = _latest_pair(gdpq_s)
+    cab_p,  cab_v  = _latest_pair(cab_s)
+    ge_p,   ge_v   = _latest_pair(ge_s)
 
     resp = {
         "country": country,
         "iso_codes": iso,
-        "imf_data": {},  # backward display-parity with your current client
-        "latest": {"year": latest_year, "value": latest_value, "source": ratio_source},
-        "series": ratio_series,   # annual series used by your client
-        "source": ratio_source,
+
+        # Debt block (your clients expect these fields)
+        "latest": {"year": debt_latest.get("year"), "value": debt_latest.get("value"), "source": debt_latest.get("source")},
+        "series": debt_series,
+        "source": debt_latest.get("source"),
+
+        # Legacy fields kept for display-parity
+        "imf_data": {},
         "government_debt": {"latest": {"value": None, "date": None, "source": None}, "series": {}},
         "nominal_gdp":    {"latest": {"value": None, "date": None, "source": None}, "series": {}},
         "debt_to_gdp":    {"latest": {"value": None, "date": None, "source": None}, "series": {}},
         "debt_to_gdp_series": {},
+
+        # Latest-only indicators
         "additional_indicators": {
-            "cpi_yoy":  {"latest_value": cpi_v,  "latest_period": cpi_p,  "source": cpi_src,  "series": {}},
-            "unemployment_rate": {"latest_value": une_v, "latest_period": une_p, "source": une_src, "series": {}},
-            "fx_rate_usd": {"latest_value": fx_v, "latest_period": fx_p, "source": fx_src, "series": {}},
-            "reserves_usd": {"latest_value": res_v, "latest_period": res_p, "source": res_src, "series": {}},
-            "policy_rate": {"latest_value": pol_v, "latest_period": pol_p, "source": pol_src, "series": {}},
-            "gdp_growth": {"latest_value": gdpq_v, "latest_period": gdpq_p, "source": gdpq_src, "series": {}},
+            "cpi_yoy":  {"latest_value": cpi_v,  "latest_period": cpi_p,  "source": "compat/IMF",  "series": {}},
+            "unemployment_rate": {"latest_value": une_v, "latest_period": une_p, "source": "compat/IMF", "series": {}},
+            "fx_rate_usd": {"latest_value": fx_v, "latest_period": fx_p, "source": "compat/IMF", "series": {}},
+            "reserves_usd": {"latest_value": res_v, "latest_period": res_p, "source": "compat/IMF", "series": {}},
+            "policy_rate": {"latest_value": pol_v, "latest_period": pol_p, "source": "compat/IMF/ECB", "series": {}},
+            "gdp_growth": {"latest_value": gdpq_v, "latest_period": gdpq_p, "source": "compat/IMF", "series": {}},
             "current_account_balance_pct_gdp": {
-                "latest_value": cab_v, "latest_period": cab_p, "source": cab_src, "series": {}
+                "latest_value": cab_v, "latest_period": cab_p, "source": "compat/WB", "series": {}
             },
             "government_effectiveness": {
-                "latest_value": ge_v, "latest_period": ge_p, "source": ge_src, "series": {}
+                "latest_value": ge_v, "latest_period": ge_p, "source": "compat/WB WGI", "series": {}
             },
         },
+
         "_debug": {
-            "builder": "probe.country_lite",
+            "builder": "probe.country_lite (compat)",
             "sources": {
-                "debt_ratio": src_ratio_dbg,
-                "cpi": dbg_cpi, "unemployment": dbg_une, "fx": dbg_fx,
-                "reserves": dbg_res, "policy_rate": dbg_pol, "gdp_growth_q": dbg_gdpq,
-                "current_account_balance": dbg_cab, "government_effectiveness": dbg_ge,
+                "debt": debt.get("latest", {}),
+                "cpi": {"len": len(cpi_s)}, "unemployment": {"len": len(une_s)}, "fx": {"len": len(fx_s)},
+                "reserves": {"len": len(res_s)}, "policy_rate": {"len": len(pol_s)},
+                "gdp_growth_q": {"len": len(gdpq_s)}, "current_account_balance": {"len": len(cab_s)},
+                "government_effectiveness": {"len": len(ge_s)},
             },
         },
     }
