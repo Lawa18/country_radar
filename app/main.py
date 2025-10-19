@@ -12,7 +12,7 @@ from fastapi.openapi.utils import get_openapi
 from starlette.middleware.gzip import GZipMiddleware
 
 APP_TITLE = "Country Radar API"
-APP_VERSION = os.getenv("CR_VERSION", "2025.10.14-step1")
+APP_VERSION = os.getenv("CR_VERSION", "2025.10.18")
 APP_DESC = "Macroeconomic data API"
 
 # -----------------------------------------------------------------------------
@@ -40,18 +40,35 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
+    """
+    Lightweight access log + resilient error guard:
+    - Always logs key endpoints
+    - Never lets an exception tear down the connection (returns JSON 500)
+    """
     path = request.url.path
     ua = request.headers.get("user-agent", "")
     start = time.time()
-    resp: Response = await call_next(request)
+    ip = request.client.host if request.client else "-"
+
+    try:
+        resp: Response = await call_next(request)
+    except Exception as e:
+        dur_ms = (time.time() - start) * 1000.0
+        # Emit a compact line that will show up in Render logs
+        print(f"[req-err] {request.method} {path}?{request.query_params} ua={ua} ip={ip} -> 500 {dur_ms:.1f}ms err={type(e).__name__}: {e}")
+        # Return a JSON 500 rather than bubbling, so Actions see a structured error
+        return JSONResponse(
+            {"ok": False, "error": f"{type(e).__name__}", "detail": str(e), "path": path},
+            status_code=500
+        )
 
     # Light tracing for key endpoints
     if path in ("/__action_probe", "/v1/country-lite", "/country-data", "/v1/debt", "/v1/debt-bundle"):
-        ip = request.client.host if request.client else "-"
         print(f"[trace] {request.method} {path}?{request.query_params} ua={ua} ip={ip} -> {resp.status_code}")
 
     dur_ms = (time.time() - start) * 1000.0
-    if not ua.startswith("Render/") and path not in ("/ping",):
+    # Avoid noisy health checks
+    if not ua.startswith("Render/") and path not in ("/ping", "/healthz"):
         print(f"[req] {request.method} {path}?{request.query_params} -> {resp.status_code} {dur_ms:.1f}ms")
     return resp
 
@@ -63,9 +80,11 @@ def _safe_include(label: str, import_path: str, attr: str = "router") -> Tuple[b
     try:
         module = __import__(import_path, fromlist=[attr])
         router = getattr(module, attr)
+        # Do not override tags inside included router; we add a tag on include for grouping,
+        # but routes retain their own declared tags too.
         app.include_router(router, tags=[label])
 
-        routes = []
+        routes: List[Tuple[str, List[str]]] = []
         for r in getattr(router, "routes", []):
             if getattr(r, "path", None) and getattr(r, "methods", None):
                 routes.append((r.path, sorted(list(r.methods))))
@@ -77,11 +96,11 @@ def _safe_include(label: str, import_path: str, attr: str = "router") -> Tuple[b
         return False, []
 
 mounted: Dict[str, Any] = {}
-mounted["probe"]   = _safe_include("probe",   "app.routes.probe")
-mounted["country"] = _safe_include("country", "app.routes.country")
-mounted["debt"]    = _safe_include("debt",    "app.routes.debt")
+mounted["probe"]        = _safe_include("probe",   "app.routes.probe")
+mounted["country"]      = _safe_include("country", "app.routes.country")
+mounted["debt"]         = _safe_include("debt",    "app.routes.debt")
 # Optional new full-bundle debt router; OK if not present yet
-mounted["debt_bundle"] = _safe_include("debt", "app.routes.debt_bundle")
+mounted["debt_bundle"]  = _safe_include("debt",    "app.routes.debt_bundle")
 
 # -----------------------------------------------------------------------------
 # Health / Root
@@ -115,20 +134,43 @@ def root() -> Dict[str, Any]:
     }
 
 # -----------------------------------------------------------------------------
-# OpenAPI servers (so GPT hits the right base URL on Render)
+# OpenAPI servers (Render-first so Actions don't hit localhost)
 # -----------------------------------------------------------------------------
 def _server_list() -> List[Dict[str, str]]:
-    override = os.getenv("CR_OPENAPI_SERVER_URLS", "")
-    servers: List[Dict[str, str]] = []
-    if override.strip():
-        for url in [u.strip() for u in override.split(",") if u.strip()]:
-            servers.append({"url": url})
-    else:
-        servers.append({"url": os.getenv("CR_BASE_URL", "http://localhost:8000")})
-        rd = os.getenv("RENDER_EXTERNAL_URL")
-        if rd:
-            servers.append({"url": rd})
-    return servers
+    """
+    Order of precedence:
+      1) RENDER_EXTERNAL_URL (Render sets this, HTTPS)
+      2) CR_OPENAPI_SERVER_URLS (comma-separated overrides)
+      3) CR_BASE_URL (manual override)
+      4) http://localhost:8000 (dev fallback)
+    Only include distinct, non-empty URLs; prefer HTTPS for Actions.
+    """
+    servers: List[str] = []
+
+    rd = os.getenv("RENDER_EXTERNAL_URL", "").strip()
+    if rd:
+        servers.append(rd)
+
+    override = os.getenv("CR_OPENAPI_SERVER_URLS", "").strip()
+    if override:
+        servers.extend([u.strip() for u in override.split(",") if u.strip()])
+
+    base = os.getenv("CR_BASE_URL", "").strip()
+    if base:
+        servers.append(base)
+
+    # Always include localhost as last fallback
+    servers.append("http://localhost:8000")
+
+    # De-dupe, filter to plausible URLs, prefer https first in ordering above
+    out: List[Dict[str, str]] = []
+    seen = set()
+    for url in servers:
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        out.append({"url": url})
+    return out
 
 def custom_openapi():
     if app.openapi_schema:
@@ -139,6 +181,7 @@ def custom_openapi():
         description=APP_DESC,
         routes=app.routes,
     )
+    # Put Render URL first so GPT Actions use it
     schema["servers"] = _server_list()
     app.openapi_schema = schema
     return app.openapi_schema
