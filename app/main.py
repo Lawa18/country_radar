@@ -30,9 +30,11 @@ app = FastAPI(
 # -----------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
+    allow_origins=["*"],          # tighten later
+    allow_credentials=False,
+    allow_methods=["GET", "HEAD", "OPTIONS"],
     allow_headers=["*"],
+    max_age=600,
 )
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
