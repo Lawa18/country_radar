@@ -1,13 +1,13 @@
 # app/routes/probe.py — diagnostics + lightweight country info
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
+import inspect
 
 from fastapi import APIRouter, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
-router = APIRouter()
-
+router = APIRouter(tags=["probe"])
 
 # -----------------------------------------------------------------------------
 # Utilities (defensive: never raise in probes)
@@ -111,7 +111,6 @@ def _iso_codes(country: str) -> Dict[str, Optional[str]]:
         if cc_mod and hasattr(cc_mod, "get_country_codes"):
             codes = cc_mod.get_country_codes(country)
             if isinstance(codes, Mapping):
-                # normalize keys we care about
                 return {
                     "name": str(codes.get("name") or country),
                     "iso_alpha_2": codes.get("iso_alpha_2") or codes.get("alpha2") or codes.get("iso2"),
@@ -120,19 +119,24 @@ def _iso_codes(country: str) -> Dict[str, Optional[str]]:
                 }
     except Exception:
         pass
-    # fallback: unknown codes, but keep name
     return {"name": country, "iso_alpha_2": None, "iso_alpha_3": None, "iso_numeric": None}
-
 
 # -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
 
-@router.get("/__action_probe", summary="Connectivity probe", tags=["probe"])
-def __action_probe() -> Dict[str, Any]:
+# ——— Reachability ------------------------------------------------------------
+@router.get("/__action_probe", summary="Connectivity probe")
+def action_probe_get() -> Dict[str, Any]:
     return {"ok": True, "path": "/__action_probe"}
 
-@router.get("/__probe_series", summary="Probe Series", tags=["probe"])
+@router.options("/__action_probe", include_in_schema=False)
+def action_probe_options() -> Response:
+    # Allow preflights to succeed fast
+    return Response(status_code=204)
+
+# ——— Series probe ------------------------------------------------------------
+@router.get("/__probe_series", summary="Probe Series")
 def probe_series(
     country: str = Query(..., description="Full country name, e.g., Germany"),
 ) -> Dict[str, Any]:
@@ -215,7 +219,6 @@ def probe_series(
         period, _ = _latest(series)
         return {"len": len(series), "latest": period}
 
-    # Annualize some for consistent “len”
     cpi_wb_annual = _to_annual_latest(wb_cpi)
     une_wb_annual = _to_annual_latest(wb_une)
 
@@ -237,7 +240,6 @@ def probe_series(
             },
             "fx": {
                 "IMF": _brief(imf_fx),
-                # WB’s FX is typically not monthly; omit unless you have one
             },
             "reserves": {
                 "IMF": _brief(imf_res),
@@ -250,7 +252,6 @@ def probe_series(
                 "WB_annual": _brief(wb_gdpa),
             },
         },
-        # Minimal debug so it’s usable but compact
         "_debug": {
             "cpi": {"IMF": dbg_imf_cpi, "Eurostat": dbg_eu_cpi, "WB": dbg_wb_cpi},
             "unemployment": {"IMF": dbg_imf_une, "Eurostat": dbg_eu_une, "WB": dbg_wb_une},
@@ -262,7 +263,12 @@ def probe_series(
     }
     return resp
 
-@router.get("/__compat_probe", tags=["probe"], summary="Inspect compat normalization for one indicator")
+@router.options("/__probe_series", include_in_schema=False)
+def probe_series_options() -> Response:
+    return Response(status_code=204)
+
+# ——— Compat probe ------------------------------------------------------------
+@router.get("/__compat_probe", summary="Inspect compat normalization for one indicator")
 def compat_probe(
     indicator: str,
     country: str = "Mexico",
@@ -283,7 +289,6 @@ def compat_probe(
         ("gdp_growth","quarterly"): "get_gdp_growth_quarterly",
         ("gdp_growth","annual"):   "get_gdp_growth_annual",
     }
-    key = None
     if indicator == "gdp_growth":
         key = (indicator, "quarterly" if freq in ("auto","quarterly") else "annual")
     else:
@@ -304,16 +309,8 @@ def compat_probe(
     }
 
 # --- BEGIN: provider introspection helpers -----------------------------------
-from typing import Any, Dict
-import inspect
 
-def _safe_import(path: str):
-    try:
-        return __import__(path, fromlist=["*"])
-    except Exception:
-        return None
-
-@router.get("/__provider_fns", tags=["probe"], summary="List callables exported by a provider module")
+@router.get("/__provider_fns", summary="List callables exported by a provider module")
 def provider_fns(module: str):
     """
     List top-level callables in a provider module so we can see what's actually deployed.
@@ -334,13 +331,13 @@ def provider_fns(module: str):
             fns.append({"name": name, "signature": sig})
     return {"ok": True, "module": module, "count": len(fns), "functions": sorted(fns, key=lambda x: x["name"])}
 
-@router.get("/__codes", tags=["probe"], summary="Show resolved ISO codes for a country")
+@router.get("/__codes", summary="Show resolved ISO codes for a country")
 def show_codes(country: str = "Mexico"):
     from app.utils.country_codes import get_country_codes
     codes = get_country_codes(country)
     return {"country": country, "codes": codes}
 
-@router.get("/__provider_raw", tags=["probe"], summary="Call a provider function directly and preview result")
+@router.get("/__provider_raw", summary="Call a provider function directly and preview result")
 def provider_raw(
     module: str,
     fn: str,
@@ -405,152 +402,35 @@ def provider_raw(
         "result_type": None if res is None else type(res).__name__,
         "result_preview": _preview(res),
     }
+
 # --- END: provider introspection helpers -------------------------------------
 
-from typing import Any, Dict, Iterable, Mapping, Sequence
-import inspect
-
-def _safe_import(path: str):
-    try:
-        return __import__(path, fromlist=["*"])
-    except Exception:
-        return None
-
-def _iso_variants(country: str) -> Dict[str, Any]:
-    try:
-        cc_mod = _safe_import("app.utils.country_codes")
-        if cc_mod and hasattr(cc_mod, "get_country_codes"):
-            c = cc_mod.get_country_codes(country) or {}
-            return {
-                "country": country,
-                "name": country,
-                "iso2": c.get("iso_alpha_2") or c.get("alpha2") or c.get("iso2"),
-                "iso3": c.get("iso_alpha_3") or c.get("alpha3") or c.get("iso3"),
-                "code": c.get("iso_alpha_3") or c.get("alpha3") or c.get("iso3") or c.get("iso_alpha_2"),
-            }
-    except Exception:
-        pass
-    return {"country": country, "name": country, "iso2": None, "iso3": None, "code": None}
-
-def _call_with_variants(fn, country: str):
-    variants = _iso_variants(country)
-    attempts = [
-        {"country": variants["country"]},
-        {"name": variants["name"]},
-        {"iso2": variants["iso2"]} if variants["iso2"] else None,
-        {"iso3": variants["iso3"]} if variants["iso3"] else None,
-        {"code": variants["code"]} if variants["code"] else None,
-    ]
-    for kv in [x for x in attempts if x]:
-        try:
-            return {"args": kv, "result": fn(**kv), "error": None}
-        except TypeError as e:
-            err = str(e)
-        except Exception as e:
-            err = f"{type(e).__name__}: {e}"
-        # try positional as a last resort for this variant
-        try:
-            return {"args": {"positional": list(kv.values())[0]}, "result": fn(list(kv.values())[0]), "error": None}
-        except Exception as e2:
-            err = f"{type(e2).__name__}: {e2}"
-    return {"args": {}, "result": None, "error": err if 'err' in locals() else "no_variant_matched"}
-
-def _preview(obj: Any, limit: int = 12) -> Any:
-    # Make a short, JSON-safe preview
-    try:
-        import pandas as pd  # if present
-        if isinstance(obj, (pd.Series, pd.DataFrame)):
-            obj = obj.to_dict()
-    except Exception:
-        pass
-
-    if obj is None:
-        return None
-    if isinstance(obj, (str, int, float, bool)):
-        return obj
-    if isinstance(obj, Mapping):
-        keys = list(obj.keys())
-        head = keys[:limit]
-        preview_map = {str(k): obj[k] for k in head}
-        # If mapping-of-mapping, show nested keys for first few
-        nested = {}
-        for k in head:
-            v = obj[k]
-            if isinstance(v, Mapping):
-                nested[str(k)] = list(v.keys())[:5]
-        out = {"type": "mapping", "len": len(keys), "head_keys": head, "head_values": preview_map}
-        if nested:
-            out["nested_keys"] = nested
-        return out
-    if isinstance(obj, Sequence) and not isinstance(obj, (bytes, bytearray, str)):
-        head = list(obj)[:limit]
-        return {"type": "sequence", "len": len(obj), "head": head}
-    # fallback repr
-    return {"type": type(obj).__name__, "repr": repr(obj)[:400]}
-
-@router.get("/__provider_raw", tags=["probe"], summary="Call a provider function directly and preview result")
-def provider_raw(
-    module: str = Query(..., description="e.g., app.providers.imf_provider"),
-    fn_candidates: str = Query(..., description="Comma-separated function names to try, in order"),
-    country: str = Query("Mexico"),
-):
-    """
-    Tries to import `module`, finds the first callable among `fn_candidates`,
-    calls it with multiple argument variants (country/name/iso2/iso3/code or positional),
-    and returns a short preview of the raw return value.
-    """
-    mod = _safe_import(module)
-    if not mod:
-        return {"ok": False, "error": f"import_failed: {module}"}
-    tried = []
-    f = None
-    for name in [s.strip() for s in fn_candidates.split(",") if s.strip()]:
-        cand = getattr(mod, name, None)
-        if callable(cand):
-            f = cand
-            tried.append({name: "callable"})
-            break
-        tried.append({name: "missing"})
-    if not f:
-        return {"ok": False, "module": module, "tried": tried, "error": "no_callable_found"}
-
-    call = _call_with_variants(f, country)
-    res = call["result"]
-    return {
-        "ok": True,
-        "module": module,
-        "fn_used": [k for k,v in tried[-1].items()][0] if tried else None,
-        "call_args": call["args"],
-        "call_error": call["error"],
-        "result_type": type(res).__name__ if res is not None else None,
-        "result_preview": _preview(res, 10),
-    }
-
-@router.get("/v1/country-lite", summary="Country Lite", tags=["probe"])
+# ——— Country Lite ------------------------------------------------------------
+@router.get("/v1/country-lite", summary="Country Lite")
 def country_lite(
     country: str = Query(..., description="Full country name, e.g., Mexico"),
 ) -> Dict[str, Any]:
     """
     Lightweight country snapshot:
       - ISO codes
-      - Debt-to-GDP (WB ratio preferred)
+      - Debt-to-GDP (WB ratio preferred; IMF fallback)
       - A few latest macro indicators (IMF/WB)
     Always soft-fails and returns what it can.
     """
     iso = _iso_codes(country)
 
     # Debt-to-GDP ratio (World Bank preferred here for parity with your current outputs)
-    wb = _safe_import("app.providers.wb_provider")
-    imf = _safe_import("app.providers.imf_provider")
+    wb_mod = _safe_import("app.providers.wb_provider")
+    imf_mod = _safe_import("app.providers.imf_provider")
 
     ratio_series, src_ratio_dbg = {}, {}
-    if wb:
+    if wb_mod:
         ratio_series, src_ratio_dbg = _probe_provider(
             "app.providers.wb_provider",
             ("get_central_gov_debt_pct_gdp", "central_gov_debt_pct_gdp", "get_debt_to_gdp_annual", "debt_to_gdp_annual"),
             country=country,
         )
-    if not ratio_series and imf:
+    if not ratio_series and imf_mod:
         ratio_series, src_ratio_dbg = _probe_provider(
             "app.providers.imf_provider",
             ("get_debt_to_gdp_annual", "debt_to_gdp_annual", "get_general_gov_debt_pct_gdp", "general_gov_debt_pct_gdp"),
@@ -558,7 +438,7 @@ def country_lite(
         )
     ratio_series = _to_annual_latest(ratio_series)
     latest_year, latest_value = _latest(ratio_series)
-    ratio_source = "World Bank (ratio)" if wb and ratio_series else ("IMF (ratio)" if imf and ratio_series else None)
+    ratio_source = "World Bank (ratio)" if wb_mod and ratio_series else ("IMF (ratio)" if imf_mod and ratio_series else None)
 
     # Additional indicators (latest only)
     def _latest_only(module: str, fn_candidates: Iterable[str]) -> Tuple[Optional[str], Optional[float], Dict[str, Any], str]:
@@ -567,40 +447,51 @@ def country_lite(
         src = "IMF" if "imf" in module else ("WorldBank" if "wb" in module else "Eurostat")
         return period, value, dbg, src
 
-    cpi_p, cpi_v, dbg_cpi, cpi_src = _latest_only("app.providers.imf_provider",
-        ("get_cpi_yoy_monthly","cpi_yoy_monthly","get_cpi_yoy","cpi_yoy"))
-    une_p, une_v, dbg_une, une_src = _latest_only("app.providers.imf_provider",
-        ("get_unemployment_rate_monthly","unemployment_rate_monthly","get_unemployment_rate","unemployment_rate"))
-    fx_p, fx_v, dbg_fx, fx_src = _latest_only("app.providers.imf_provider",
-        ("get_fx_rate_usd_monthly","fx_rate_usd_monthly","get_fx_rate_usd","fx_rate_usd"))
-    res_p, res_v, dbg_res, res_src = _latest_only("app.providers.imf_provider",
-        ("get_reserves_usd_monthly","reserves_usd_monthly","get_reserves_usd","reserves_usd"))
-    pol_p, pol_v, dbg_pol, pol_src = _latest_only("app.providers.imf_provider",
-        ("get_policy_rate_monthly","policy_rate_monthly","get_policy_rate","policy_rate"))
-    gdpq_p, gdpq_v, dbg_gdpq, gdpq_src = _latest_only("app.providers.imf_provider",
-        ("get_gdp_growth_quarterly","gdp_growth_quarterly"))
+    cpi_p, cpi_v, dbg_cpi, cpi_src = _latest_only(
+        "app.providers.imf_provider",
+        ("get_cpi_yoy_monthly","cpi_yoy_monthly","get_cpi_yoy","cpi_yoy"),
+    )
+    une_p, une_v, dbg_une, une_src = _latest_only(
+        "app.providers.imf_provider",
+        ("get_unemployment_rate_monthly","unemployment_rate_monthly","get_unemployment_rate","unemployment_rate"),
+    )
+    fx_p, fx_v, dbg_fx, fx_src = _latest_only(
+        "app.providers.imf_provider",
+        ("get_fx_rate_usd_monthly","fx_rate_usd_monthly","get_fx_rate_usd","fx_rate_usd"),
+    )
+    res_p, res_v, dbg_res, res_src = _latest_only(
+        "app.providers.imf_provider",
+        ("get_reserves_usd_monthly","reserves_usd_monthly","get_reserves_usd","reserves_usd"),
+    )
+    pol_p, pol_v, dbg_pol, pol_src = _latest_only(
+        "app.providers.imf_provider",
+        ("get_policy_rate_monthly","policy_rate_monthly","get_policy_rate","policy_rate"),
+    )
+    gdpq_p, gdpq_v, dbg_gdpq, gdpq_src = _latest_only(
+        "app.providers.imf_provider",
+        ("get_gdp_growth_quarterly","gdp_growth_quarterly"),
+    )
 
-    cab_p, cab_v, dbg_cab, cab_src = _latest_only("app.providers.wb_provider",
-        ("get_current_account_balance_pct_gdp","current_account_balance_pct_gdp"))
-    ge_p, ge_v, dbg_ge, ge_src = _latest_only("app.providers.wb_provider",
-        ("get_government_effectiveness","government_effectiveness"))
+    cab_p, cab_v, dbg_cab, cab_src = _latest_only(
+        "app.providers.wb_provider",
+        ("get_current_account_balance_pct_gdp","current_account_balance_pct_gdp"),
+    )
+    ge_p, ge_v, dbg_ge, ge_src = _latest_only(
+        "app.providers.wb_provider",
+        ("get_government_effectiveness","government_effectiveness"),
+    )
 
     resp = {
         "country": country,
         "iso_codes": iso,
-        "imf_data": {},  # kept for backward display-parity with your current client
-        "latest": {
-            "year": latest_year,
-            "value": latest_value,
-            "source": ratio_source,
-        },
+        "imf_data": {},  # backward display-parity with your current client
+        "latest": {"year": latest_year, "value": latest_value, "source": ratio_source},
         "series": ratio_series,   # annual series used by your client
         "source": ratio_source,
         "government_debt": {"latest": {"value": None, "date": None, "source": None}, "series": {}},
         "nominal_gdp":    {"latest": {"value": None, "date": None, "source": None}, "series": {}},
         "debt_to_gdp":    {"latest": {"value": None, "date": None, "source": None}, "series": {}},
         "debt_to_gdp_series": {},
-
         "additional_indicators": {
             "cpi_yoy":  {"latest_value": cpi_v,  "latest_period": cpi_p,  "source": cpi_src,  "series": {}},
             "unemployment_rate": {"latest_value": une_v, "latest_period": une_p, "source": une_src, "series": {}},
@@ -626,3 +517,7 @@ def country_lite(
         },
     }
     return JSONResponse(content=resp)
+
+@router.options("/v1/country-lite", include_in_schema=False)
+def country_lite_options() -> Response:
+    return Response(status_code=204)
