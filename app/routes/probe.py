@@ -13,6 +13,99 @@ router = APIRouter(tags=["probe"])
 # Utilities (defensive: never raise in probes)
 # -----------------------------------------------------------------------------
 
+# ---- History policy + compat helpers ----------------------------------------
+HIST_POLICY = {"A": 20, "Q": 4, "M": 12}  # Annual, Quarterly, Monthly window sizes
+
+def _freq_of_key(k: str) -> str:
+    """
+    Crude freq detector: 'YYYY-Qn' -> Q ; 'YYYY-MM' -> M ; else 'A'.
+    """
+    s = str(k)
+    if "-Q" in s:
+        return "Q"
+    if "-" in s:
+        parts = s.split("-")
+        # YYYY-MM or YYYY-MM-DD, treat as monthly for our use (IMF monthly keys are YYYY-MM)
+        if len(parts) >= 2 and parts[0].isdigit():
+            return "M"
+    return "A"
+
+def _trim_series_policy(series: Mapping[str, float], policy: Dict[str, int]) -> Dict[str, float]:
+    """
+    Trim a mixed or single-freq series to the policy windows by freq.
+    For mixed keys (rare), we group by freq and trim each group.
+    """
+    if not series:
+        return {}
+    buckets: Dict[str, Dict[str, float]] = {"A": {}, "Q": {}, "M": {}}
+    for k, v in series.items():
+        try:
+            freq = _freq_of_key(k)
+            buckets[freq][str(k)] = float(v)
+        except Exception:
+            continue
+    out: Dict[str, float] = {}
+    for f, sub in buckets.items():
+        if not sub:
+            continue
+        keep = policy.get(f, 0)
+        # sort chronologically by parsed period tuple (reuse _parse_period_key)
+        ordered = sorted(sub.items(), key=lambda kv: _parse_period_key(kv[0]))
+        take = ordered[-keep:] if keep > 0 else ordered
+        out.update(dict(take))
+    # return merged trimmed dict sorted by period
+    return dict(sorted(out.items(), key=lambda kv: _parse_period_key(kv[0])))
+
+def _compat_fetch_series(func_name: str, country: str, want_freq: str, keep_hint: int) -> Dict[str, float]:
+    """
+    Fetch from compat with hints; fall back to plain call; coerce + trim.
+    keep_hint should be >= policy window (e.g., 24 for safety), we then trim strictly.
+    """
+    mod = _safe_import("app.providers.compat")
+    raw: Mapping[str, Any] = {}
+    if mod:
+        fn = getattr(mod, func_name, None)
+        if callable(fn):
+            for kwargs in (
+                {"country": country, "series": "mini", "keep": max(keep_hint, 24)},
+                {"country": country, "series": "full"},
+                {"country": country},
+            ):
+                try:
+                    raw = fn(**kwargs) or {}
+                    if raw:
+                        break
+                except TypeError:
+                    continue
+                except Exception:
+                    continue
+    data = _coerce_numeric_series(raw)
+    # If series is annual but we asked monthly/quarterly, that's OK—we still trim by policy.
+    return _trim_series_policy(data, HIST_POLICY)
+
+def _wb_fallback_series(country: str, indicator_code: str) -> Dict[str, float]:
+    """
+    Direct WB fallback when compat function is missing/unimplemented.
+    """
+    try:
+        wb = _safe_import("app.providers.wb_provider")
+        if not wb:
+            return {}
+        fetch = getattr(wb, "fetch_wb_indicator_raw", None)
+        to_year = getattr(wb, "wb_year_dict_from_raw", None)
+        if not callable(fetch) or not callable(to_year):
+            return {}
+        from app.utils.country_codes import get_country_codes
+        codes = get_country_codes(country) or {}
+        iso3 = codes.get("iso_alpha_3")
+        if not iso3:
+            return {}
+        raw = fetch(iso3, indicator_code)
+        series = _coerce_numeric_series(to_year(raw))
+        return _trim_series_policy(series, HIST_POLICY)
+    except Exception:
+        return {}
+
 def _compat_series(func_name: str, country: str) -> Dict[str, float]:
     mod = _safe_import("app.providers.compat")
     if not mod:
@@ -430,82 +523,99 @@ def country_lite(
     country: str = Query(..., description="Full country name, e.g., Mexico"),
 ) -> Dict[str, Any]:
     """
-    Lightweight snapshot built off the compat layer (which routes to the actual
-    deployed provider functions on Render). Soft-fails and returns what it can.
+    Compat-first, frequency-aware snapshot with bounded history windows:
+      - Debt-to-GDP (annual, last 20y)
+      - GDP growth (quarterly, last 4q)
+      - Monthly set (CPI YoY, Unemployment, FX, Reserves, Policy rate) last 12m
+      - Current Account % GDP (annual, last 20y) — WB fallback
+      - Government Effectiveness (annual, last 20y) — WB fallback
     """
     iso = _iso_codes(country)
 
-    # ---- Debt-to-GDP via unified service (uses compat/Eurostat/IMF/WB as needed)
+    # ---- Debt-to-GDP (service already tiers Eurostat/IMF/WB and caches)
     try:
         from app.services.debt_service import compute_debt_payload
         debt = compute_debt_payload(country) or {}
     except Exception:
         debt = {}
-    debt_latest = debt.get("latest") or {"year": None, "value": None, "source": "computed:NA/NA"}
-    debt_series = debt.get("series") or {}
+    debt_series_full = debt.get("series") or {}
+    debt_series = _trim_series_policy(debt_series_full, HIST_POLICY)  # A:20
+    debt_latest = debt.get("latest") or {"year": None, "value": None, "source": "unavailable"}
 
-    # ---- Latest-only indicators via compat (monthly/quarterly where possible)
-    cpi_s  = _compat_series("get_cpi_yoy_monthly", country)
-    une_s  = _compat_series("get_unemployment_rate_monthly", country)
-    fx_s   = _compat_series("get_fx_rate_usd_monthly", country)
-    res_s  = _compat_series("get_reserves_usd_monthly", country)
-    pol_s  = _compat_series("get_policy_rate_monthly", country)
-    gdpq_s = _compat_series("get_gdp_growth_quarterly", country)
+    # ---- GDP growth (quarterly, 4)
+    gdp_growth_q = _compat_fetch_series("get_gdp_growth_quarterly", country, "Q", keep_hint=12)
 
-    # Optional WB-style metrics (only if you have compat wrappers deployed)
-    cab_s  = _compat_series("get_current_account_balance_pct_gdp", country)   # optional
-    ge_s   = _compat_series("get_government_effectiveness", country)          # optional
+    # ---- Monthly (12): CPI YoY, Unemployment, FX, Reserves, Policy rate
+    cpi_m   = _compat_fetch_series("get_cpi_yoy_monthly", country, "M", keep_hint=24)
+    une_m   = _compat_fetch_series("get_unemployment_rate_monthly", country, "M", keep_hint=24)
+    fx_m    = _compat_fetch_series("get_fx_rate_usd_monthly", country, "M", keep_hint=24)
+    res_m   = _compat_fetch_series("get_reserves_usd_monthly", country, "M", keep_hint=24)
+    policy_m= _compat_fetch_series("get_policy_rate_monthly", country, "M", keep_hint=36)
 
-    cpi_p,  cpi_v  = _latest_pair(cpi_s)
-    une_p,  une_v  = _latest_pair(une_s)
-    fx_p,   fx_v   = _latest_pair(fx_s)
-    res_p,  res_v  = _latest_pair(res_s)
-    pol_p,  pol_v  = _latest_pair(pol_s)
-    gdpq_p, gdpq_v = _latest_pair(gdpq_s)
-    cab_p,  cab_v  = _latest_pair(cab_s)
-    ge_p,   ge_v   = _latest_pair(ge_s)
+    # ---- Annual (20): Current Account % GDP, Government Effectiveness
+    # Prefer compat wrappers if present; else WB fallback codes.
+    cab_a = _compat_fetch_series("get_current_account_balance_pct_gdp", country, "A", keep_hint=40)
+    if not cab_a:
+        # WB code for Current Account Balance (% of GDP)
+        cab_a = _wb_fallback_series(country, "BN.CAB.XOKA.GD.ZS")
+    ge_a  = _compat_fetch_series("get_government_effectiveness", country, "A", keep_hint=40)
+    if not ge_a:
+        # WGI: Government Effectiveness (estimate)
+        ge_a = _wb_fallback_series(country, "GE.EST")
+
+    # ---- Latest extraction
+    def _kvl(d: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
+        return _latest(d)
+
+    cpi_p, cpi_v     = _kvl(cpi_m)
+    une_p, une_v     = _kvl(une_m)
+    fx_p, fx_v       = _kvl(fx_m)
+    res_p, res_v     = _kvl(res_m)
+    pol_p, pol_v     = _kvl(policy_m)
+    gdpq_p, gdpq_v   = _kvl(gdp_growth_q)
+    cab_p, cab_v     = _kvl(cab_a)
+    ge_p, ge_v       = _kvl(ge_a)
 
     resp = {
         "country": country,
         "iso_codes": iso,
 
-        # Debt block (your clients expect these fields)
+        # Debt block (annual, trimmed)
         "latest": {"year": debt_latest.get("year"), "value": debt_latest.get("value"), "source": debt_latest.get("source")},
         "series": debt_series,
         "source": debt_latest.get("source"),
 
-        # Legacy fields kept for display-parity
+        # Legacy top-levels retained (unused by your new GPT, safe to keep)
         "imf_data": {},
         "government_debt": {"latest": {"value": None, "date": None, "source": None}, "series": {}},
         "nominal_gdp":    {"latest": {"value": None, "date": None, "source": None}, "series": {}},
         "debt_to_gdp":    {"latest": {"value": None, "date": None, "source": None}, "series": {}},
         "debt_to_gdp_series": {},
 
-        # Latest-only indicators
+        # Indicators with required frequency and **trimmed history**
         "additional_indicators": {
-            "cpi_yoy":  {"latest_value": cpi_v,  "latest_period": cpi_p,  "source": "compat/IMF",  "series": {}},
-            "unemployment_rate": {"latest_value": une_v, "latest_period": une_p, "source": "compat/IMF", "series": {}},
-            "fx_rate_usd": {"latest_value": fx_v, "latest_period": fx_p, "source": "compat/IMF", "series": {}},
-            "reserves_usd": {"latest_value": res_v, "latest_period": res_p, "source": "compat/IMF", "series": {}},
-            "policy_rate": {"latest_value": pol_v, "latest_period": pol_p, "source": "compat/IMF/ECB", "series": {}},
-            "gdp_growth": {"latest_value": gdpq_v, "latest_period": gdpq_p, "source": "compat/IMF", "series": {}},
+            # Monthly — 12m
+            "cpi_yoy":  {"latest_value": cpi_v,  "latest_period": cpi_p,  "source": "compat/IMF",     "series": cpi_m},
+            "unemployment_rate": {"latest_value": une_v, "latest_period": une_p, "source": "compat/IMF", "series": une_m},
+            "fx_rate_usd": {"latest_value": fx_v, "latest_period": fx_p, "source": "compat/IMF",       "series": fx_m},
+            "reserves_usd": {"latest_value": res_v, "latest_period": res_p, "source": "compat/IMF",     "series": res_m},
+            "policy_rate": {"latest_value": pol_v, "latest_period": pol_p, "source": "compat/IMF/ECB",  "series": policy_m},
+
+            # Quarterly — 4q
+            "gdp_growth": {"latest_value": gdpq_v, "latest_period": gdpq_p, "source": "compat/IMF",     "series": gdp_growth_q},
+
+            # Annual — 20y (with WB fallback)
             "current_account_balance_pct_gdp": {
-                "latest_value": cab_v, "latest_period": cab_p, "source": "compat/WB", "series": {}
+                "latest_value": cab_v, "latest_period": cab_p, "source": "compat/WB", "series": cab_a
             },
             "government_effectiveness": {
-                "latest_value": ge_v, "latest_period": ge_p, "source": "compat/WB WGI", "series": {}
+                "latest_value": ge_v, "latest_period": ge_p, "source": "compat/WB WGI", "series": ge_a
             },
         },
 
         "_debug": {
-            "builder": "probe.country_lite (compat)",
-            "sources": {
-                "debt": debt.get("latest", {}),
-                "cpi": {"len": len(cpi_s)}, "unemployment": {"len": len(une_s)}, "fx": {"len": len(fx_s)},
-                "reserves": {"len": len(res_s)}, "policy_rate": {"len": len(pol_s)},
-                "gdp_growth_q": {"len": len(gdpq_s)}, "current_account_balance": {"len": len(cab_s)},
-                "government_effectiveness": {"len": len(ge_s)},
-            },
+            "builder": "probe.country_lite (compat + policy windows)",
+            "history_policy": HIST_POLICY,
         },
     }
     return JSONResponse(content=resp)
@@ -513,3 +623,4 @@ def country_lite(
 @router.options("/v1/country-lite", include_in_schema=False)
 def country_lite_options() -> Response:
     return Response(status_code=204)
+
