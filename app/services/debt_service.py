@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Dict, Any, Optional, Tuple
+import os
 import time
 from collections import OrderedDict
 
@@ -59,7 +60,9 @@ class _TTLCache:
     def set(self, key: str, payload: Dict[str, Any]) -> None:
         self.data[key] = (time.time(), payload)
 
-_cache = _TTLCache(ttl_sec=900)
+# TTL: prefer CR_DEBT_TTL, then CR_TTL_SECS, else 900
+_DEBT_TTL = int(os.getenv("CR_DEBT_TTL", os.getenv("CR_TTL_SECS", "900")))
+_cache = _TTLCache(ttl_sec=_DEBT_TTL)
 
 # ------------------------ canonical empty ------------------------
 EMPTY = {
@@ -193,7 +196,7 @@ def _wb_computed_ratio_annual(iso3: str) -> Dict[str, float]:
     return dict(OrderedDict(sorted(out2.items())))
 
 # ------------------------ main API ------------------------
-def compute_debt_payload(country: str) -> Dict[str, Any]:
+def compute_debt_payload(country: str, fresh: bool = False, **_: Any) -> Dict[str, Any]:
     """
     Canonical /v1/debt payload builder.
     Order:
@@ -203,6 +206,8 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
       4) World Bank ratio (% of GDP)
       5) Computed (WB levels, USD -> LCU fallback)
 
+    fresh=True → bypass internal TTL cache and force a refetch.
+
     Returns:
       {
         "latest": {"year": int|None, "value": float|None, "source": str},
@@ -210,15 +215,17 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
       }
     """
     cache_key = f"debt:{country}"
-    cached = _cache.get(cache_key)
-    if cached:
-        return cached
+    if not fresh:
+        cached = _cache.get(cache_key)
+        if cached:
+            return cached
 
     # 0) Resolve ISO codes
     codes = _resolve_codes(country) if callable(_resolve_codes) else None
     if not codes:
         payload = EMPTY.copy()
-        _cache.set(cache_key, payload)
+        if not fresh:
+            _cache.set(cache_key, payload)
         return payload
 
     iso2 = (codes or {}).get("iso_alpha_2")
@@ -233,7 +240,8 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
             if latest:
                 y, v = latest
                 payload = {"latest": {"year": y, "value": v, "source": "compat:get_debt_to_gdp_annual"}, "series": series}
-                _cache.set(cache_key, payload)
+                if not fresh:
+                    _cache.set(cache_key, payload)
                 return payload
 
     # 2) Eurostat (ISO2)
@@ -244,7 +252,8 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
             if latest:
                 y, v = latest
                 payload = {"latest": {"year": y, "value": v, "source": "Eurostat"}, "series": s}
-                _cache.set(cache_key, payload)
+                if not fresh:
+                    _cache.set(cache_key, payload)
                 return payload
 
     # 3) IMF WEO (ISO3)
@@ -255,7 +264,8 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
             if latest:
                 y, v = latest
                 payload = {"latest": {"year": y, "value": v, "source": "IMF WEO"}, "series": s}
-                _cache.set(cache_key, payload)
+                if not fresh:
+                    _cache.set(cache_key, payload)
                 return payload
 
     # 4) World Bank ratio
@@ -266,7 +276,8 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
             if latest:
                 y, v = latest
                 payload = {"latest": {"year": y, "value": v, "source": "World Bank (ratio)"}, "series": s}
-                _cache.set(cache_key, payload)
+                if not fresh:
+                    _cache.set(cache_key, payload)
                 return payload
 
         # 5) WB computed ratio
@@ -276,24 +287,26 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
             if latest:
                 y, v = latest
                 payload = {"latest": {"year": y, "value": v, "source": "Computed (WB levels)"}, "series": s}
-                _cache.set(cache_key, payload)
+                if not fresh:
+                    _cache.set(cache_key, payload)
                 return payload
 
     payload = EMPTY.copy()
-    _cache.set(cache_key, payload)
+    if not fresh:
+        _cache.set(cache_key, payload)
     return payload
 
 # ------------------------ legacy aliases (compat) ------------------------
-def get_debt_to_gdp(country: str) -> Dict[str, Any]:
+def get_debt_to_gdp(country: str, **kwargs: Any) -> Dict[str, Any]:
     # Backward-compat alias to your previous symbol
-    return compute_debt_payload(country)
+    return compute_debt_payload(country, **kwargs)
 
-def debt_payload_for_country(country: str) -> Dict[str, Any]:
-    return compute_debt_payload(country)
+def debt_payload_for_country(country: str, **kwargs: Any) -> Dict[str, Any]:
+    return compute_debt_payload(country, **kwargs)
 
-def debt_payload_for_iso2(iso2: str) -> Dict[str, Any]:
+def debt_payload_for_iso2(iso2: str, **kwargs: Any) -> Dict[str, Any]:
     # Let resolver map iso2 to names consistently
-    return compute_debt_payload(iso2)
+    return compute_debt_payload(iso2, **kwargs)
 
-def compute_debt_payload_iso2(iso2: str) -> Dict[str, Any]:
-    return compute_debt_payload(iso2)
+def compute_debt_payload_iso2(iso2: str, **kwargs: Any) -> Dict[str, Any]:
+    return compute_debt_payload(iso2, **kwargs)
