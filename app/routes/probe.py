@@ -246,6 +246,39 @@ async def _compat_fetch_series_async(
             continue
     return {}
 
+def _compat_or_provider_series(country: str,
+                               compat_candidates: Iterable[str],
+                               provider_fallbacks: Iterable[Tuple[str, Iterable[str]]],
+                               keep_hint: int = 24) -> Dict[str, float]:
+    """
+    Try a list of compat functions first; if none return data, try provider fallbacks
+    using the existing _probe_provider utility. Trim to policy window at the end.
+    """
+    # 1) compat candidates
+    mod = _safe_import("app.providers.compat")
+    if mod:
+        for name in compat_candidates:
+            fn = getattr(mod, name, None)
+            if callable(fn):
+                for kv in (
+                    {"country": country, "series": "mini", "keep": max(keep_hint, 24)},
+                    {"country": country},
+                ):
+                    try:
+                        raw = fn(**kv) or {}
+                        if raw:
+                            return _trim_series_policy(_coerce_numeric_series(raw), HIST_POLICY)
+                    except Exception:
+                        continue
+
+    # 2) provider fallbacks [(module, [fn1, fn2, ...]), ...]
+    for module_name, fn_list in provider_fallbacks:
+        series, _dbg = _probe_provider(module_name, tuple(fn_list), country=country)
+        if series:
+            return _trim_series_policy(series, HIST_POLICY)
+
+    return {}
+
 async def _wb_fallback_series_async(country: str, indicator_code: str) -> Dict[str, float]:
     """WB fallback via wb_provider raw helpers, under IND_TIMEOUT."""
     try:
@@ -582,8 +615,28 @@ async def country_lite(
     async def _indicators_task():
         tasks = {
             # Monthly (12)
-            "cpi":    _compat_fetch_series_async("get_cpi_yoy_monthly", country, keep_hint=24, prefer_sdmx=prefer_sdmx, fresh=fresh),
-            "une":    _compat_fetch_series_async("get_unemployment_rate_monthly", country, keep_hint=24, prefer_sdmx=prefer_sdmx, fresh=fresh),
+            cpi_m = _compat_or_provider_series(
+                country,
+                compat_candidates=("get_cpi_yoy_monthly", "get_inflation_yoy_monthly", "get_cpi_monthly_yoy", "get_cpi_yoy"),
+                provider_fallbacks=(
+                    ("app.providers.imf_provider", ("get_cpi_yoy_monthly","cpi_yoy_monthly","get_cpi_yoy","cpi_yoy")),
+                    ("app.providers.eurostat_provider", ("get_hicp_yoy","hicp_yoy")),
+                    ("app.providers.wb_provider", ("get_cpi_annual","cpi_annual")),
+                ),
+                keep_hint=24
+            )
+
+            une_m = _compat_or_provider_series(
+                country,
+                compat_candidates=("get_unemployment_rate_monthly","get_unemployment_monthly","get_unemployment_rate"),
+                provider_fallbacks=(
+                    ("app.providers.imf_provider", ("get_unemployment_rate_monthly","unemployment_rate_monthly","get_unemployment_rate","unemployment_rate")),
+                    ("app.providers.eurostat_provider", ("get_unemployment_rate_monthly","unemployment_rate_monthly")),
+                    ("app.providers.wb_provider", ("get_unemployment_rate_annual","unemployment_rate_annual")),
+                ),
+                keep_hint=24
+            )
+
             "fx":     _compat_fetch_series_async("get_fx_rate_usd_monthly", country, keep_hint=24, prefer_sdmx=prefer_sdmx, fresh=fresh),
             "res":    _compat_fetch_series_async("get_reserves_usd_monthly", country, keep_hint=24, prefer_sdmx=prefer_sdmx, fresh=fresh),
             "policy": _compat_fetch_series_async("get_policy_rate_monthly", country, keep_hint=36, prefer_sdmx=prefer_sdmx, fresh=fresh),
