@@ -571,167 +571,214 @@ def provider_raw(
     }
 # --- END: provider introspection helpers -------------------------------------
 
-# ——— Country Lite (async / fresh / prefer) -----------------------------------
+# === Country Lite (mode-aware) ===============================================
+
 @router.get("/v1/country-lite", summary="Country Lite")
-async def country_lite(
+def country_lite(
     country: str = Query(..., description="Full country name, e.g., Mexico"),
-    fresh: bool = Query(False, description="Bypass caches and force latest upstream fetch"),
-    prefer: str = Query("auto", description="Upstream preference: auto | sdmxcentral | default"),
+    mode: str = Query("auto", description="auto|sync|async|dry"),
+    prefer: str = Query("default", description="provider preference hint"),
+    fresh: bool = Query(False, description="hint upstream caches to refresh"),
 ) -> Dict[str, Any]:
     """
-    Async, compat-first snapshot with bounded history + timeouts.
-      - fresh=true → bypasses caches
-      - prefer=sdmxcentral → hint IMF path to use SDMX Central when available
-      - Windows: A=20y, Q=4q, M=12m
+    Compat-first, frequency-aware snapshot with bounded history windows:
+      - Debt-to-GDP (annual, last 20y)
+      - GDP growth (quarterly, last 4q)
+      - Monthly set (CPI YoY, Unemployment, FX, Reserves, Policy rate) last 12m
+      - Current Account % GDP (annual, last 20y) — WB fallback
+      - Government Effectiveness (annual, last 20y) — WB fallback
+
+    Modes:
+      - dry  : wiring-only (no upstream)
+      - sync : single-threaded, no gather/async, most stable
+      - async: parallel fetch (honors timeouts)
+      - auto : sync if CR_USE_ASYNC_PROBE is "0", else async
     """
-    env_pref_sdmx = os.getenv("CR_PREFER_SDMXCENTRAL", "0") == "1"
-    prefer_sdmx = (prefer.lower() == "sdmxcentral") or (prefer.lower() == "auto" and env_pref_sdmx)
+    # ---- config / env --------------------------------------------------------
+    use_async_env = os.getenv("CR_USE_ASYNC_PROBE", "1").lower() not in ("0", "false", "no")
+    prefer_sdmx  = os.getenv("CR_PREFER_SDMXCENTRAL", "0").lower() in ("1", "true", "yes")
+    IND_TIMEOUT  = float(os.getenv("CR_INDICATOR_TIMEOUT", "8.0"))
+    ROUTE_DEADLINE = float(os.getenv("CR_COUNTRY_TIMEOUT", "18.0"))
 
-    # Route-level TTL cache (skip if fresh)
-    cache_key = f"country_lite:{country}:sdmx{int(prefer_sdmx)}"
-    if not fresh:
-        cached = _cache.get(cache_key)
-        if cached:
-            return cached
+    # normalize mode
+    mode = (mode or "auto").lower().strip()
+    if mode not in ("auto", "sync", "async", "dry"):
+        mode = "auto"
 
+    # resolve ISO (safe)
     iso = _iso_codes(country)
 
-    async def _debt_task():
-        try:
-            from app.services.debt_service import compute_debt_payload
-            debt = await asyncio.wait_for(
-                _run_blocking(compute_debt_payload, country=country),
-                timeout=IND_TIMEOUT
-            )
-        except Exception:
-            debt = {}
-        series_full = debt.get("series") or {}
-        return {
-            "latest": debt.get("latest") or {"year": None, "value": None, "source": "unavailable"},
-            "series": _trim_series_policy(series_full, HIST_POLICY),
-            "source": (debt.get("latest") or {}).get("source"),
-        }
-
-    async def _indicators_task():
-        tasks = {
-            # Monthly (12)
-            cpi_m = _compat_or_provider_series(
-                country,
-                compat_candidates=("get_cpi_yoy_monthly", "get_inflation_yoy_monthly", "get_cpi_monthly_yoy", "get_cpi_yoy"),
-                provider_fallbacks=(
-                    ("app.providers.imf_provider", ("get_cpi_yoy_monthly","cpi_yoy_monthly","get_cpi_yoy","cpi_yoy")),
-                    ("app.providers.eurostat_provider", ("get_hicp_yoy","hicp_yoy")),
-                    ("app.providers.wb_provider", ("get_cpi_annual","cpi_annual")),
-                ),
-                keep_hint=24
-            )
-
-            une_m = _compat_or_provider_series(
-                country,
-                compat_candidates=("get_unemployment_rate_monthly","get_unemployment_monthly","get_unemployment_rate"),
-                provider_fallbacks=(
-                    ("app.providers.imf_provider", ("get_unemployment_rate_monthly","unemployment_rate_monthly","get_unemployment_rate","unemployment_rate")),
-                    ("app.providers.eurostat_provider", ("get_unemployment_rate_monthly","unemployment_rate_monthly")),
-                    ("app.providers.wb_provider", ("get_unemployment_rate_annual","unemployment_rate_annual")),
-                ),
-                keep_hint=24
-            )
-
-            "fx":     _compat_fetch_series_async("get_fx_rate_usd_monthly", country, keep_hint=24, prefer_sdmx=prefer_sdmx, fresh=fresh),
-            "res":    _compat_fetch_series_async("get_reserves_usd_monthly", country, keep_hint=24, prefer_sdmx=prefer_sdmx, fresh=fresh),
-            "policy": _compat_fetch_series_async("get_policy_rate_monthly", country, keep_hint=36, prefer_sdmx=prefer_sdmx, fresh=fresh),
-            # Quarterly (4)
-            "gdpq":   _compat_fetch_series_async("get_gdp_growth_quarterly", country, keep_hint=12, prefer_sdmx=prefer_sdmx, fresh=fresh),
-            # Annual (20) — compat if present; else WB fallback
-            "cab":    _compat_fetch_series_async("get_current_account_balance_pct_gdp", country, keep_hint=40, prefer_sdmx=False, fresh=fresh),
-            "ge":     _compat_fetch_series_async("get_government_effectiveness", country, keep_hint=40, prefer_sdmx=False, fresh=fresh),
-        }
-        done = await asyncio.gather(*tasks.values(), return_exceptions=True)
-        ind = dict(zip(tasks.keys(), ({} if isinstance(x, Exception) else x for x in done)))
-        # Fallbacks for annuals
-        if not ind["cab"]:
-            ind["cab"] = await _wb_fallback_series_async(country, "BN.CAB.XOKA.GD.ZS")
-        if not ind["ge"]:
-            ind["ge"]  = await _wb_fallback_series_async(country, "GE.EST")
-        return ind
-
-    try:
-        debt_res, ind_res = await asyncio.wait_for(
-            asyncio.gather(_debt_task(), _indicators_task()),
-            timeout=ROUTE_DEADLINE
-        )
-    except asyncio.TimeoutError:
-        return {
+    # ---- dry mode: structure only -------------------------------------------
+    if mode == "dry":
+        resp = {
             "country": country,
             "iso_codes": iso,
-            "latest": {"year": None, "value": None, "source": "timeout"},
+            "latest": {"year": None, "value": None, "source": "unavailable"},
             "series": {},
-            "source": "timeout",
+            "source": None,
             "imf_data": {},
             "government_debt": {"latest": {"value": None, "date": None, "source": None}, "series": {}},
             "nominal_gdp":    {"latest": {"value": None, "date": None, "source": None}, "series": {}},
             "debt_to_gdp":    {"latest": {"value": None, "date": None, "source": None}, "series": {}},
             "debt_to_gdp_series": {},
-            "additional_indicators": {},
-            "_debug": {"builder": "timeout", "history_policy": HIST_POLICY, "deadline": ROUTE_DEADLINE},
+            "additional_indicators": {
+                "cpi_yoy":  {"latest_value": None, "latest_period": None, "source": "compat/IMF", "series": {}},
+                "unemployment_rate": {"latest_value": None, "latest_period": None, "source": "compat/IMF", "series": {}},
+                "fx_rate_usd": {"latest_value": None, "latest_period": None, "source": "compat/IMF", "series": {}},
+                "reserves_usd": {"latest_value": None, "latest_period": None, "source": "compat/IMF", "series": {}},
+                "policy_rate": {"latest_value": None, "latest_period": None, "source": "compat/IMF/ECB", "series": {}},
+                "gdp_growth": {"latest_value": None, "latest_period": None, "source": "compat/IMF", "series": {}},
+                "current_account_balance_pct_gdp": {"latest_value": None, "latest_period": None, "source": "compat/WB", "series": {}},
+                "government_effectiveness": {"latest_value": None, "latest_period": None, "source": "compat/WB WGI", "series": {}},
+            },
+            "_debug": {
+                "builder": "probe.country_lite (dry)",
+                "history_policy": HIST_POLICY,
+                "prefer_sdmxcentral": prefer_sdmx,
+                "fresh": fresh,
+                "timeouts": {"per_indicator": IND_TIMEOUT, "route_deadline": ROUTE_DEADLINE},
+            },
+        }
+        return JSONResponse(content=resp)
+
+    # ---- shared sync builder -------------------------------------------------
+    def _build_sync() -> Dict[str, Any]:
+        # Debt-to-GDP (uses your debt_service cascade + cache)
+        try:
+            from app.services.debt_service import compute_debt_payload
+            debt = compute_debt_payload(country) or {}
+        except Exception:
+            debt = {}
+        debt_series_full = debt.get("series") or {}
+        debt_series = _trim_series_policy(debt_series_full, HIST_POLICY)  # A:20
+        debt_latest = debt.get("latest") or {"year": None, "value": None, "source": "unavailable"}
+
+        # Quarterly — last 4
+        gdp_growth_q = _compat_fetch_series("get_gdp_growth_quarterly", country, "Q", keep_hint=12)
+
+        # Monthly — last 12 (CPI & Unemp use tolerant helper)
+        cpi_m = _compat_or_provider_series(
+            country,
+            compat_candidates=("get_cpi_yoy_monthly", "get_inflation_yoy_monthly", "get_cpi_monthly_yoy", "get_cpi_yoy"),
+            provider_fallbacks=(
+                ("app.providers.imf_provider", ("get_cpi_yoy_monthly","cpi_yoy_monthly","get_cpi_yoy","cpi_yoy")),
+                ("app.providers.eurostat_provider", ("get_hicp_yoy","hicp_yoy")),
+                ("app.providers.wb_provider", ("get_cpi_annual","cpi_annual")),
+            ),
+            keep_hint=24
+        )
+        une_m = _compat_or_provider_series(
+            country,
+            compat_candidates=("get_unemployment_rate_monthly","get_unemployment_monthly","get_unemployment_rate"),
+            provider_fallbacks=(
+                ("app.providers.imf_provider", ("get_unemployment_rate_monthly","unemployment_rate_monthly","get_unemployment_rate","unemployment_rate")),
+                ("app.providers.eurostat_provider", ("get_unemployment_rate_monthly","unemployment_rate_monthly")),
+                ("app.providers.wb_provider", ("get_unemployment_rate_annual","unemployment_rate_annual")),
+            ),
+            keep_hint=24
+        )
+        fx_m     = _compat_fetch_series("get_fx_rate_usd_monthly", country, "M", keep_hint=24)
+        res_m    = _compat_fetch_series("get_reserves_usd_monthly", country, "M", keep_hint=24)
+        policy_m = _compat_fetch_series("get_policy_rate_monthly", country, "M", keep_hint=36)
+
+        # Annual — last 20 (WB fallback codes)
+        cab_a = _compat_fetch_series("get_current_account_balance_pct_gdp", country, "A", keep_hint=40)
+        if not cab_a:
+            cab_a = _wb_fallback_series(country, "BN.CAB.XOKA.GD.ZS")
+        ge_a  = _compat_fetch_series("get_government_effectiveness", country, "A", keep_hint=40)
+        if not ge_a:
+            ge_a = _wb_fallback_series(country, "GE.EST")
+
+        # latests
+        def _kvl(d: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
+            return _latest(d)
+
+        cpi_p, cpi_v   = _kvl(cpi_m)
+        une_p, une_v   = _kvl(une_m)
+        fx_p, fx_v     = _kvl(fx_m)
+        res_p, res_v   = _kvl(res_m)
+        pol_p, pol_v   = _kvl(policy_m)
+        gdpq_p, gdpq_v = _kvl(gdp_growth_q)
+        cab_p, cab_v   = _kvl(cab_a)
+        ge_p, ge_v     = _kvl(ge_a)
+
+        return {
+            "country": country,
+            "iso_codes": iso,
+
+            # Debt block (annual, trimmed)
+            "latest": {"year": debt_latest.get("year"), "value": debt_latest.get("value"), "source": debt_latest.get("source")},
+            "series": debt_series,
+            "source": debt_latest.get("source"),
+
+            # Legacy top-levels retained
+            "imf_data": {},
+            "government_debt": {"latest": {"value": None, "date": None, "source": None}, "series": {}},
+            "nominal_gdp":    {"latest": {"value": None, "date": None, "source": None}, "series": {}},
+            "debt_to_gdp":    {"latest": {"value": None, "date": None, "source": None}, "series": {}},
+            "debt_to_gdp_series": {},
+
+            # Indicators (trimmed history)
+            "additional_indicators": {
+                # Monthly — 12m
+                "cpi_yoy":  {"latest_value": cpi_v,  "latest_period": cpi_p,  "source": "compat/IMF",     "series": cpi_m},
+                "unemployment_rate": {"latest_value": une_v, "latest_period": une_p, "source": "compat/IMF", "series": une_m},
+                "fx_rate_usd": {"latest_value": fx_v, "latest_period": fx_p, "source": "compat/IMF",       "series": fx_m},
+                "reserves_usd": {"latest_value": res_v, "latest_period": res_p, "source": "compat/IMF",     "series": res_m},
+                "policy_rate": {"latest_value": pol_v, "latest_period": pol_p, "source": "compat/IMF/ECB",  "series": policy_m},
+
+                # Quarterly — 4q
+                "gdp_growth": {"latest_value": gdpq_v, "latest_period": gdpq_p, "source": "compat/IMF",     "series": gdp_growth_q},
+
+                # Annual — 20y
+                "current_account_balance_pct_gdp": {
+                    "latest_value": cab_v, "latest_period": cab_p, "source": "compat/WB", "series": cab_a
+                },
+                "government_effectiveness": {
+                    "latest_value": ge_v, "latest_period": ge_p, "source": "compat/WB WGI", "series": ge_a
+                },
+            },
+
+            "_debug": {
+                "builder": "probe.country_lite (sync)",
+                "history_policy": HIST_POLICY,
+                "prefer_sdmxcentral": prefer_sdmx,
+                "fresh": fresh,
+            },
         }
 
-    # Extract latests
-    cpi_p, cpi_v   = _latest_pair(ind_res["cpi"])
-    une_p, une_v   = _latest_pair(ind_res["une"])
-    fx_p, fx_v     = _latest_pair(ind_res["fx"])
-    res_p, res_v   = _latest_pair(ind_res["res"])
-    pol_p, pol_v   = _latest_pair(ind_res["policy"])
-    gdpq_p, gdpq_v = _latest_pair(ind_res["gdpq"])
-    cab_p, cab_v   = _latest_pair(ind_res["cab"])
-    ge_p, ge_v     = _latest_pair(ind_res["ge"])
+    # ---- async (temporarily: run sync under a deadline) ----------------------
+    async def _build_async_with_deadline():
+        loop = asyncio.get_event_loop()
+        try:
+            return await asyncio.wait_for(loop.run_in_executor(None, _build_sync), timeout=ROUTE_DEADLINE)
+        except asyncio.TimeoutError:
+            return {
+                "country": country,
+                "iso_codes": iso,
+                "latest": {"year": None, "value": None, "source": "timeout"},
+                "series": {},
+                "source": "timeout",
+                "imf_data": {},
+                "government_debt": {"latest": {"value": None, "date": None, "source": None}, "series": {}},
+                "nominal_gdp":    {"latest": {"value": None, "date": None, "source": None}, "series": {}},
+                "debt_to_gdp":    {"latest": {"value": None, "date": None, "source": None}, "series": {}},
+                "debt_to_gdp_series": {},
+                "additional_indicators": {},
+                "_debug": {
+                    "builder": "timeout",
+                    "history_policy": HIST_POLICY,
+                    "deadline": ROUTE_DEADLINE,
+                },
+            }
 
-    resp = {
-        "country": country,
-        "iso_codes": iso,
+    # choose mode
+    if mode == "sync" or (mode == "auto" and not use_async_env):
+        return JSONResponse(content=_build_sync())
+    else:
+        # async (for now it runs the sync builder under a deadline; we can parallelize later)
+        return JSONResponse(content=asyncio.run(_build_async_with_deadline()))
 
-        # Debt (annual, trimmed)
-        "latest": debt_res["latest"],
-        "series": debt_res["series"],
-        "source": debt_res["source"],
-
-        # Legacy top-levels retained
-        "imf_data": {},
-        "government_debt": {"latest": {"value": None, "date": None, "source": None}, "series": {}},
-        "nominal_gdp":    {"latest": {"value": None, "date": None, "source": None}, "series": {}},
-        "debt_to_gdp":    {"latest": {"value": None, "date": None, "source": None}, "series": {}},
-        "debt_to_gdp_series": {},
-
-        # Indicators with policy windows
-        "additional_indicators": {
-            # Monthly — 12m
-            "cpi_yoy":  {"latest_value": cpi_v,  "latest_period": cpi_p,  "source": "compat/IMF",     "series": ind_res["cpi"]},
-            "unemployment_rate": {"latest_value": une_v, "latest_period": une_p, "source": "compat/IMF", "series": ind_res["une"]},
-            "fx_rate_usd": {"latest_value": fx_v, "latest_period": fx_p, "source": "compat/IMF",       "series": ind_res["fx"]},
-            "reserves_usd": {"latest_value": res_v, "latest_period": res_p, "source": "compat/IMF",     "series": ind_res["res"]},
-            "policy_rate": {"latest_value": pol_v, "latest_period": pol_p, "source": "compat/IMF/ECB",  "series": ind_res["policy"]},
-            # Quarterly — 4q
-            "gdp_growth": {"latest_value": gdpq_v, "latest_period": gdpq_p, "source": "compat/IMF",     "series": ind_res["gdpq"]},
-            # Annual — 20y
-            "current_account_balance_pct_gdp": {
-                "latest_value": cab_v, "latest_period": cab_p, "source": "compat/WB", "series": ind_res["cab"]
-            },
-            "government_effectiveness": {
-                "latest_value": ge_v, "latest_period": ge_p, "source": "compat/WB WGI", "series": ind_res["ge"]
-            },
-        },
-        "_debug": {
-            "builder": "probe.country_lite (async)",
-            "history_policy": HIST_POLICY,
-            "timeouts": {"per_indicator": IND_TIMEOUT, "route_deadline": ROUTE_DEADLINE},
-            "prefer_sdmxcentral": prefer_sdmx,
-            "fresh": fresh,
-        },
-    }
-
-    if not fresh:
-        _cache.set(cache_key, resp)
-    return JSONResponse(content=resp)
 
 @router.options("/v1/country-lite", include_in_schema=False)
 def country_lite_options() -> Response:
