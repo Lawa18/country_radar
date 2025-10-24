@@ -601,6 +601,39 @@ def _compat_fetch_series(func_name: str, country: str, want_freq: str, keep_hint
     return _trim_series_policy(data, HIST_POLICY)
 # ---------------------------------------------------------------------------
 
+# --- RE-ADD WB FALLBACK HELPER (place above /v1/country-lite) ----------------
+def _wb_fallback_series(country: str, indicator_code: str) -> Dict[str, float]:
+    """
+    Direct World Bank fallback for an indicator code.
+    Requires wb_provider exposing: fetch_wb_indicator_raw, wb_year_dict_from_raw.
+    Uses ISO3 from app.utils.country_codes.get_country_codes(country).
+    Returns a dict trimmed by HIST_POLICY.
+    """
+    try:
+        wb = _safe_import("app.providers.wb_provider")
+        if not wb:
+            return {}
+        fetch = getattr(wb, "fetch_wb_indicator_raw", None)
+        to_year = getattr(wb, "wb_year_dict_from_raw", None)
+        if not callable(fetch) or not callable(to_year):
+            return {}
+
+        # ISO3 resolution
+        cc_mod = _safe_import("app.utils.country_codes")
+        iso3 = None
+        if cc_mod and hasattr(cc_mod, "get_country_codes"):
+            codes = cc_mod.get_country_codes(country) or {}
+            iso3 = codes.get("iso_alpha_3")
+        if not iso3:
+            return {}
+
+        raw = fetch(iso3, indicator_code)
+        ser = _coerce_numeric_series(to_year(raw))
+        return _trim_series_policy(ser, HIST_POLICY)
+    except Exception:
+        return {}
+# ---------------------------------------------------------------------------
+
 @router.get("/v1/country-lite", summary="Country Lite")
 def country_lite(
     country: str = Query(..., description="Full country name, e.g., Mexico"),
