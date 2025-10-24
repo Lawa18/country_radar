@@ -571,7 +571,35 @@ def provider_raw(
     }
 # --- END: provider introspection helpers -------------------------------------
 
-# === Country Lite (mode-aware) ===============================================
+# --- RE-ADD THIS HELPER (place above /v1/country-lite) -----------------------
+def _compat_fetch_series(func_name: str, country: str, want_freq: str, keep_hint: int) -> Dict[str, float]:
+    """
+    Fetch from compat with hints; fall back to plain call; coerce + trim.
+    keep_hint should be >= policy window (e.g., 24 for safety), we then trim strictly.
+    NOTE: relies on HIST_POLICY, _safe_import, _coerce_numeric_series, _trim_series_policy
+    being defined earlier in this module (they already are in your file).
+    """
+    mod = _safe_import("app.providers.compat")
+    raw: Mapping[str, Any] = {}
+    if mod:
+        fn = getattr(mod, func_name, None)
+        if callable(fn):
+            for kwargs in (
+                {"country": country, "series": "mini", "keep": max(keep_hint, 24)},
+                {"country": country, "series": "full"},
+                {"country": country},
+            ):
+                try:
+                    raw = fn(**kwargs) or {}
+                    if raw:
+                        break
+                except TypeError:
+                    continue
+                except Exception:
+                    continue
+    data = _coerce_numeric_series(raw)
+    return _trim_series_policy(data, HIST_POLICY)
+# ---------------------------------------------------------------------------
 
 @router.get("/v1/country-lite", summary="Country Lite")
 def country_lite(
