@@ -241,6 +241,62 @@ def _wb_fallback_series(country: str, indicator_code: str) -> Dict[str, float]:
         return {}
 
 # -----------------------------------------------------------------------------
+# Parallel compat fetch helpers (for faster first response)
+# -----------------------------------------------------------------------------
+_EXEC = ThreadPoolExecutor(max_workers=8)  # adjust if your instance has more CPU
+
+def _compat_fetch_series_blocking(func_name: str, country: str, keep_hint: int) -> Dict[str, float]:
+    """
+    Blocking compat fetch + trim used inside the thread pool (parallel).
+    Uses the same logic as _compat_fetch_series but drops want_freq (unused here).
+    """
+    mod = _safe_import("app.providers.compat")
+    if not mod:
+        return {}
+    fn = getattr(mod, func_name, None)
+    if not callable(fn):
+        return {}
+    for kwargs in (
+        {"country": country, "series": "mini", "keep": max(keep_hint, 24)},
+        {"country": country, "series": "full"},
+        {"country": country},
+    ):
+        try:
+            raw = fn(**kwargs) or {}
+            if raw:
+                return _trim_series_policy(_coerce_numeric_series(raw), HIST_POLICY)
+        except TypeError:
+            continue
+        except Exception:
+            continue
+    return {}
+
+async def _gather_series_parallel(country: str) -> Dict[str, Dict[str, float]]:
+    """
+    Run all compat fetches concurrently using a thread pool.
+    Returns a dict keyed by our short names → trimmed series dicts.
+    """
+    loop = asyncio.get_event_loop()
+    futs = {
+        # Monthly (12m)
+        "cpi_m":    loop.run_in_executor(_EXEC, _compat_fetch_series_blocking, "get_cpi_yoy_monthly", country, 24),
+        "une_m":    loop.run_in_executor(_EXEC, _compat_fetch_series_blocking, "get_unemployment_rate_monthly", country, 24),
+        "fx_m":     loop.run_in_executor(_EXEC, _compat_fetch_series_blocking, "get_fx_rate_usd_monthly", country, 24),
+        "res_m":    loop.run_in_executor(_EXEC, _compat_fetch_series_blocking, "get_reserves_usd_monthly", country, 24),
+        "policy_m": loop.run_in_executor(_EXEC, _compat_fetch_series_blocking, "get_policy_rate_monthly", country, 36),
+        # Quarterly (4q)
+        "gdp_q":    loop.run_in_executor(_EXEC, _compat_fetch_series_blocking, "get_gdp_growth_quarterly", country, 8),
+        # Annual (20y)
+        "cab_a":    loop.run_in_executor(_EXEC, _compat_fetch_series_blocking, "get_current_account_balance_pct_gdp", country, 40),
+        "ge_a":     loop.run_in_executor(_EXEC, _compat_fetch_series_blocking, "get_government_effectiveness", country, 40),
+    }
+    results = await asyncio.gather(*futs.values(), return_exceptions=True)
+    out = {}
+    for key, res in zip(futs.keys(), results):
+        out[key] = res if isinstance(res, dict) else {}
+    return out
+
+# -----------------------------------------------------------------------------
 # Routes
 # -----------------------------------------------------------------------------
 
@@ -521,118 +577,61 @@ def provider_raw(
         "result_preview": _preview(res),
     }
 
-# --- Country Lite (compat-first, bounded history, cached) --------------------
-@router.get("/v1/country-lite", summary="Country Lite")
-def country_lite(
-    country: str = Query(..., description="Full country name, e.g., Mexico"),
-) -> Dict[str, Any]:
+# -----------------------------------------------------------------------------
+# Parallel compat fetch helpers (for faster first response)
+# -----------------------------------------------------------------------------
+_EXEC = ThreadPoolExecutor(max_workers=8)  # adjust if your instance has more CPU
+
+def _compat_fetch_series_blocking(func_name: str, country: str, keep_hint: int) -> Dict[str, float]:
     """
-    Compat-first, frequency-aware snapshot with bounded history windows:
-      - Debt-to-GDP (annual, last 20y)
-      - GDP growth (quarterly, last 4q)
-      - Monthly set (CPI YoY, Unemployment, FX, Reserves, Policy rate) last 12m
-      - Current Account % GDP (annual, last 20y) — WB fallback
-      - Government Effectiveness (annual, last 20y) — WB fallback
+    Blocking compat fetch + trim used inside the thread pool (parallel).
+    Uses the same logic as _compat_fetch_series but drops want_freq (unused here).
     """
+    mod = _safe_import("app.providers.compat")
+    if not mod:
+        return {}
+    fn = getattr(mod, func_name, None)
+    if not callable(fn):
+        return {}
+    for kwargs in (
+        {"country": country, "series": "mini", "keep": max(keep_hint, 24)},
+        {"country": country, "series": "full"},
+        {"country": country},
+    ):
+        try:
+            raw = fn(**kwargs) or {}
+            if raw:
+                return _trim_series_policy(_coerce_numeric_series(raw), HIST_POLICY)
+        except TypeError:
+            continue
+        except Exception:
+            continue
+    return {}
 
-    # 0) Fast cache hit
-    cached = _cache_get(country)
-    if cached:
-        return JSONResponse(content=cached)
-
-    iso = _iso_codes(country)
-
-    # ---- Debt-to-GDP (service tiers Eurostat/IMF/WB and caches)
-    try:
-        from app.services.debt_service import compute_debt_payload
-        debt = compute_debt_payload(country) or {}
-    except Exception:
-        debt = {}
-    debt_series_full = debt.get("series") or {}
-    debt_series = _trim_series_policy(debt_series_full, HIST_POLICY)  # A:20
-    debt_latest = debt.get("latest") or {"year": None, "value": None, "source": "unavailable"}
-
-    # ---- GDP growth (quarterly, 4) — compat + retry
-    gdp_growth_q = _compat_fetch_series_retry("get_gdp_growth_quarterly", country, "Q", keep_hint=12)
-
-    # ---- Monthly (12): CPI YoY, Unemployment, FX, Reserves, Policy rate — compat + retry
-    cpi_m    = _compat_fetch_series_retry("get_cpi_yoy_monthly", country, "M", keep_hint=24)
-    une_m    = _compat_fetch_series_retry("get_unemployment_rate_monthly", country, "M", keep_hint=24)
-    fx_m     = _compat_fetch_series_retry("get_fx_rate_usd_monthly", country, "M", keep_hint=24)
-    res_m    = _compat_fetch_series_retry("get_reserves_usd_monthly", country, "M", keep_hint=24)
-    policy_m = _compat_fetch_series_retry("get_policy_rate_monthly", country, "M", keep_hint=36)
-
-    # ---- Annual (20): Current Account % GDP, Government Effectiveness
-    cab_a = _compat_fetch_series_retry("get_current_account_balance_pct_gdp", country, "A", keep_hint=40)
-    if not cab_a:
-        cab_a = _wb_fallback_series(country, "BN.CAB.XOKA.GD.ZS")
-    ge_a  = _compat_fetch_series_retry("get_government_effectiveness", country, "A", keep_hint=40)
-    if not ge_a:
-        ge_a = _wb_fallback_series(country, "GE.EST")
-
-    # ---- Latest extraction
-    def _kvl(d: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
-        return _latest(d)
-
-    cpi_p, cpi_v     = _kvl(cpi_m)
-    une_p, une_v     = _kvl(une_m)
-    fx_p, fx_v       = _kvl(fx_m)
-    res_p, res_v     = _kvl(res_m)
-    pol_p, pol_v     = _kvl(policy_m)
-    gdpq_p, gdpq_v   = _kvl(gdp_growth_q)
-    cab_p, cab_v     = _kvl(cab_a)
-    ge_p, ge_v       = _kvl(ge_a)
-
-    resp: Dict[str, Any] = {
-        "country": country,
-        "iso_codes": iso,
-
-        # Debt block (annual, trimmed)
-        "latest": {"year": debt_latest.get("year"), "value": debt_latest.get("value"), "source": debt_latest.get("source")},
-        "series": debt_series,
-        "source": debt_latest.get("source"),
-
-        # Legacy top-levels retained (compatibility with older clients)
-        "imf_data": {},
-        "government_debt": {"latest": {"value": None, "date": None, "source": None}, "series": {}},
-        "nominal_gdp":    {"latest": {"value": None, "date": None, "source": None}, "series": {}},
-        "debt_to_gdp":    {"latest": {"value": None, "date": None, "source": None}, "series": {}},
-        "debt_to_gdp_series": {},
-
-        # Indicators with required frequency and **trimmed history**
-        "additional_indicators": {
-            # Monthly — 12m
-            "cpi_yoy":  {"latest_value": cpi_v,  "latest_period": cpi_p,  "source": "compat/IMF",     "series": cpi_m},
-            "unemployment_rate": {"latest_value": une_v, "latest_period": une_p, "source": "compat/IMF", "series": une_m},
-            "fx_rate_usd": {"latest_value": fx_v, "latest_period": fx_p, "source": "compat/IMF",       "series": fx_m},
-            "reserves_usd": {"latest_value": res_v, "latest_period": res_p, "source": "compat/IMF",     "series": res_m},
-            "policy_rate": {"latest_value": pol_v, "latest_period": pol_p, "source": "compat/IMF/ECB",  "series": policy_m},
-
-            # Quarterly — 4q
-            "gdp_growth": {"latest_value": gdpq_v, "latest_period": gdpq_p, "source": "compat/IMF",     "series": gdp_growth_q},
-
-            # Annual — 20y (with WB fallback)
-            "current_account_balance_pct_gdp": {
-                "latest_value": cab_v, "latest_period": cab_p, "source": "compat/WB", "series": cab_a
-            },
-            "government_effectiveness": {
-                "latest_value": ge_v, "latest_period": ge_p, "source": "compat/WB WGI", "series": ge_a
-            },
-        },
-
-        "_debug": {
-            "builder": "probe.country_lite (sync + cache + retry)",
-            "history_policy": HIST_POLICY,
-        },
+async def _gather_series_parallel(country: str) -> Dict[str, Dict[str, float]]:
+    """
+    Run all compat fetches concurrently using a thread pool.
+    Returns a dict keyed by our short names → trimmed series dicts.
+    """
+    loop = asyncio.get_event_loop()
+    futs = {
+        # Monthly (12m)
+        "cpi_m":    loop.run_in_executor(_EXEC, _compat_fetch_series_blocking, "get_cpi_yoy_monthly", country, 24),
+        "une_m":    loop.run_in_executor(_EXEC, _compat_fetch_series_blocking, "get_unemployment_rate_monthly", country, 24),
+        "fx_m":     loop.run_in_executor(_EXEC, _compat_fetch_series_blocking, "get_fx_rate_usd_monthly", country, 24),
+        "res_m":    loop.run_in_executor(_EXEC, _compat_fetch_series_blocking, "get_reserves_usd_monthly", country, 24),
+        "policy_m": loop.run_in_executor(_EXEC, _compat_fetch_series_blocking, "get_policy_rate_monthly", country, 36),
+        # Quarterly (4q)
+        "gdp_q":    loop.run_in_executor(_EXEC, _compat_fetch_series_blocking, "get_gdp_growth_quarterly", country, 8),
+        # Annual (20y)
+        "cab_a":    loop.run_in_executor(_EXEC, _compat_fetch_series_blocking, "get_current_account_balance_pct_gdp", country, 40),
+        "ge_a":     loop.run_in_executor(_EXEC, _compat_fetch_series_blocking, "get_government_effectiveness", country, 40),
     }
-
-    # Save to cache (best-effort)
-    try:
-        _cache_set(country, resp)
-    except Exception:
-        pass
-
-    return JSONResponse(content=resp)
+    results = await asyncio.gather(*futs.values(), return_exceptions=True)
+    out = {}
+    for key, res in zip(futs.keys(), results):
+        out[key] = res if isinstance(res, dict) else {}
+    return out
 
 @router.options("/v1/country-lite", include_in_schema=False)
 def country_lite_options() -> Response:
