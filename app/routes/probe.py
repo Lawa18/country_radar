@@ -1,7 +1,7 @@
 # app/routes/probe.py — diagnostics + lightweight country info (stable + cached)
 from __future__ import annotations
 
-from typing import Any, Dict, Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 import inspect
 import time as _time
 import asyncio
@@ -52,15 +52,11 @@ def _coerce_numeric_series(d: Optional[Mapping[str, Any]]) -> Dict[str, float]:
         try:
             out[str(k)] = float(v)
         except Exception:
-            # ignore non-numeric
             pass
     return out
 
 def _parse_period_key(p: str) -> Tuple[int, int, int]:
-    """
-    Sort keys like 'YYYY', 'YYYY-MM', 'YYYY-Qn' robustly.
-    Returns (year, month, quarter) for sorting.
-    """
+    """Sort keys like 'YYYY', 'YYYY-MM', 'YYYY-Qn' robustly."""
     try:
         if isinstance(p, (int, float)):
             return (int(p), 0, 0)
@@ -95,7 +91,6 @@ def _to_annual_latest(d: Mapping[str, float]) -> Dict[str, float]:
     return {y: v for y, (_, v) in sorted(by_year.items(), key=lambda kv: int(kv[0]))}
 
 def _freq_of_key(k: str) -> str:
-    """Crude freq detector: 'YYYY-Qn' -> Q ; 'YYYY-MM' -> M ; else 'A'."""
     s = str(k)
     if "-Q" in s:
         return "Q"
@@ -106,10 +101,7 @@ def _freq_of_key(k: str) -> str:
     return "A"
 
 def _trim_series_policy(series: Mapping[str, float], policy: Dict[str, int]) -> Dict[str, float]:
-    """
-    Trim a mixed or single-freq series to the policy windows by freq.
-    For mixed keys (rare), we group by freq and trim each group.
-    """
+    """Trim mixed/single-freq series to policy windows by freq."""
     if not series:
         return {}
     buckets: Dict[str, Dict[str, float]] = {"A": {}, "Q": {}, "M": {}}
@@ -133,10 +125,7 @@ def _trim_series_policy(series: Mapping[str, float], policy: Dict[str, int]) -> 
 # ISO + provider probes
 # -----------------------------------------------------------------------------
 def _iso_codes(country: str) -> Dict[str, Optional[str]]:
-    """
-    Resolve ISO codes defensively; never raise.
-    Expects app.utils.country_codes.get_country_codes(name) → dict or similar.
-    """
+    """Resolve ISO codes defensively; never raise."""
     try:
         cc_mod = _safe_import("app.utils.country_codes")
         if cc_mod and hasattr(cc_mod, "get_country_codes"):
@@ -153,10 +142,7 @@ def _iso_codes(country: str) -> Dict[str, Optional[str]]:
     return {"name": country, "iso_alpha_2": None, "iso_alpha_3": None, "iso_numeric": None}
 
 def _probe_provider(module_name: str, fns: Iterable[str], **kwargs) -> Tuple[Dict[str, float], Dict[str, Any]]:
-    """
-    Try calling a list of function names in a provider; return coerced numeric series and a small debug trace.
-    Accepts {'country': 'Germany'} or legacy alias {'name': 'Germany'}.
-    """
+    """Try call list of function names in a provider; return coerced numeric series and a small debug trace."""
     mod = _safe_import(module_name)
     dbg: Dict[str, Any] = {"module": module_name, "tried": []}
     if mod is None:
@@ -187,10 +173,7 @@ def _probe_provider(module_name: str, fns: Iterable[str], **kwargs) -> Tuple[Dic
 # Compat fetchers (primary) + WB fallback
 # -----------------------------------------------------------------------------
 def _compat_fetch_series(func_name: str, country: str, want_freq: str, keep_hint: int) -> Dict[str, float]:
-    """
-    Fetch from compat with hints; fall back to plain call; coerce + trim.
-    keep_hint should be >= policy window (e.g., 24 for safety), we then trim strictly.
-    """
+    """Fetch from compat with hints; fall back to plain call; coerce + trim."""
     mod = _safe_import("app.providers.compat")
     raw: Mapping[str, Any] = {}
     if mod:
@@ -216,14 +199,11 @@ def _compat_fetch_series_retry(func_name: str, country: str, want_freq: str, kee
     s = _compat_fetch_series(func_name, country, want_freq, keep_hint)
     if s:
         return s
-    # tiny backoff and try once more
-    _time.sleep(0.15)
+    _time.sleep(0.15)  # tiny backoff
     return _compat_fetch_series(func_name, country, want_freq, keep_hint)
 
 def _wb_fallback_series(country: str, indicator_code: str) -> Dict[str, float]:
-    """
-    Direct WB fallback when compat function is missing/unimplemented.
-    """
+    """Direct WB fallback when compat function is missing/unimplemented."""
     try:
         wb = _safe_import("app.providers.wb_provider")
         if not wb:
@@ -246,13 +226,10 @@ def _wb_fallback_series(country: str, indicator_code: str) -> Dict[str, float]:
 # -----------------------------------------------------------------------------
 # Parallel compat fetch helpers (for faster first response)
 # -----------------------------------------------------------------------------
-_EXEC = ThreadPoolExecutor(max_workers=8)  # adjust if your instance has more CPU
+_EXEC = ThreadPoolExecutor(max_workers=8)
 
 def _compat_fetch_series_blocking(func_name: str, country: str, keep_hint: int) -> Dict[str, float]:
-    """
-    Blocking compat fetch + trim used inside the thread pool (parallel).
-    Uses the same logic as _compat_fetch_series but drops want_freq (unused here).
-    """
+    """Blocking compat fetch + trim used inside the thread pool (parallel)."""
     mod = _safe_import("app.providers.compat")
     if not mod:
         return {}
@@ -275,10 +252,7 @@ def _compat_fetch_series_blocking(func_name: str, country: str, keep_hint: int) 
     return {}
 
 async def _gather_series_parallel(country: str) -> Dict[str, Dict[str, float]]:
-    """
-    Run all compat fetches concurrently using a thread pool.
-    Returns a dict keyed by our short names → trimmed series dicts.
-    """
+    """Run all compat fetches concurrently using a thread pool."""
     loop = asyncio.get_event_loop()
     futs = {
         # Monthly (12m)
@@ -300,9 +274,7 @@ async def _gather_series_parallel(country: str) -> Dict[str, Dict[str, float]]:
     return out
 
 async def _with_timeout(coro, timeout_s: float) -> Dict[str, Dict[str, float]]:
-    """
-    Await a coroutine with a hard timeout. Returns {} on timeout or errors.
-    """
+    """Await a coroutine with a hard timeout. Return {} on timeout/errors."""
     try:
         return await asyncio.wait_for(coro, timeout_s)
     except Exception:
@@ -347,7 +319,7 @@ class CountryLiteResponse(BaseModel):
     series: NumberSeries = Field(default_factory=dict)
     source: Optional[str] = None
 
-    # legacy fields kept for compatibility with your client
+    # legacy fields kept for compatibility
     imf_data: Dict[str, Any] = Field(default_factory=dict)
     government_debt: Dict[str, Any] = Field(default_factory=dict)
     nominal_gdp: Dict[str, Any] = Field(default_factory=dict)
@@ -368,7 +340,6 @@ def action_probe_get() -> Dict[str, Any]:
 
 @router.options("/__action_probe", include_in_schema=False)
 def action_probe_options() -> Response:
-    # Allow preflights to succeed fast
     return Response(status_code=204)
 
 # ——— Series probe ------------------------------------------------------------
@@ -376,10 +347,7 @@ def action_probe_options() -> Response:
 def probe_series(
     country: str = Query(..., description="Full country name, e.g., Germany"),
 ) -> Dict[str, Any]:
-    """
-    Quick availability check for core indicators across providers.
-    Returns length and latest period per source; never raises.
-    """
+    """Quick availability check for core indicators across providers."""
     iso = _iso_codes(country)
 
     # CPI (YoY or equivalent)
@@ -474,15 +442,9 @@ def probe_series(
                 "Eurostat": _brief(eu_une),
                 "WB_annual": _brief(une_wb_annual),
             },
-            "fx": {
-                "IMF": _brief(imf_fx),
-            },
-            "reserves": {
-                "IMF": _brief(imf_res),
-            },
-            "policy_rate": {
-                "IMF": _brief(imf_pr),
-            },
+            "fx": {"IMF": _brief(imf_fx)},
+            "reserves": {"IMF": _brief(imf_res)},
+            "policy_rate": {"IMF": _brief(imf_pr)},
             "gdp_growth": {
                 "IMF_quarterly": _brief(imf_gdpq),
                 "WB_annual": _brief(wb_gdpa),
@@ -511,7 +473,6 @@ def compat_probe(
     freq: str = "auto",  # monthly/annual/quarterly/auto
 ):
     import app.providers.compat as compat
-
     name_map = {
         ("cpi_yoy","monthly"): "get_cpi_yoy_monthly",
         ("cpi_yoy","annual"):  "get_cpi_annual",
@@ -525,15 +486,13 @@ def compat_probe(
         ("gdp_growth","quarterly"): "get_gdp_growth_quarterly",
         ("gdp_growth","annual"):   "get_gdp_growth_annual",
     }
-    if indicator == "gdp_growth":
-        key = (indicator, "quarterly" if freq in ("auto","quarterly") else "annual")
-    else:
-        key = (indicator, "monthly" if freq in ("auto","monthly") else "annual")
+    key = (indicator, "quarterly" if indicator == "gdp_growth" and freq in ("auto","quarterly") else
+                      "monthly"   if indicator != "gdp_growth" and freq in ("auto","monthly") else
+                      "annual")
     fn_name = name_map.get(key)
     fn = getattr(compat, fn_name, None) if fn_name else None
     if not callable(fn):
         return {"error": f"compat function not found: {fn_name}"}
-
     series = fn(country=country)
     head = dict(list(series.items())[:10])
     return {
@@ -547,10 +506,7 @@ def compat_probe(
 # --- Provider introspection helpers ------------------------------------------
 @router.get("/__provider_fns", summary="List callables exported by a provider module")
 def provider_fns(module: str):
-    """
-    List top-level callables in a provider module so we can see what's actually deployed.
-    Example: /__provider_fns?module=app.providers.wb_provider_cr
-    """
+    """List top-level callables in a provider module so we can see what's actually deployed."""
     mod = _safe_import(module)
     if not mod:
         return {"ok": False, "module": module, "error": "import_failed"}
@@ -573,15 +529,8 @@ def show_codes(country: str = "Mexico"):
     return {"country": country, "codes": codes}
 
 @router.get("/__provider_raw", summary="Call a provider function directly and preview result")
-def provider_raw(
-    module: str,
-    fn: str,
-    country: str = "Mexico",
-):
-    """
-    Call a specific function in a provider with various arg shapes (country/name/iso2/iso3/code)
-    and return a short preview of the raw payload.
-    """
+def provider_raw(module: str, fn: str, country: str = "Mexico"):
+    """Call a specific function in a provider and return a short preview of the raw payload."""
     mod = _safe_import(module)
     if not mod:
         return {"ok": False, "module": module, "fn": fn, "error": "import_failed"}
@@ -599,7 +548,7 @@ def provider_raw(
         {"code": codes.get("iso_alpha_3") or codes.get("iso_alpha_2")},
     ]
     tried = []
-    res = err = None
+    res = None
     for kv in trials:
         if any(v is None for v in kv.values()):
             continue
@@ -612,7 +561,6 @@ def provider_raw(
         except Exception as e:
             tried.append({"kwargs": kv, "error": f"{type(e).__name__}: {e}"})
     if res is None:
-        # final positional attempt
         try:
             res = f(country)
             tried.append({"args": [country], "ok": True})
@@ -640,9 +588,7 @@ def provider_raw(
 
 # --- Country Lite (compat-first, bounded history, cached, parallel) ----------
 @router.get("/v1/country-lite", summary="Country Lite", response_model=CountryLiteResponse)
-async def country_lite(
-    country: str = Query(..., description="Full country name, e.g., Mexico"),
-):
+async def country_lite(country: str = Query(..., description="Full country name, e.g., Mexico")):
     """
     Compat-first, frequency-aware snapshot with bounded history windows:
       - Debt-to-GDP (annual, last 20y)
@@ -651,7 +597,6 @@ async def country_lite(
       - Current Account % GDP (annual, last 20y) — WB fallback
       - Government Effectiveness (annual, last 20y) — WB fallback
     """
-
     # 0) Fast cache hit
     cached = _cache_get(country)
     if cached:
@@ -659,7 +604,7 @@ async def country_lite(
 
     iso = _iso_codes(country)
 
-    # ---- Debt-to-GDP (service tiers Eurostat/IMF/WB and caches)
+    # Debt-to-GDP (service tiers Eurostat/IMF/WB and caches)
     try:
         from app.services.debt_service import compute_debt_payload
         debt = compute_debt_payload(country) or {}
@@ -669,7 +614,7 @@ async def country_lite(
     debt_series = _trim_series_policy(debt_series_full, HIST_POLICY)  # A:20
     debt_latest = debt.get("latest") or {"year": None, "value": None, "source": "unavailable"}
 
-    # ---- Fetch the rest in parallel with a hard timeout
+    # Fetch the rest in parallel with a hard timeout
     series_bundle = await _with_timeout(_gather_series_parallel(country), timeout_s=3.0)
     cpi_m   = series_bundle.get("cpi_m", {})
     une_m   = series_bundle.get("une_m", {})
@@ -680,13 +625,12 @@ async def country_lite(
     cab_a   = series_bundle.get("cab_a", {})
     ge_a    = series_bundle.get("ge_a", {})
 
-    # ---- Annual fallbacks if compat empty
+    # Annual fallbacks if compat empty
     if not cab_a:
         cab_a = _wb_fallback_series(country, "BN.CAB.XOKA.GD.ZS")
     if not ge_a:
         ge_a = _wb_fallback_series(country, "GE.EST")
 
-    # ---- Latest extraction
     def _kvl(d: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
         return _latest(d)
 
@@ -707,8 +651,6 @@ async def country_lite(
             "iso_alpha_3": iso.get("iso_alpha_3"),
             "iso_numeric": iso.get("iso_numeric"),
         },
-
-        # Debt block (annual, trimmed)
         "latest": {"year": debt_latest.get("year"), "value": debt_latest.get("value"), "source": debt_latest.get("source")},
         "series": debt_series,
         "source": debt_latest.get("source"),
@@ -720,34 +662,22 @@ async def country_lite(
         "debt_to_gdp":    {"latest": {"value": None, "date": None, "source": None}, "series": {}},
         "debt_to_gdp_series": {},
 
-        # Indicators with required frequency and **trimmed history**
         "additional_indicators": {
-            # Monthly — 12m
             "cpi_yoy":  {"latest_value": cpi_v,  "latest_period": cpi_p,  "source": "compat/IMF",     "series": cpi_m},
             "unemployment_rate": {"latest_value": une_v, "latest_period": une_p, "source": "compat/IMF", "series": une_m},
             "fx_rate_usd": {"latest_value": fx_v, "latest_period": fx_p, "source": "compat/IMF",       "series": fx_m},
             "reserves_usd": {"latest_value": res_v, "latest_period": res_p, "source": "compat/IMF",     "series": res_m},
             "policy_rate": {"latest_value": pol_v, "latest_period": pol_p, "source": "compat/IMF/ECB",  "series": policy_m},
-
-            # Quarterly — 4q
             "gdp_growth": {"latest_value": gdpq_v, "latest_period": gdpq_p, "source": "compat/IMF",     "series": gdp_q},
-
-            # Annual — 20y (with WB fallback)
-            "current_account_balance_pct_gdp": {
-                "latest_value": cab_v, "latest_period": cab_p, "source": "compat/WB", "series": cab_a
-            },
-            "government_effectiveness": {
-                "latest_value": ge_v, "latest_period": ge_p, "source": "compat/WB WGI", "series": ge_a
-            },
+            "current_account_balance_pct_gdp": {"latest_value": cab_v, "latest_period": cab_p, "source": "compat/WB", "series": cab_a},
+            "government_effectiveness": {"latest_value": ge_v, "latest_period": ge_p, "source": "compat/WB WGI", "series": ge_a},
         },
-
         "_debug": {
             "builder": "probe.country_lite (parallel + timeout + cache)",
             "history_policy": HIST_POLICY,
         },
     }
 
-    # Save to cache (best-effort)
     try:
         _cache_set(country, resp)
     except Exception:
