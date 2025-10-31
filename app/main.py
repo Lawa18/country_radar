@@ -44,6 +44,7 @@ def _safe_include(prefix: str, module_path: str) -> None:
 _safe_include("country", "app.routes.country")          # for /country-data
 _safe_include("debt_bundle", "app.routes.debt_bundle")  # for /v1/debt-bundle
 _safe_include("debt", "app.routes.debt")                # for /v1/debt
+_safe_include("country-lite", "app.routes.country_lite")
 
 # ------------------------------------------------------------
 # 2) include the probe router (THIS is what adds /v1/country-lite)
