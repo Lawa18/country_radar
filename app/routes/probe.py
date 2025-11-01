@@ -1,4 +1,4 @@
-# app/routes/probe.py — diagnostics (safe, defensive, no heavy endpoints)
+# app/routes/probe.py — diagnostics only (no /v1/country-lite here)
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
@@ -13,25 +13,29 @@ router = APIRouter(tags=["probe"])
 # -----------------------------------------------------------------------------
 # History policy + compat helpers
 # -----------------------------------------------------------------------------
-HIST_POLICY = {"A": 20, "Q": 4, "M": 12}  # Annual, Quarterly, Monthly window sizes
+HIST_POLICY: Dict[str, int] = {
+    "A": 20,  # annual
+    "Q": 4,   # quarterly
+    "M": 12,  # monthly
+}
 
-# --- tiny response cache (not used by a hot endpoint now, but kept) ----------
-_COUNTRY_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
-_COUNTRY_TTL = 600.0  # 10 minutes
+# --- tiny response cache for probe endpoints (mainly for /__probe_series) ----
+_PROBE_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_PROBE_TTL = 600.0  # 10 minutes
 
 
-def _cache_get(country: str) -> Optional[Dict[str, Any]]:
-    row = _COUNTRY_CACHE.get(country.lower())
+def _probe_cache_get(key: str) -> Optional[Dict[str, Any]]:
+    row = _PROBE_CACHE.get(key)
     if not row:
         return None
     ts, payload = row
-    if _time.time() - ts > _COUNTRY_TTL:
+    if _time.time() - ts > _PROBE_TTL:
         return None
     return payload
 
 
-def _cache_set(country: str, payload: Dict[str, Any]) -> None:
-    _COUNTRY_CACHE[country.lower()] = (_time.time(), payload)
+def _probe_cache_set(key: str, payload: Dict[str, Any]) -> None:
+    _PROBE_CACHE[key] = (_time.time(), payload)
 
 
 # -----------------------------------------------------------------------------
@@ -193,7 +197,7 @@ def _probe_provider(module_name: str, fns: Iterable[str], **kwargs) -> Tuple[Dic
 
 
 # -----------------------------------------------------------------------------
-# Compat fetchers (primary) + WB fallback (sync, no threads)
+# Compat fetchers (sync, no threads)
 # -----------------------------------------------------------------------------
 def _compat_fetch_series(func_name: str, country: str, want_freq: str, keep_hint: int) -> Dict[str, float]:
     """
@@ -222,10 +226,18 @@ def _compat_fetch_series(func_name: str, country: str, want_freq: str, keep_hint
     return _trim_series_policy(data, HIST_POLICY)
 
 
+def _compat_fetch_series_retry(func_name: str, country: str, want_freq: str, keep_hint: int) -> Dict[str, float]:
+    s = _compat_fetch_series(func_name, country, want_freq, keep_hint)
+    if s:
+        return s
+    # tiny backoff and try once more
+    _time.sleep(0.1)
+    return _compat_fetch_series(func_name, country, want_freq, keep_hint)
+
+
 def _wb_fallback_series(country: str, indicator_code: str) -> Dict[str, float]:
     """
     Direct WB fallback when compat function is missing/unimplemented.
-    Kept here for debugging, even if your main country-lite doesn’t use it.
     """
     try:
         wb = _safe_import("app.providers.wb_provider")
@@ -259,7 +271,6 @@ def action_probe_get() -> Dict[str, Any]:
 
 @router.options("/__action_probe", include_in_schema=False)
 def action_probe_options() -> Response:
-    # Allow preflights to succeed fast
     return Response(status_code=204)
 
 
@@ -272,9 +283,14 @@ def probe_series(
     Quick availability check for core indicators across providers.
     Returns length and latest period per source; never raises.
     """
+    cache_key = f"series:{country.lower()}"
+    cached = _probe_cache_get(cache_key)
+    if cached:
+        return JSONResponse(content=cached)
+
     iso = _iso_codes(country)
 
-    # CPI (YoY or equivalent)
+    # CPI
     imf_cpi, dbg_imf_cpi = _probe_provider(
         "app.providers.imf_provider",
         ("get_cpi_yoy_monthly", "cpi_yoy_monthly", "get_cpi_yoy", "cpi_yoy"),
@@ -308,28 +324,28 @@ def probe_series(
         country=country,
     )
 
-    # FX vs USD
+    # FX
     imf_fx, dbg_imf_fx = _probe_provider(
         "app.providers.imf_provider",
         ("get_fx_rate_usd_monthly", "fx_rate_usd_monthly", "get_fx_rate_usd", "fx_rate_usd"),
         country=country,
     )
 
-    # Reserves (USD)
+    # Reserves
     imf_res, dbg_imf_res = _probe_provider(
         "app.providers.imf_provider",
         ("get_reserves_usd_monthly", "reserves_usd_monthly", "get_reserves_usd", "reserves_usd"),
         country=country,
     )
 
-    # Policy rate
+    # Policy
     imf_pr, dbg_imf_pr = _probe_provider(
         "app.providers.imf_provider",
         ("get_policy_rate_monthly", "policy_rate_monthly", "get_policy_rate", "policy_rate"),
         country=country,
     )
 
-    # GDP growth (quarterly preferred)
+    # GDP growth
     imf_gdpq, dbg_imf_gdpq = _probe_provider(
         "app.providers.imf_provider",
         ("get_gdp_growth_quarterly", "gdp_growth_quarterly"),
@@ -350,7 +366,7 @@ def probe_series(
     cpi_wb_annual = _to_annual_latest(wb_cpi)
     une_wb_annual = _to_annual_latest(wb_une)
 
-    resp = {
+    resp: Dict[str, Any] = {
         "ok": True,
         "country": country,
         "iso2": iso.get("iso_alpha_2"),
@@ -380,7 +396,7 @@ def probe_series(
                 "WB_annual": _brief(wb_gdpa),
             },
         },
-        "_debug": {
+        "debug": {
             "cpi": {"IMF": dbg_imf_cpi, "Eurostat": dbg_eu_cpi, "WB": dbg_wb_cpi},
             "unemployment": {"IMF": dbg_imf_une, "Eurostat": dbg_eu_une, "WB": dbg_wb_une},
             "fx": {"IMF": dbg_imf_fx},
@@ -389,7 +405,9 @@ def probe_series(
             "gdp_growth": {"IMF_q": dbg_imf_gdpq, "WB_a": dbg_wb_gdpa},
         },
     }
-    return resp
+
+    _probe_cache_set(cache_key, resp)
+    return JSONResponse(content=resp)
 
 
 @router.options("/__probe_series", include_in_schema=False)
@@ -459,7 +477,12 @@ def provider_fns(module: str):
             except Exception:
                 sig = "(?)"
             fns.append({"name": name, "signature": sig})
-    return {"ok": True, "module": module, "count": len(fns), "functions": sorted(fns, key=lambda x: x["name"])}
+    return {
+        "ok": True,
+        "module": module,
+        "count": len(fns),
+        "functions": sorted(fns, key=lambda x: x["name"]),
+    }
 
 
 @router.get("/__codes", summary="Show resolved ISO codes for a country")
@@ -485,6 +508,7 @@ def provider_raw(
     f = getattr(mod, fn, None)
     if not callable(f):
         return {"ok": False, "module": module, "fn": fn, "error": "fn_missing"}
+
     # variants
     from app.utils import country_codes as cc
     codes = (cc.get_country_codes(country) or {}) if hasattr(cc, "get_country_codes") else {}
@@ -508,6 +532,7 @@ def provider_raw(
             tried.append({"kwargs": kv, "error": str(e)})
         except Exception as e:
             tried.append({"kwargs": kv, "error": f"{type(e).__name__}: {e}"})
+
     if res is None:
         # final positional attempt
         try:
@@ -525,7 +550,7 @@ def provider_raw(
             small = {str(k): obj[k] for k in head}
             return {"type": "mapping", "len": len(keys), "head_keys": head, "head_values": small}
         if isinstance(obj, (list, tuple)):
-            return {"type": "sequence", "len": obj), "head": list(obj)[:limit]}
+            return {"type": "sequence", "len": len(obj), "head": list(obj)[:limit]}
         return {"type": type(obj).__name__, "repr": repr(obj)[:400]}
 
     return {
