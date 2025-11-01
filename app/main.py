@@ -66,3 +66,7 @@ def root():
         ],
         "hint": "see /docs or /openapi.json",
     }
+
+@app.get("/fast-health")
+def fast_health():
+    return {"ok": True}
