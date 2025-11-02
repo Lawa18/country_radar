@@ -15,58 +15,72 @@ app = FastAPI(
 )
 
 
-def _safe_include(prefix: str, module_path: str) -> None:
+def _safe_include(prefix: str, module_path: str) -> bool:
     """
     Import a router module and include its `router` if present.
-    Logs instead of crashing so one bad router doesn't kill the app.
+    Return True/False so we can see what actually mounted.
     """
     try:
         mod = importlib.import_module(module_path)
     except Exception as e:
         logger.error("failed to import %s: %s", module_path, e)
-        return
+        return False
 
     router = getattr(mod, "router", None)
     if router is None:
         logger.error("module %s has no `router`", module_path)
-        return
+        return False
 
     app.include_router(router)
     logger.info("[init] %s router mounted from: %s", prefix, module_path)
+    return True
 
 
-# ------------------------------------------------------------
-# 1) include all the routers we already saw in openapi.json
-#    (these must exist in your codebase right now)
-# ------------------------------------------------------------
-# You may already have something like this in your old main.py;
-# if so, keep that AND add the probe include below.
-_safe_include("country", "app.routes.country")          # for /country-data
-_safe_include("debt_bundle", "app.routes.debt_bundle")  # for /v1/debt-bundle
-_safe_include("debt", "app.routes.debt")                # for /v1/debt
-_safe_include("country-lite", "app.routes.country_lite")
-
-# ------------------------------------------------------------
-# 2) include the probe router (THIS is what adds /v1/country-lite)
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------
+# STARTUP: mount ONLY the lightest router(s)
+# ---------------------------------------------------------------------
+# probe is cheap now (sync, lazy imports), so we can mount it
 _safe_include("probe", "app.routes.probe")
 
-# ------------------------------------------------------------
-# 3) root
-# ------------------------------------------------------------
+# ---------------------------------------------------------------------
+# ROOT + HEALTH
+# ---------------------------------------------------------------------
 @app.get("/")
 def root():
     return {
         "ok": True,
-        "routers": [
-            "country",
-            "debt_bundle",
-            "debt",
-            "probe",
+        "routers_maybe_mounted": [
+            "probe",     # guaranteed
+            # the rest are mounted on-demand via /__load_heavy
         ],
-        "hint": "see /docs or /openapi.json",
+        "hint": "call /__load_heavy once after deploy to mount country/debt routes",
     }
 
-@app.get("/fast-health")
-def fast_health():
-    return {"ok": True}
+
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------
+# ON-DEMAND MOUNTER
+# ---------------------------------------------------------------------
+@app.get("/__load_heavy")
+def load_heavy():
+    """
+    Call this ONCE (from browser or from your GPT action) after the service starts.
+    This will mount the heavy routers that sometimes make Render grumpy
+    when we mount them at startup.
+    """
+    mounted = {}
+    mounted["country"] = _safe_include("country", "app.routes.country")
+    mounted["debt_bundle"] = _safe_include("debt_bundle", "app.routes.debt_bundle")
+    mounted["debt"] = _safe_include("debt", "app.routes.debt")
+    # if you keep a separate country-lite router, mount it here too:
+    mounted["country-lite"] = _safe_include("country-lite", "app.routes.country_lite")
+
+    return {
+        "ok": True,
+        "mounted": mounted,
+        "note": "Heavy routers loaded. If one is False, check logs on Render.",
+    }
