@@ -16,10 +16,7 @@ app = FastAPI(
 
 
 def _safe_include(prefix: str, module_path: str) -> bool:
-    """
-    Import a router module and include its `router` if present.
-    Return True/False so we can see what actually mounted.
-    """
+    """Import a router module and include its `router` if present."""
     try:
         mod = importlib.import_module(module_path)
     except Exception as e:
@@ -37,50 +34,46 @@ def _safe_include(prefix: str, module_path: str) -> bool:
 
 
 # ---------------------------------------------------------------------
-# STARTUP: mount ONLY the lightest router(s)
+# STARTUP: mount ONLY the light/cheap router(s)
 # ---------------------------------------------------------------------
-# probe is cheap now (sync, lazy imports), so we can mount it
+# ✅ probe is now light enough, so we can mount it at startup
 _safe_include("probe", "app.routes.probe")
 
-# ---------------------------------------------------------------------
-# ROOT + HEALTH
-# ---------------------------------------------------------------------
+# ❌ DO NOT mount country / debt / country-lite here.
+# That’s what is making Render time out.
+
+
 @app.get("/")
 def root():
     return {
         "ok": True,
-        "routers_maybe_mounted": [
-            "probe",     # guaranteed
-            # the rest are mounted on-demand via /__load_heavy
+        "routers_now": ["probe"],
+        "routers_later": [
+            "country",
+            "debt_bundle",
+            "debt",
+            "country-lite",
         ],
-        "hint": "call /__load_heavy once after deploy to mount country/debt routes",
+        "hint": "call /__load_heavy after deploy to mount the rest",
     }
 
 
 @app.get("/healthz")
 def healthz():
+    # keep this super fast
     return {"status": "ok"}
 
 
-# ---------------------------------------------------------------------
-# ON-DEMAND MOUNTER
-# ---------------------------------------------------------------------
 @app.get("/__load_heavy")
 def load_heavy():
     """
-    Call this ONCE (from browser or from your GPT action) after the service starts.
-    This will mount the heavy routers that sometimes make Render grumpy
-    when we mount them at startup.
+    Call this endpoint manually AFTER the service is up.
+    This mounts the slow/big routers.
     """
-    mounted = {}
-    mounted["country"] = _safe_include("country", "app.routes.country")
-    mounted["debt_bundle"] = _safe_include("debt_bundle", "app.routes.debt_bundle")
-    mounted["debt"] = _safe_include("debt", "app.routes.debt")
-    # if you keep a separate country-lite router, mount it here too:
-    mounted["country-lite"] = _safe_include("country-lite", "app.routes.country_lite")
-
-    return {
-        "ok": True,
-        "mounted": mounted,
-        "note": "Heavy routers loaded. If one is False, check logs on Render.",
+    mounted = {
+        "country": _safe_include("country", "app.routes.country"),
+        "debt_bundle": _safe_include("debt_bundle", "app.routes.debt_bundle"),
+        "debt": _safe_include("debt", "app.routes.debt"),
+        "country-lite": _safe_include("country-lite", "app.routes.country_lite"),
     }
+    return {"ok": True, "mounted": mounted}
