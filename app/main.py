@@ -77,3 +77,14 @@ def load_heavy():
         "country-lite": _safe_include("country-lite", "app.routes.country_lite"),
     }
     return {"ok": True, "mounted": mounted}
+
+import threading, time
+def _delayed_load():
+    time.sleep(5)
+    try:
+        _safe_include("country-lite", "app.routes.country_lite")
+    except Exception as e:
+        logger.error("Delayed include failed: %s", e)
+
+threading.Thread(target=_delayed_load, daemon=True).start()
+
