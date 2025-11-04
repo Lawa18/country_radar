@@ -1,28 +1,51 @@
-# app/routes/country_lite.py — actual /v1/country-lite endpoint (lightweight import)
+# app/routes/country_lite.py — heavier, real macro snapshot
 from __future__ import annotations
 
 from typing import Any, Dict, Mapping, Optional, Tuple
 import time as _time
 
 from fastapi import APIRouter, Query
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 router = APIRouter(tags=["country-lite"])
 
-# same history policy as probe
-HIST_POLICY: Dict[str, int] = {"A": 20, "Q": 4, "M": 12}
+HIST_POLICY = {"A": 20, "Q": 4, "M": 12}
 
-# tiny cache
 _COUNTRY_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _COUNTRY_TTL = 600.0  # 10 minutes
 
 
-# ----------------- shared tiny helpers -----------------
+def _cache_get(country: str) -> Optional[Dict[str, Any]]:
+    row = _COUNTRY_CACHE.get(country.lower())
+    if not row:
+        return None
+    ts, payload = row
+    if _time.time() - ts > _COUNTRY_TTL:
+        return None
+    return payload
+
+
+def _cache_set(country: str, payload: Dict[str, Any]) -> None:
+    _COUNTRY_CACHE[country.lower()] = (_time.time(), payload)
+
+
 def _safe_import(module: str):
     try:
         return __import__(module, fromlist=["*"])
     except Exception:
         return None
+
+
+def _coerce_numeric_series(d: Optional[Mapping[str, Any]]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    if not isinstance(d, Mapping):
+        return out
+    for k, v in d.items():
+        try:
+            out[str(k)] = float(v)
+        except Exception:
+            pass
+    return out
 
 
 def _parse_period_key(p: str) -> Tuple[int, int, int]:
@@ -41,16 +64,12 @@ def _parse_period_key(p: str) -> Tuple[int, int, int]:
         return (0, 0, 0)
 
 
-def _coerce_numeric_series(d: Optional[Mapping[str, Any]]) -> Dict[str, float]:
-    out: Dict[str, float] = {}
-    if not isinstance(d, Mapping):
-        return out
-    for k, v in d.items():
-        try:
-            out[str(k)] = float(v)
-        except Exception:
-            pass
-    return out
+def _latest(d: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
+    if not d:
+        return None, None
+    ks = sorted(d.keys(), key=_parse_period_key)
+    k = ks[-1]
+    return k, d[k]
 
 
 def _freq_of_key(k: str) -> str:
@@ -85,14 +104,6 @@ def _trim_series_policy(series: Mapping[str, float], policy: Dict[str, int]) -> 
     return dict(sorted(out.items(), key=lambda kv: _parse_period_key(kv[0])))
 
 
-def _latest(d: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
-    if not d:
-        return None, None
-    ks = sorted(d.keys(), key=_parse_period_key)
-    k = ks[-1]
-    return k, d[k]
-
-
 def _iso_codes(country: str) -> Dict[str, Optional[str]]:
     try:
         cc_mod = _safe_import("app.utils.country_codes")
@@ -110,48 +121,35 @@ def _iso_codes(country: str) -> Dict[str, Optional[str]]:
     return {"name": country, "iso_alpha_2": None, "iso_alpha_3": None, "iso_numeric": None}
 
 
-def _cache_get(country: str) -> Optional[Dict[str, Any]]:
-    row = _COUNTRY_CACHE.get(country.lower())
-    if not row:
-        return None
-    ts, payload = row
-    if _time.time() - ts > _COUNTRY_TTL:
-        return None
-    return payload
-
-
-def _cache_set(country: str, payload: Dict[str, Any]) -> None:
-    _COUNTRY_CACHE[country.lower()] = (_time.time(), payload)
-
-
-# ---- compat fetchers (no heavy imports at module import) --------------------
-def _compat_fetch_series_retry(func_name: str, country: str, keep_hint: int) -> Dict[str, float]:
+def _compat_fetch_series(func_name: str, country: str, want_freq: str, keep_hint: int) -> Dict[str, float]:
     mod = _safe_import("app.providers.compat")
-    if not mod:
-        return {}
-    fn = getattr(mod, func_name, None)
-    if not callable(fn):
-        return {}
-    for kwargs in (
-        {"country": country, "series": "mini", "keep": max(keep_hint, 24)},
-        {"country": country, "series": "full"},
-        {"country": country},
-    ):
-        try:
-            raw = fn(**kwargs) or {}
-            if raw:
-                return _trim_series_policy(_coerce_numeric_series(raw), HIST_POLICY)
-        except TypeError:
-            continue
-        except Exception:
-            continue
-    # tiny retry
+    raw: Mapping[str, Any] = {}
+    if mod:
+        fn = getattr(mod, func_name, None)
+        if callable(fn):
+            for kwargs in (
+                {"country": country, "series": "mini", "keep": max(keep_hint, 24)},
+                {"country": country, "series": "full"},
+                {"country": country},
+            ):
+                try:
+                    raw = fn(**kwargs) or {}
+                    if raw:
+                        break
+                except TypeError:
+                    continue
+                except Exception:
+                    continue
+    data = _coerce_numeric_series(raw)
+    return _trim_series_policy(data, HIST_POLICY)
+
+
+def _compat_fetch_series_retry(func_name: str, country: str, want_freq: str, keep_hint: int) -> Dict[str, float]:
+    s = _compat_fetch_series(func_name, country, want_freq, keep_hint)
+    if s:
+        return s
     _time.sleep(0.1)
-    try:
-        raw = fn(country=country) or {}
-        return _trim_series_policy(_coerce_numeric_series(raw), HIST_POLICY)
-    except Exception:
-        return {}
+    return _compat_fetch_series(func_name, country, want_freq, keep_hint)
 
 
 def _wb_fallback_series(country: str, indicator_code: str) -> Dict[str, float]:
@@ -175,41 +173,39 @@ def _wb_fallback_series(country: str, indicator_code: str) -> Dict[str, float]:
         return {}
 
 
-# ---------------------------------------------------------------------
-# /v1/country-lite
-# ---------------------------------------------------------------------
 @router.get("/v1/country-lite", summary="Country Lite")
-def country_lite(country: str = Query(..., description="Full country name, e.g. Mexico")) -> Dict[str, Any]:
-    # fast cache
+def country_lite(
+    country: str = Query(..., description="Full country name, e.g., Mexico"),
+) -> Dict[str, Any]:
     cached = _cache_get(country)
     if cached:
         return JSONResponse(content=cached)
 
     iso = _iso_codes(country)
 
-    # debt payload (lazy import)
+    # debt block
     try:
         from app.services.debt_service import compute_debt_payload
         debt = compute_debt_payload(country) or {}
     except Exception:
         debt = {}
+
     debt_series_full = debt.get("series") or {}
     debt_series = _trim_series_policy(debt_series_full, HIST_POLICY)
     debt_latest = debt.get("latest") or {"year": None, "value": None, "source": "unavailable"}
 
-    # compat indicators (lazy)
-    gdp_q = _compat_fetch_series_retry("get_gdp_growth_quarterly", country, 12)
-    cpi_m = _compat_fetch_series_retry("get_cpi_yoy_monthly", country, 24)
-    une_m = _compat_fetch_series_retry("get_unemployment_rate_monthly", country, 24)
-    fx_m = _compat_fetch_series_retry("get_fx_rate_usd_monthly", country, 24)
-    res_m = _compat_fetch_series_retry("get_reserves_usd_monthly", country, 24)
-    pol_m = _compat_fetch_series_retry("get_policy_rate_monthly", country, 36)
+    # core indicators
+    gdp_growth_q = _compat_fetch_series_retry("get_gdp_growth_quarterly", country, "Q", keep_hint=12)
+    cpi_m = _compat_fetch_series_retry("get_cpi_yoy_monthly", country, "M", keep_hint=24)
+    une_m = _compat_fetch_series_retry("get_unemployment_rate_monthly", country, "M", keep_hint=24)
+    fx_m = _compat_fetch_series_retry("get_fx_rate_usd_monthly", country, "M", keep_hint=24)
+    res_m = _compat_fetch_series_retry("get_reserves_usd_monthly", country, "M", keep_hint=24)
+    policy_m = _compat_fetch_series_retry("get_policy_rate_monthly", country, "M", keep_hint=36)
 
-    cab_a = _compat_fetch_series_retry("get_current_account_balance_pct_gdp", country, 40)
+    cab_a = _compat_fetch_series_retry("get_current_account_balance_pct_gdp", country, "A", keep_hint=40)
     if not cab_a:
         cab_a = _wb_fallback_series(country, "BN.CAB.XOKA.GD.ZS")
-
-    ge_a = _compat_fetch_series_retry("get_government_effectiveness", country, 40)
+    ge_a = _compat_fetch_series_retry("get_government_effectiveness", country, "A", keep_hint=40)
     if not ge_a:
         ge_a = _wb_fallback_series(country, "GE.EST")
 
@@ -217,8 +213,8 @@ def country_lite(country: str = Query(..., description="Full country name, e.g. 
     une_p, une_v = _latest(une_m)
     fx_p, fx_v = _latest(fx_m)
     res_p, res_v = _latest(res_m)
-    pol_p, pol_v = _latest(pol_m)
-    gdp_p, gdp_v = _latest(gdp_q)
+    pol_p, pol_v = _latest(policy_m)
+    gdpq_p, gdpq_v = _latest(gdp_growth_q)
     cab_p, cab_v = _latest(cab_a)
     ge_p, ge_v = _latest(ge_a)
 
@@ -266,13 +262,13 @@ def country_lite(country: str = Query(..., description="Full country name, e.g. 
                 "latest_value": pol_v,
                 "latest_period": pol_p,
                 "source": "compat/IMF/ECB",
-                "series": pol_m,
+                "series": policy_m,
             },
             "gdp_growth": {
-                "latest_value": gdp_v,
-                "latest_period": gdp_p,
+                "latest_value": gdpq_v,
+                "latest_period": gdpq_p,
                 "source": "compat/IMF",
-                "series": gdp_q,
+                "series": gdp_growth_q,
             },
             "current_account_balance_pct_gdp": {
                 "latest_value": cab_v,
@@ -287,12 +283,20 @@ def country_lite(country: str = Query(..., description="Full country name, e.g. 
                 "series": ge_a,
             },
         },
+        "_debug": {
+            "builder": "country_lite (sync + cache + retry)",
+            "history_policy": HIST_POLICY,
+        },
     }
 
-    # cache best-effort
     try:
         _cache_set(country, resp)
     except Exception:
         pass
 
     return JSONResponse(content=resp)
+
+
+@router.options("/v1/country-lite", include_in_schema=False)
+def country_lite_options() -> Response:
+    return Response(status_code=204)
