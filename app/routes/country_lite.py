@@ -9,7 +9,6 @@ import concurrent.futures as _fut
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 
-# Keep history windows identical to probe
 HIST_POLICY = {"A": 20, "Q": 4, "M": 12}
 
 router = APIRouter(tags=["country-lite"])
@@ -125,7 +124,7 @@ def _iso_codes(country: str) -> Dict[str, Optional[str]]:
         pass
     return {"name": country, "iso_alpha_2": None, "iso_alpha_3": None, "iso_numeric": None}
 
-# -------------------- compat + WB fetchers --------------------
+# -------------------- compat + IMF + WB fetchers --------------------
 def _compat_fetch_series(func_name: str, country: str, keep_hint: int) -> Dict[str, float]:
     mod = _safe_import("app.providers.compat")
     raw: Mapping[str, Any] = {}
@@ -147,12 +146,41 @@ def _compat_fetch_series(func_name: str, country: str, keep_hint: int) -> Dict[s
                     continue
     return _trim_series_policy(_coerce_numeric_series(raw), HIST_POLICY)
 
-def _compat_fetch_retry(func_name: str, country: str, keep_hint: int) -> Dict[str, float]:
-    s = _compat_fetch_series(func_name, country, keep_hint)
-    if s:
-        return s
-    _time.sleep(0.1)
-    return _compat_fetch_series(func_name, country, keep_hint)
+def _imf_fetch_series(func_name: str, country: str) -> Dict[str, float]:
+    """Direct IMF provider fallback if compat returns empty."""
+    mod = _safe_import("app.providers.imf_provider")
+    if not mod:
+        return {}
+    fn = getattr(mod, func_name, None)
+    if not callable(fn):
+        return {}
+    try:
+        raw = fn(country=country) or {}
+        return _trim_series_policy(_coerce_numeric_series(raw), HIST_POLICY)
+    except Exception:
+        return {}
+
+def _yoy_from_index(idx: Mapping[str, float]) -> Dict[str, float]:
+    """Compute YoY % from a monthly index series."""
+    if not idx:
+        return {}
+    # ensure sorted
+    keys = sorted(idx.keys(), key=_parse_period_key)
+    out: Dict[str, float] = {}
+    # map year-month → value
+    vals = {k: float(idx[k]) for k in keys}
+    for k in keys:
+        # find same month -12
+        try:
+            y, m = str(k).split("-")[:2]
+            y0, m0 = int(y), int(m)
+            y_prev = y0 - 1
+            k_prev = f"{y_prev:04d}-{m0:02d}"
+            if k_prev in vals and vals[k_prev] != 0:
+                out[k] = (vals[k] / vals[k_prev] - 1.0) * 100.0
+        except Exception:
+            continue
+    return _trim_series_policy(out, HIST_POLICY)
 
 def _wb_fallback_series(country: str, indicator_code: str) -> Dict[str, float]:
     try:
@@ -176,8 +204,16 @@ def _wb_fallback_series(country: str, indicator_code: str) -> Dict[str, float]:
 
 # Thread pool for parallel fetch
 _EXEC = _fut.ThreadPoolExecutor(max_workers=8)
+_PER_TASK_TIMEOUT = 3.0  # seconds, keep low to avoid 17s total waits
 
-def _fetch_all_parallel(country: str) -> Dict[str, Dict[str, float]]:
+def _fetch_all_parallel(country: str, timing: Dict[str, int]) -> Dict[str, Dict[str, float]]:
+    def timed(label: str, fn):
+        t0 = _time.time()
+        res = fn()
+        timing[label] = int((_time.time() - t0) * 1000)
+        return res
+
+    # 1) primary compat submits
     tasks = {
         # Monthly (12)
         "cpi_m":    ("get_cpi_yoy_monthly", 24),
@@ -192,20 +228,48 @@ def _fetch_all_parallel(country: str) -> Dict[str, Dict[str, float]]:
         "ge_a":     ("get_government_effectiveness", 40),
     }
     futures = {
-        key: _EXEC.submit(_compat_fetch_retry, func, country, keep)
+        key: _EXEC.submit(_compat_fetch_series, func, country, keep)
         for key, (func, keep) in tasks.items()
     }
+
     out: Dict[str, Dict[str, float]] = {}
     for key, fut in futures.items():
         try:
-            out[key] = fut.result(timeout=8.0) or {}
+            out[key] = fut.result(timeout=_PER_TASK_TIMEOUT) or {}
         except Exception:
             out[key] = {}
-    # WB fallbacks if needed
+
+    # 2) IMF direct fallbacks for key gaps
+    # CPI YoY fallback: direct IMF yoy, else IMF index → compute yoy
+    if not out.get("cpi_m"):
+        # try direct IMF YoY
+        imf_yoy = timed("imf_cpi_yoy", lambda: _imf_fetch_series("get_cpi_yoy_monthly", country))
+        if imf_yoy:
+            out["cpi_m"] = imf_yoy
+        else:
+            # try IMF CPI index and compute YoY
+            imf_idx = timed("imf_cpi_index", lambda: _imf_fetch_series("get_cpi_index_monthly", country))
+            if imf_idx:
+                out["cpi_m"] = _yoy_from_index(imf_idx)
+
+    # Unemployment fallback: IMF direct monthly
+    if not out.get("une_m"):
+        out["une_m"] = timed("imf_unemployment", lambda: _imf_fetch_series("get_unemployment_rate_monthly", country))
+
+    # Quarterly GDP growth fallback: IMF direct
+    if not out.get("gdp_q"):
+        out["gdp_q"] = timed("imf_gdp_q", lambda: _imf_fetch_series("get_gdp_growth_quarterly", country))
+
+    # WB fallbacks for annuals
     if not out.get("cab_a"):
-        out["cab_a"] = _wb_fallback_series(country, "BN.CAB.XOKA.GD.ZS")
+        out["cab_a"] = timed("wb_cab", lambda: _wb_fallback_series(country, "BN.CAB.XOKA.GD.ZS"))
     if not out.get("ge_a"):
-        out["ge_a"] = _wb_fallback_series(country, "GE.EST")
+        out["ge_a"] = timed("wb_ge", lambda: _wb_fallback_series(country, "GE.EST"))
+
+    # Ensure all keys exist
+    for k in ("cpi_m","une_m","fx_m","res_m","policy_m","gdp_q","cab_a","ge_a"):
+        out.setdefault(k, {})
+
     return out
 
 # -------------------- route --------------------
@@ -225,7 +289,7 @@ def country_lite(
 
     iso = _iso_codes(country)
 
-    # debt (sync, but usually cached in its own service)
+    # debt (sync)
     t_debt0 = _time.time()
     try:
         from app.services.debt_service import compute_debt_payload
@@ -237,9 +301,10 @@ def country_lite(
     debt_latest = debt.get("latest") or {"year": None, "value": None, "source": "unavailable"}
     t_debt1 = _time.time()
 
-    # parallel compat fetch
+    # parallel compat + fallbacks
     t_par0 = _time.time()
-    series = _fetch_all_parallel(country)
+    timing_by_key: Dict[str, int] = {}
+    series = _fetch_all_parallel(country, timing_by_key)
     t_par1 = _time.time()
 
     def _kvl(d: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
@@ -262,7 +327,7 @@ def country_lite(
         "series": debt_series,
         "source": debt_latest.get("source"),
 
-        # legacy blocks (kept empty for compatibility)
+        # legacy blocks
         "imf_data": {},
         "government_debt": {"latest": {"value": None, "date": None, "source": None}, "series": {}},
         "nominal_gdp": {"latest": {"value": None, "date": None, "source": None}, "series": {}},
@@ -281,18 +346,19 @@ def country_lite(
         },
 
         "_debug": {
-            "builder": "country_lite (sync + cache + parallel)",
+            "builder": "country_lite (sync + cache + parallel + imf_fallbacks)",
             "history_policy": HIST_POLICY,
             "timing_ms": {
                 "total": int((_time.time() - t0) * 1000),
                 "debt": int((t_debt1 - t_debt0) * 1000),
                 "parallel_fetch": int((t_par1 - t_par0) * 1000),
             },
+            "timing_ms_by_key": timing_by_key,
             "fresh": bool(fresh),
+            "timeouts": {"per_task_seconds": _PER_TASK_TIMEOUT},
         },
     }
 
-    # store cache
     try:
         _cache_set(country, payload)
     except Exception:
