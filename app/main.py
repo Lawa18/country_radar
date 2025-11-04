@@ -5,9 +5,6 @@ import importlib
 import logging
 from fastapi import FastAPI
 
-from starlette.middleware.gzip import GZipMiddleware
-app.add_middleware(GZipMiddleware, minimum_size=500)
-
 logger = logging.getLogger("country-radar")
 logging.basicConfig(level=logging.INFO)
 
