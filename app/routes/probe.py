@@ -621,12 +621,27 @@ def _fetch_all_parallel(country: str, timing: Dict[str, int]) -> Dict[str, Dict[
     return out
 
 
-@router.get("/v1/country-lite", summary="Country Lite")
+# --- Country Lite (compat-first, bounded history, cached) — with parallel+fallbacks
+@router.get(
+    "/v1/country-lite",
+    summary="Country Lite",
+    operation_id="country_lite_get",  # <-- match GPT tool expectation
+)
 def country_lite(
     country: str = Query(..., description="Full country name, e.g., Mexico"),
     fresh: bool = Query(False, description="Bypass cache if true"),
 ) -> JSONResponse:
     """
+    Compat-first, frequency-aware snapshot with bounded history windows:
+      - Debt-to-GDP (annual, last 20y)
+      - GDP growth (quarterly, last 4q)
+      - Monthly set (CPI YoY, Unemployment, FX, Reserves, Policy rate) last 12m
+      - Current Account % GDP (annual, last 20y) — WB fallback
+      - Government Effectiveness (annual, last 20y) — WB fallback
+    Mirrors runtime behavior (parallel fetch + IMF fallbacks + short timeouts).
+    """
+    #  ... (your existing function body goes here, unchanged)
+
     Compat-first, frequency-aware snapshot with bounded history windows:
       - Debt-to-GDP (annual, last 20y)
       - GDP growth (quarterly, last 4q)
