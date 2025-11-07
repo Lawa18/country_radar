@@ -4,7 +4,6 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple
 import inspect
 import time as _time
-import concurrent.futures as _fut
 
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse, Response
@@ -15,6 +14,7 @@ router = APIRouter(tags=["probe"])
 # History policy + compat helpers
 # -----------------------------------------------------------------------------
 HIST_POLICY = {"A": 20, "Q": 4, "M": 12}  # Annual, Quarterly, Monthly window sizes
+COMPAT_TIMEOUT = 3.0  # seconds — soft per-call cap for compat providers
 
 # --- tiny response cache for /v1/country-lite --------------------------------
 _COUNTRY_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -194,17 +194,24 @@ def _probe_provider(module_name: str, fns: Iterable[str], **kwargs) -> Tuple[Dic
 
 
 # -----------------------------------------------------------------------------
-# Compat / IMF / WB fetchers used by country_lite (probe version)
+# Compat fetchers (primary) + WB fallback (sync, no threads)
 # -----------------------------------------------------------------------------
-def _compat_fetch_series(func_name: str, country: str, keep_hint: int) -> Dict[str, float]:
-    """Primary: compat provider with size hints; coerce + trim."""
+def _compat_fetch_series(func_name: str, country: str, want_freq: str, keep_hint: int) -> Dict[str, float]:
+    """
+    Fetch from compat with hints; fall back to plain call; coerce + trim.
+    keep_hint should be >= policy window (e.g., 24 for safety), we then trim strictly.
+    """
     mod = _safe_import("app.providers.compat")
     raw: Mapping[str, Any] = {}
     if mod:
         fn = getattr(mod, func_name, None)
         if callable(fn):
+            # Try with timeout first; if provider rejects unknown kwargs, TypeError is handled.
             for kwargs in (
-                {"country": country, "series": "mini", "keep": max(keep_hint, 24)},
+                {"country": country, "series": "mini", "keep": max(keep_hint, 24), "timeout": COMPAT_TIMEOUT},
+                {"country": country, "series": "full", "timeout": COMPAT_TIMEOUT},
+                {"country": country, "timeout": COMPAT_TIMEOUT},
+                {"country": country, "series": "mini", "keep": max(keep_hint, 24)},  # fallback w/o timeout
                 {"country": country, "series": "full"},
                 {"country": country},
             ):
@@ -213,6 +220,7 @@ def _compat_fetch_series(func_name: str, country: str, keep_hint: int) -> Dict[s
                     if raw:
                         break
                 except TypeError:
+                    # provider doesn’t accept some kwarg (e.g., timeout) — try next variant
                     continue
                 except Exception:
                     continue
@@ -220,42 +228,19 @@ def _compat_fetch_series(func_name: str, country: str, keep_hint: int) -> Dict[s
     return _trim_series_policy(data, HIST_POLICY)
 
 
-def _imf_fetch_series(func_name: str, country: str) -> Dict[str, float]:
-    """Direct IMF provider fallback if compat returns empty."""
-    mod = _safe_import("app.providers.imf_provider")
-    if not mod:
-        return {}
-    fn = getattr(mod, func_name, None)
-    if not callable(fn):
-        return {}
-    try:
-        raw = fn(country=country) or {}
-        return _trim_series_policy(_coerce_numeric_series(raw), HIST_POLICY)
-    except Exception:
-        return {}
-
-
-def _yoy_from_index(idx: Mapping[str, float]) -> Dict[str, float]:
-    """Compute YoY % from a monthly index series."""
-    if not idx:
-        return {}
-    keys = sorted(idx.keys(), key=_parse_period_key)
-    vals = {k: float(idx[k]) for k in keys}
-    out: Dict[str, float] = {}
-    for k in keys:
-        try:
-            y, m = str(k).split("-")[:2]
-            y0, m0 = int(y), int(m)
-            k_prev = f"{y0-1:04d}-{m0:02d}"
-            if k_prev in vals and vals[k_prev] != 0:
-                out[k] = (vals[k] / vals[k_prev] - 1.0) * 100.0
-        except Exception:
-            continue
-    return _trim_series_policy(out, HIST_POLICY)
+def _compat_fetch_series_retry(func_name: str, country: str, want_freq: str, keep_hint: int) -> Dict[str, float]:
+    s = _compat_fetch_series(func_name, country, want_freq, keep_hint)
+    if s:
+        return s
+    # tiny backoff and try once more
+    _time.sleep(0.1)
+    return _compat_fetch_series(func_name, country, want_freq, keep_hint)
 
 
 def _wb_fallback_series(country: str, indicator_code: str) -> Dict[str, float]:
-    """Direct WB fallback when compat function is missing/unimplemented."""
+    """
+    Direct WB fallback when compat function is missing/unimplemented.
+    """
     try:
         wb = _safe_import("app.providers.wb_provider")
         if not wb:
@@ -277,8 +262,10 @@ def _wb_fallback_series(country: str, indicator_code: str) -> Dict[str, float]:
 
 
 # -----------------------------------------------------------------------------
-# Reachability & diagnostics (unchanged)
+# Routes
 # -----------------------------------------------------------------------------
+
+# ——— Reachability ------------------------------------------------------------
 @router.get("/__action_probe", summary="Connectivity probe")
 def action_probe_get() -> Dict[str, Any]:
     return {"ok": True, "path": "/__action_probe"}
@@ -286,9 +273,11 @@ def action_probe_get() -> Dict[str, Any]:
 
 @router.options("/__action_probe", include_in_schema=False)
 def action_probe_options() -> Response:
+    # Allow preflights to succeed fast
     return Response(status_code=204)
 
 
+# ——— Series probe ------------------------------------------------------------
 @router.get("/__probe_series", summary="Probe Series")
 def probe_series(
     country: str = Query(..., description="Full country name, e.g., Germany"),
@@ -422,9 +411,7 @@ def probe_series_options() -> Response:
     return Response(status_code=204)
 
 
-# -----------------------------------------------------------------------------
-# Compat probe (unchanged)
-# -----------------------------------------------------------------------------
+# ——— Compat probe ------------------------------------------------------------
 @router.get("/__compat_probe", summary="Inspect compat normalization for one indicator")
 def compat_probe(
     indicator: str,
@@ -466,9 +453,13 @@ def compat_probe(
     }
 
 
-# --- Provider introspection helpers (unchanged) -------------------------------
+# --- Provider introspection helpers ------------------------------------------
 @router.get("/__provider_fns", summary="List callables exported by a provider module")
 def provider_fns(module: str):
+    """
+    List top-level callables in a provider module so we can see what's actually deployed.
+    Example: /__provider_fns?module=app.providers.wb_provider_cr
+    """
     mod = _safe_import(module)
     if not mod:
         return {"ok": False, "module": module, "error": "import_failed"}
@@ -482,7 +473,7 @@ def provider_fns(module: str):
             except Exception:
                 sig = "(?)"
             fns.append({"name": name, "signature": sig})
-    return {"ok": True, "module": module, "count": len(fns), "functions": sorted(fns, key=lambda x: x["name"])}
+    return {"ok": True, "module": module, "count": len(fns), "functions": sorted(fns, key=lambda x: x["name"])})
 
 
 @router.get("/__codes", summary="Show resolved ISO codes for a country")
@@ -498,12 +489,17 @@ def provider_raw(
     fn: str,
     country: str = "Mexico",
 ):
+    """
+    Call a specific function in a provider with various arg shapes (country/name/iso2/iso3/code)
+    and return a short preview of the raw payload.
+    """
     mod = _safe_import(module)
     if not mod:
         return {"ok": False, "module": module, "fn": fn, "error": "import_failed"}
     f = getattr(mod, fn, None)
     if not callable(f):
         return {"ok": False, "module": module, "fn": fn, "error": "fn_missing"}
+    # variants
     from app.utils import country_codes as cc
     codes = (cc.get_country_codes(country) or {}) if hasattr(cc, "get_country_codes") else {}
     trials = [
@@ -527,6 +523,7 @@ def provider_raw(
         except Exception as e:
             tried.append({"kwargs": kv, "error": f"{type(e).__name__}: {e}"})
     if res is None:
+        # final positional attempt
         try:
             res = f(country)
             tried.append({"args": [country], "ok": True})
@@ -555,82 +552,11 @@ def provider_raw(
     }
 
 
-# -----------------------------------------------------------------------------
-# Country Lite (compat-first, bounded history, cached) — now with parallel+fallbacks
-# -----------------------------------------------------------------------------
-_EXEC = _fut.ThreadPoolExecutor(max_workers=8)
-_PER_TASK_TIMEOUT = 3.0  # seconds, keep low so slow sources don't stall diagnostics
-
-
-def _fetch_all_parallel(country: str, timing: Dict[str, int]) -> Dict[str, Dict[str, float]]:
-    def timed_ms(label: str, fn):
-        t0 = _time.time()
-        res = fn()
-        timing[label] = int((_time.time() - t0) * 1000)
-        return res
-
-    tasks = {
-        # Monthly (12)
-        "cpi_m":    ("get_cpi_yoy_monthly", 24),
-        "une_m":    ("get_unemployment_rate_monthly", 24),
-        "fx_m":     ("get_fx_rate_usd_monthly", 24),
-        "res_m":    ("get_reserves_usd_monthly", 24),
-        "policy_m": ("get_policy_rate_monthly", 36),
-        # Quarterly (4)
-        "gdp_q":    ("get_gdp_growth_quarterly", 8),
-        # Annual (20)
-        "cab_a":    ("get_current_account_balance_pct_gdp", 40),
-        "ge_a":     ("get_government_effectiveness", 40),
-    }
-    futures = {
-        key: _EXEC.submit(_compat_fetch_series, func, country, keep)
-        for key, (func, keep) in tasks.items()
-    }
-
-    out: Dict[str, Dict[str, float]] = {}
-    for key, fut in futures.items():
-        try:
-            out[key] = fut.result(timeout=_PER_TASK_TIMEOUT) or {}
-        except Exception:
-            out[key] = {}
-
-    # Fallbacks (IMF + WB) for gaps so probe view matches runtime behavior
-    # CPI YoY: IMF direct; else IMF CPI index → compute YoY
-    if not out.get("cpi_m"):
-        imf_yoy = timed_ms("imf_cpi_yoy", lambda: _imf_fetch_series("get_cpi_yoy_monthly", country))
-        if imf_yoy:
-            out["cpi_m"] = imf_yoy
-        else:
-            imf_idx = timed_ms("imf_cpi_index", lambda: _imf_fetch_series("get_cpi_index_monthly", country))
-            if imf_idx:
-                out["cpi_m"] = _yoy_from_index(imf_idx)
-
-    if not out.get("une_m"):
-        out["une_m"] = timed_ms("imf_unemployment", lambda: _imf_fetch_series("get_unemployment_rate_monthly", country))
-    if not out.get("gdp_q"):
-        out["gdp_q"] = timed_ms("imf_gdp_q", lambda: _imf_fetch_series("get_gdp_growth_quarterly", country))
-
-    if not out.get("cab_a"):
-        out["cab_a"] = timed_ms("wb_cab", lambda: _wb_fallback_series(country, "BN.CAB.XOKA.GD.ZS"))
-    if not out.get("ge_a"):
-        out["ge_a"] = timed_ms("wb_ge", lambda: _wb_fallback_series(country, "GE.EST"))
-
-    for k in ("cpi_m", "une_m", "fx_m", "res_m", "policy_m", "gdp_q", "cab_a", "ge_a"):
-        out.setdefault(k, {})
-
-    return out
-
-
-# --- Country Lite (compat-first, bounded history, cached) — with parallel+fallbacks
-@router.get(
-    "/v1/country-lite",
-    summary="Country Lite",
-    operation_id="country_lite_get",  # <-- match GPT tool expectation
-)
+# --- Country Lite (compat-first, bounded history, cached, SYNC) --------------
+@router.get("/v1/country-lite", summary="Country Lite")
 def country_lite(
     country: str = Query(..., description="Full country name, e.g., Mexico"),
-    fresh: bool = Query(False, description="Bypass cache if true"),
-) -> JSONResponse:
+) -> Dict[str, Any]:
     """
     Compat-first, frequency-aware snapshot with bounded history windows:
       - Debt-to-GDP (annual, last 20y)
@@ -638,31 +564,16 @@ def country_lite(
       - Monthly set (CPI YoY, Unemployment, FX, Reserves, Policy rate) last 12m
       - Current Account % GDP (annual, last 20y) — WB fallback
       - Government Effectiveness (annual, last 20y) — WB fallback
-    Mirrors runtime behavior (parallel fetch + IMF fallbacks + short timeouts).
     """
-    #  ... (your existing function body goes here, unchanged)
 
-    Compat-first, frequency-aware snapshot with bounded history windows:
-      - Debt-to-GDP (annual, last 20y)
-      - GDP growth (quarterly, last 4q)
-      - Monthly set (CPI YoY, Unemployment, FX, Reserves, Policy rate) last 12m
-      - Current Account % GDP (annual, last 20y) — WB fallback
-      - Government Effectiveness (annual, last 20y) — WB fallback
-    Mirrors runtime behavior (parallel fetch + IMF fallbacks + short timeouts).
-    """
-    t0 = _time.time()
-
-    if not fresh:
-        cached = _cache_get(country)
-        if cached:
-            resp = JSONResponse(content=cached)
-            resp.headers["Cache-Control"] = "public, max-age=300"
-            return resp
+    # 0) Fast cache hit
+    cached = _cache_get(country)
+    if cached:
+        return JSONResponse(content=cached)
 
     iso = _iso_codes(country)
 
-    # Debt block (sync; tolerant)
-    t_debt0 = _time.time()
+    # ---- Debt-to-GDP (service tiers Eurostat/IMF/WB and caches)
     try:
         from app.services.debt_service import compute_debt_payload
         debt = compute_debt_payload(country) or {}
@@ -671,81 +582,122 @@ def country_lite(
     debt_series_full = debt.get("series") or {}
     debt_series = _trim_series_policy(debt_series_full, HIST_POLICY)  # A:20
     debt_latest = debt.get("latest") or {"year": None, "value": None, "source": "unavailable"}
-    t_debt1 = _time.time()
 
-    # Parallel compat + fallbacks
-    t_par0 = _time.time()
-    timing_by_key: Dict[str, int] = {}
-    series = _fetch_all_parallel(country, timing_by_key)
-    t_par1 = _time.time()
+    # ---- GDP growth (quarterly, 4) — compat + retry
+    gdp_growth_q = _compat_fetch_series_retry("get_gdp_growth_quarterly", country, "Q", keep_hint=12)
 
+    # ---- Monthly (12): CPI YoY, Unemployment, FX, Reserves, Policy rate — compat + retry
+    cpi_m = _compat_fetch_series_retry("get_cpi_yoy_monthly", country, "M", keep_hint=36)
+    une_m = _compat_fetch_series_retry("get_unemployment_rate_monthly", country, "M", keep_hint=36)  # consistent monthly window
+    fx_m = _compat_fetch_series_retry("get_fx_rate_usd_monthly", country, "M", keep_hint=36)
+    res_m = _compat_fetch_series_retry("get_reserves_usd_monthly", country, "M", keep_hint=36)
+    policy_m = _compat_fetch_series_retry("get_policy_rate_monthly", country, "M", keep_hint=48)
+
+    # ---- Annual (20): Current Account % GDP, Government Effectiveness
+    cab_a = _compat_fetch_series_retry("get_current_account_balance_pct_gdp", country, "A", keep_hint=40)
+    if not cab_a:
+        cab_a = _wb_fallback_series(country, "BN.CAB.XOKA.GD.ZS")
+    ge_a = _compat_fetch_series_retry("get_government_effectiveness", country, "A", keep_hint=40)
+    if not ge_a:
+        ge_a = _wb_fallback_series(country, "GE.EST")
+
+    # ---- Latest extraction
     def _kvl(d: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
         return _latest(d)
 
-    cpi_p, cpi_v = _kvl(series["cpi_m"])
-    une_p, une_v = _kvl(series["une_m"])
-    fx_p, fx_v = _kvl(series["fx_m"])
-    res_p, res_v = _kvl(series["res_m"])
-    pol_p, pol_v = _kvl(series["policy_m"])
-    gdpq_p, gdpq_v = _kvl(series["gdp_q"])
-    cab_p, cab_v = _kvl(series["cab_a"])
-    ge_p, ge_v = _kvl(series["ge_a"])
+    cpi_p, cpi_v = _kvl(cpi_m)
+    une_p, une_v = _kvl(une_m)
+    fx_p, fx_v = _kvl(fx_m)
+    res_p, res_v = _kvl(res_m)
+    pol_p, pol_v = _kvl(policy_m)
+    gdpq_p, gdpq_v = _kvl(gdp_growth_q)
+    cab_p, cab_v = _kvl(cab_a)
+    ge_p, ge_v = _kvl(ge_a)
 
-    payload: Dict[str, Any] = {
+    resp: Dict[str, Any] = {
         "country": country,
         "iso_codes": iso,
-
         # Debt block (annual, trimmed)
-        "latest": {"year": debt_latest.get("year"), "value": debt_latest.get("value"), "source": debt_latest.get("source")},
+        "latest": {
+            "year": debt_latest.get("year"),
+            "value": debt_latest.get("value"),
+            "source": debt_latest.get("source"),
+        },
         "series": debt_series,
         "source": debt_latest.get("source"),
-
         # Legacy top-levels retained (compatibility with older clients)
         "imf_data": {},
         "government_debt": {"latest": {"value": None, "date": None, "source": None}, "series": {}},
         "nominal_gdp": {"latest": {"value": None, "date": None, "source": None}, "series": {}},
         "debt_to_gdp": {"latest": {"value": None, "date": None, "source": None}, "series": {}},
         "debt_to_gdp_series": {},
-
         # Indicators with required frequency and **trimmed history**
         "additional_indicators": {
-            # Monthly — 12m
-            "cpi_yoy":  {"latest_value": cpi_v,  "latest_period": cpi_p,  "source": "compat/IMF",     "series": series["cpi_m"]},
-            "unemployment_rate": {"latest_value": une_v, "latest_period": une_p, "source": "compat/IMF", "series": series["une_m"]},
-            "fx_rate_usd": {"latest_value": fx_v, "latest_period": fx_p, "source": "compat/IMF",       "series": series["fx_m"]},
-            "reserves_usd": {"latest_value": res_v, "latest_period": res_p, "source": "compat/IMF",     "series": series["res_m"]},
-            "policy_rate": {"latest_value": pol_v, "latest_period": pol_p, "source": "compat/IMF/ECB",  "series": series["policy_m"]},
-
-            # Quarterly — 4q
-            "gdp_growth": {"latest_value": gdpq_v, "latest_period": gdpq_p, "source": "compat/IMF", "series": series["gdp_q"]},
-
-            # Annual — 20y (with WB fallback)
-            "current_account_balance_pct_gdp": {"latest_value": cab_v, "latest_period": cab_p, "source": "compat/WB", "series": series["cab_a"]},
-            "government_effectiveness": {"latest_value": ge_v, "latest_period": ge_p, "source": "compat/WB WGI", "series": series["ge_a"]},
-        },
-
-        "_debug": {
-            "builder": "country_lite (sync + cache + parallel + imf_fallbacks)",
-            "history_policy": HIST_POLICY,
-            "timing_ms": {
-                "total": int((_time.time() - t0) * 1000),
-                "debt": int((t_debt1 - t_debt0) * 1000),
-                "parallel_fetch": int((t_par1 - t_par0) * 1000),
+            # Monthly — 12m (kept window derived from HIST_POLICY but we fetch a bit more via keep_hint)
+            "cpi_yoy": {
+                "latest_value": cpi_v,
+                "latest_period": cpi_p,
+                "source": "compat/IMF",
+                "series": cpi_m,
             },
-            "timing_ms_by_key": timing_by_key,
-            "fresh": bool(fresh),
-            "timeouts": {"per_task_seconds": _PER_TASK_TIMEOUT},
+            "unemployment_rate": {
+                "latest_value": une_v,
+                "latest_period": une_p,
+                "source": "compat/IMF",
+                "series": une_m,
+            },
+            "fx_rate_usd": {
+                "latest_value": fx_v,
+                "latest_period": fx_p,
+                "source": "compat/IMF",
+                "series": fx_m,
+            },
+            "reserves_usd": {
+                "latest_value": res_v,
+                "latest_period": res_p,
+                "source": "compat/IMF",
+                "series": res_m,
+            },
+            "policy_rate": {
+                "latest_value": pol_v,
+                "latest_period": pol_p,
+                "source": "compat/IMF/ECB",
+                "series": policy_m,
+            },
+            # Quarterly — 4q
+            "gdp_growth": {
+                "latest_value": gdpq_v,
+                "latest_period": gdpq_p,
+                "source": "compat/IMF",
+                "series": gdp_growth_q,
+            },
+            # Annual — 20y (with WB fallback)
+            "current_account_balance_pct_gdp": {
+                "latest_value": cab_v,
+                "latest_period": cab_p,
+                "source": "compat/WB",
+                "series": cab_a,
+            },
+            "government_effectiveness": {
+                "latest_value": ge_v,
+                "latest_period": ge_p,
+                "source": "compat/WB WGI",
+                "series": ge_a,
+            },
+        },
+        "_debug": {
+            "builder": "country_lite (sync + cache + retry + timeout3s)",
+            "history_policy": HIST_POLICY,
         },
     }
 
+    # Save to cache (best-effort)
     try:
-        _cache_set(country, payload)
+        _cache_set(country, resp)
     except Exception:
         pass
 
-    resp = JSONResponse(content=payload)
-    resp.headers["Cache-Control"] = "public, max-age=300"
-    return resp
+    return JSONResponse(content=resp)
 
 
 @router.options("/v1/country-lite", include_in_schema=False)
