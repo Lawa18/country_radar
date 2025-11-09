@@ -4,15 +4,40 @@ from __future__ import annotations
 import importlib
 import logging
 from fastapi import FastAPI
+from fastapi.routing import APIRoute
+from fastapi.openapi.utils import get_openapi
 
 logger = logging.getLogger("country-radar")
 logging.basicConfig(level=logging.INFO)
+
+# --- keep operation_id stable (avoid FastAPI auto-dedupe renaming) ----------
+def _fixed_unique_id(route: APIRoute) -> str:
+    # Use the explicit operation_id if set on the route; otherwise fall back.
+    return route.operation_id or f"{route.name}_{route.path}".strip("/").replace("/", "_")
 
 app = FastAPI(
     title="Country Radar API",
     description="Macroeconomic data API",
     version="2025.10.19",
+    generate_unique_id_function=_fixed_unique_id,
 )
+
+# --- inject a single servers URL in the OpenAPI (for GPT connector) ----------
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+    )
+    # Important: provide exactly one public URL so the connector doesn't get confused.
+    schema["servers"] = [{"url": "https://country-radar.onrender.com"}]
+    app.openapi_schema = schema
+    return app.openapi_schema
+
+app.openapi = custom_openapi  # override
 
 
 def _safe_include(prefix: str, module_path: str) -> bool:
@@ -36,11 +61,11 @@ def _safe_include(prefix: str, module_path: str) -> bool:
 # ---------------------------------------------------------------------
 # STARTUP: mount ONLY the light/cheap router(s)
 # ---------------------------------------------------------------------
-# ✅ probe is now light enough, so we can mount it at startup
+# ✅ probe is light and contains /v1/country-lite (with operation_id='country_lite_get')
 _safe_include("probe", "app.routes.probe")
 
-# ❌ DO NOT mount country / debt / country-lite here.
-# That’s what is making Render time out.
+# ❌ DO NOT mount the legacy/alternate country_lite router anywhere.
+#    That caused duplicate paths & operationId renames in OpenAPI.
 
 
 @app.get("/")
@@ -52,9 +77,9 @@ def root():
             "country",
             "debt_bundle",
             "debt",
-            "country-lite",
+            # "country-lite"  # intentionally NOT mounted anywhere
         ],
-        "hint": "call /__load_heavy after deploy to mount the rest",
+        "hint": "call /__load_heavy after deploy to mount the rest (not country-lite)",
     }
 
 
@@ -68,23 +93,14 @@ def healthz():
 def load_heavy():
     """
     Call this endpoint manually AFTER the service is up.
-    This mounts the slow/big routers.
+    This mounts the slow/big routers (EXCEPT country-lite to avoid duplication).
     """
     mounted = {
         "country": _safe_include("country", "app.routes.country"),
         "debt_bundle": _safe_include("debt_bundle", "app.routes.debt_bundle"),
         "debt": _safe_include("debt", "app.routes.debt"),
-        "country-lite": _safe_include("country-lite", "app.routes.country_lite"),
+        # "country-lite": _safe_include("country-lite", "app.routes.country_lite"),  # <-- leave disabled
     }
     return {"ok": True, "mounted": mounted}
 
-import threading, time
-def _delayed_load():
-    time.sleep(5)
-    try:
-        _safe_include("country-lite", "app.routes.country_lite")
-    except Exception as e:
-        logger.error("Delayed include failed: %s", e)
-
-threading.Thread(target=_delayed_load, daemon=True).start()
-
+# ⚠️ No delayed includes. That previously re-mounted an alternate /v1/country-lite.
