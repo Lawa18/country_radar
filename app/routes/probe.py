@@ -607,16 +607,41 @@ def country_lite(
 
     iso = _iso_codes(country)
 
-    # ---- Debt (hard timeout: 3s)
-    debt = {}
+    # ---- Debt block: try light WB-based ratio instead of heavy compute_debt_payload
+    debt_series_full: Dict[str, float] = {}
+    debt_latest: Dict[str, Any] = {"year": None, "value": None, "source": "computed:NA/Timeout"}
+
+    # 1) Try the heavy service, but don't let it block the route
     try:
         from app.services.debt_service import compute_debt_payload
-        debt = _with_timeout(3.0, compute_debt_payload, country) or {}
+        heavy_debt = _with_timeout(2.0, compute_debt_payload, country) or {}
+        if heavy_debt.get("series"):
+            debt_series_full = heavy_debt.get("series") or {}
+            debt_latest = heavy_debt.get("latest") or debt_latest
     except Exception:
-        debt = {}
-    debt_series_full = (debt.get("series") or {})
+        # ignore any errors here; we fall back to WB
+        pass
+
+    # 2) If still empty, fall back to a direct World Bank debt-to-GDP ratio
+    if not debt_series_full:
+        # NOTE: GC.DOD.TOTL.GD.ZS is the standard WB code for
+        # "Central government debt, total (% of GDP)".
+        # If your wb_provider uses a different code, adjust here.
+        wb_debt = _wb_series_generic(country, "GC.DOD.TOTL.GD.ZS")
+        if wb_debt:
+            debt_series_full = wb_debt
+            period, value = _latest(wb_debt)
+            year_for_latest = None
+            if period:
+                year_for_latest = str(period).split("-")[0]
+            debt_latest = {
+                "year": year_for_latest,
+                "value": value,
+                "source": "World Bank (ratio)",
+            }
+
     debt_series = _trim_series_policy(debt_series_full, HIST_POLICY)
-    debt_latest = debt.get("latest") or {"year": None, "value": None, "source": "computed:NA/NA"}
+
 
     # ---- Quarterly GDP growth (compat) — keep_hint=12
     gdp_growth_q = _compat_fetch_series_retry("get_gdp_growth_quarterly", country, "Q", keep_hint=12)
