@@ -120,6 +120,7 @@ def _iso_codes(country: str) -> Dict[str, Optional[str]]:
     try:
         cc_mod = _safe_import("app.utils.country_codes")
         if cc_mod and hasattr(cc_mod, "get_country_codes"):
+            from typing import Mapping as _Mapping  # avoid mypy confusion
             codes = cc_mod.get_country_codes(country)
             if isinstance(codes, Mapping):
                 return {
@@ -140,16 +141,18 @@ def build_country_payload_v2(
     keep: int = 60,
 ) -> Dict[str, Any]:
     """
-    Modern builder: IMF-first monthly/quarterly indicators + debt bundle if available.
-    - `series`: none | mini | full   (affects series trimming)
-    - `keep`:   hard cap on returned points (monthly/quarterly/annual)
+    Modern builder for Country Radar:
+    - Compat-first IMF monthly/quarterly indicators (via app.providers.compat)
+    - Optional debt bundle via app.services.debt_service.compute_debt_payload
+    - Controlled history windows per indicator, clamped by `keep`
+
+    `series`:
+      - "none": only latest point per indicator
+      - "mini": short history (per-indicator policy, e.g. 36m FX/CPI)
+      - "full": up to `keep` points if `keep` > mini policy
     """
     # --- base ISO resolution
-    try:
-        from app.utils.country_codes import get_country_codes
-        iso = get_country_codes(country) or {}
-    except Exception:
-        iso = {"name": country, "iso_alpha_2": None, "iso_alpha_3": None, "iso_numeric": None}
+    iso = _iso_codes(country)
 
     # --- payload scaffold
     payload: Dict[str, Any] = {
@@ -162,7 +165,7 @@ def build_country_payload_v2(
             "iso_numeric": iso.get("iso_numeric"),
         },
         "series_mode": series,
-        "keep_days": keep,
+        "keep_points": keep,
         "indicators": {
             "cpi_yoy":          {"series": {}, "latest_period": None, "latest_value": None, "source": None, "freq": "monthly"},
             "unemployment_rate":{"series": {}, "latest_period": None, "latest_value": None, "source": None, "freq": "monthly"},
@@ -190,22 +193,54 @@ def build_country_payload_v2(
         "debt_to_gdp_series": {},
     }
 
-    # --- trim helper
-    def _trim_series(d: Dict[str, float]) -> Dict[str, float]:
+    # --- per-indicator history policy (mini/full caps), clamped by `keep`
+    # These are *soft* caps; the effective limit is min(policy, keep) where applicable.
+    history_policy = {
+        "cpi_yoy":          {"freq": "M", "mini": 36, "full": keep},
+        "unemployment_rate":{"freq": "M", "mini": 36, "full": keep},
+        "fx_rate_usd":      {"freq": "M", "mini": 36, "full": keep},
+        "reserves_usd":     {"freq": "M", "mini": 36, "full": keep},
+        "policy_rate":      {"freq": "M", "mini": 48, "full": keep},
+        "gdp_growth":       {"freq": "Q", "mini": 8,  "full": keep},
+    }
+
+    def _trim_series_for_indicator(name: str, d: Dict[str, float]) -> Dict[str, float]:
+        """Apply series-mode + per-indicator history policy with robust sorting."""
         if not d:
             return {}
         try:
-            keys = sorted(d.keys())
+            keys = sorted(d.keys(), key=_parse_period_key)
         except Exception:
             keys = list(d.keys())
+
+        if not keys:
+            return {}
+
         if series == "none":
             last = keys[-1]
             return {last: d[last]}
+
+        policy = history_policy.get(name, {"mini": keep, "full": keep})
         if series == "mini":
-            keys = keys[-min(len(keys), keep):]
-        elif keep and series == "full" and len(keys) > keep:
-            keys = keys[-keep:]
+            k_limit = min(policy.get("mini", keep), keep) if keep else policy.get("mini", keep)
+        else:  # "full"
+            k_limit = keep or policy.get("full", keep)
+
+        if k_limit and len(keys) > k_limit:
+            keys = keys[-k_limit:]
         return {k: d[k] for k in keys}
+
+    # --- tiny helper for setting indicator blocks
+    def _set_indicator_block(key: str, series_map: Dict[str, float], source_label: str) -> None:
+        block = payload["indicators"][key]
+        trimmed = _trim_series_for_indicator(key, series_map)
+        if not trimmed:
+            return
+        latest_key, latest_val = _latest(trimmed)
+        block["series"] = trimmed
+        block["latest_period"] = latest_key
+        block["latest_value"] = latest_val
+        block["source"] = source_label
 
     # --- indicators via compat (IMF/WB/ECB bridge)
     try:
@@ -217,31 +252,31 @@ def build_country_payload_v2(
             tried.setdefault(key, []).append({getter_name: bool(callable(getter))})
             if not callable(getter):
                 return
-            series_map = getter(country) or {}
-            series_map = _trim_series(series_map)
-            if not series_map:
+            try:
+                raw_series = getter(country) or {}
+            except Exception as e:
+                tried[key].append({getter_name: {"error": f"{type(e).__name__}: {e}"}})
                 return
-            latest_key = sorted(series_map.keys())[-1]
-            latest_val = series_map[latest_key]
-            payload["indicators"][key]["series"] = series_map
-            payload["indicators"][key]["latest_period"] = latest_key
-            payload["indicators"][key]["latest_value"] = latest_val
-            payload["indicators"][key]["source"] = src_label
+            # Compat returns already-normalized series; just trim + set
+            numeric_series = _coerce_numeric_series(raw_series)
+            if not numeric_series:
+                return
+            _set_indicator_block(key, numeric_series, src_label)
 
-        _fill("cpi_yoy",           "get_cpi_yoy_monthly",           "IMF")
-        _fill("unemployment_rate", "get_unemployment_rate_monthly",  "IMF")
-        _fill("fx_rate_usd",       "get_fx_rate_usd_monthly",        "IMF")
-        _fill("reserves_usd",      "get_reserves_usd_monthly",       "IMF")
-        _fill("policy_rate",       "get_policy_rate_monthly",        "IMF/ECB")
-        _fill("gdp_growth",        "get_gdp_growth_quarterly",       "IMF")
+        _fill("cpi_yoy",           "get_cpi_yoy_monthly",           "compat/IMF")
+        _fill("unemployment_rate", "get_unemployment_rate_monthly", "compat/IMF")
+        _fill("fx_rate_usd",       "get_fx_rate_usd_monthly",       "compat/IMF")
+        _fill("reserves_usd",      "get_reserves_usd_monthly",      "compat/IMF")
+        _fill("policy_rate",       "get_policy_rate_monthly",       "compat/IMF/ECB")
+        _fill("gdp_growth",        "get_gdp_growth_quarterly",      "compat/IMF")
 
         payload["_debug"]["source_trace"].update({
-            "cpi_yoy":           {"compat_imf": {"module": compat.__name__, "tried": tried.get("cpi_yoy", [])}},
-            "unemployment_rate": {"compat_imf": {"module": compat.__name__, "tried": tried.get("unemployment_rate", [])}},
-            "fx_rate_usd":       {"compat_imf": {"module": compat.__name__, "tried": tried.get("fx_rate_usd", [])}},
-            "reserves_usd":      {"compat_imf": {"module": compat.__name__, "tried": tried.get("reserves_usd", [])}},
-            "policy_rate":       {"compat_imf": {"module": compat.__name__, "tried": tried.get("policy_rate", [])}},
-            "gdp_growth":        {"compat_imf": {"module": compat.__name__, "tried": tried.get("gdp_growth", [])}},
+            "cpi_yoy":           {"compat": {"module": compat.__name__, "tried": tried.get("cpi_yoy", [])}},
+            "unemployment_rate": {"compat": {"module": compat.__name__, "tried": tried.get("unemployment_rate", [])}},
+            "fx_rate_usd":       {"compat": {"module": compat.__name__, "tried": tried.get("fx_rate_usd", [])}},
+            "reserves_usd":      {"compat": {"module": compat.__name__, "tried": tried.get("reserves_usd", [])}},
+            "policy_rate":       {"compat": {"module": compat.__name__, "tried": tried.get("policy_rate", [])}},
+            "gdp_growth":        {"compat": {"module": compat.__name__, "tried": tried.get("gdp_growth", [])}},
         })
     except Exception as e:
         payload["_debug"]["notes"].append(f"indicator_error:{type(e).__name__}:{e}")
@@ -253,40 +288,46 @@ def build_country_payload_v2(
 
         debt = _compute_debt_payload(country)
 
-        # Accept several shapes
         if isinstance(debt, dict):
-            # direct keys if present
+            # direct keys if present (newer debt_service versions)
             for key in ("government_debt", "nominal_gdp", "debt_to_gdp", "debt_to_gdp_series"):
                 if key in debt and isinstance(debt[key], dict):
                     payload[key] = debt[key]
 
-            # common simple shape
+            # common simple shape: {"latest": {...}, "series": {...}}
             if "latest" in debt and "series" in debt and not payload["debt_to_gdp"]["series"]:
+                latest_block = debt.get("latest") or {}
+                series_block = debt.get("series") or {}
                 payload["debt_to_gdp"] = {
                     "latest": {
-                        "value": (debt.get("latest") or {}).get("value"),
-                        "date":  (debt.get("latest") or {}).get("year") or (debt.get("latest") or {}).get("date"),
-                        "source": (debt.get("latest") or {}).get("source"),
+                        "value": latest_block.get("value"),
+                        "date":  latest_block.get("year") or latest_block.get("date"),
+                        "source": latest_block.get("source"),
                     },
-                    "series": debt.get("series") or {},
+                    "series": series_block,
                 }
-                payload["debt_to_gdp_series"] = debt.get("series") or {}
+                payload["debt_to_gdp_series"] = series_block
         else:
             payload["_debug"]["notes"].append("debt_payload_unrecognized_shape")
 
-        # trim annual series in debt blocks
+        # trim annual series in debt blocks using same `keep` semantics
         def _trim_annual(block: Dict[str, Any], field: str):
-            if field not in block or not isinstance(block[field], dict):
+            ser = block.get(field)
+            if not isinstance(ser, dict) or not ser:
                 return
-            d = block[field]
-            keys = sorted(d.keys())
+            keys = sorted(ser.keys(), key=_parse_period_key)
+            if not keys:
+                return
             if series == "none":
                 keys = keys[-1:]
             elif series == "mini":
-                keys = keys[-min(len(keys), keep):]
+                # annual mini: up to 20y or keep, whichever is smaller
+                annual_keep = min(20, keep) if keep else 20
+                if len(keys) > annual_keep:
+                    keys = keys[-annual_keep:]
             elif keep and series == "full" and len(keys) > keep:
                 keys = keys[-keep:]
-            block[field] = {k: d[k] for k in keys}
+            block[field] = {k: ser[k] for k in keys}
 
         _trim_annual(payload["debt_to_gdp"], "series")
         _trim_annual(payload["government_debt"], "series")
@@ -301,4 +342,10 @@ def build_country_payload_v2(
 
 def build_country_payload(country: str, series: str = "mini", keep: int = 60) -> Dict[str, Any]:
     """Compatibility wrapper for legacy callers—delegate to v2 with same signature."""
-    return build_country_payload_v2(country=country, series=series, keep=keep)
+    # keep type-safety for `series` by constraining to allowed literals
+    mode: Literal["none", "mini", "full"]
+    if series not in ("none", "mini", "full"):
+        mode = "mini"
+    else:
+        mode = series  # type: ignore[assignment]
+    return build_country_payload_v2(country=country, series=mode, keep=keep)
