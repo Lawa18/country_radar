@@ -5,6 +5,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 import time as _time
 import threading
 import concurrent.futures as _fut
+from datetime import date as _date
 
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
@@ -19,6 +20,7 @@ _COUNTRY_TTL = 600.0  # 10 minutes
 _LOCKS: Dict[str, threading.Lock] = {}
 _GLOBAL_LOCK = threading.Lock()
 
+
 def _get_lock(key: str) -> threading.Lock:
     with _GLOBAL_LOCK:
         lk = _LOCKS.get(key)
@@ -27,24 +29,35 @@ def _get_lock(key: str) -> threading.Lock:
             _LOCKS[key] = lk
         return lk
 
+
 def _cache_get(country: str) -> Optional[Dict[str, Any]]:
-    row = _COUNTRY_CACHE.get(country.lower())
-    if not row:
-        return None
-    ts, payload = row
-    if _time.time() - ts > _COUNTRY_TTL:
-        return None
-    return payload
+    lk = _get_lock(country)
+    with lk:
+        row = _COUNTRY_CACHE.get(country)
+        if not row:
+            return None
+        ts, payload = row
+        if _time.time() - ts > _COUNTRY_TTL:
+            try:
+                del _COUNTRY_CACHE[country]
+            except Exception:
+                pass
+            return None
+        return payload
+
 
 def _cache_set(country: str, payload: Dict[str, Any]) -> None:
-    _COUNTRY_CACHE[country.lower()] = (_time.time(), payload)
+    lk = _get_lock(country)
+    with lk:
+        _COUNTRY_CACHE[country] = (_time.time(), payload)
 
-# -------------------- helpers --------------------
+
 def _safe_import(module: str):
     try:
         return __import__(module, fromlist=["*"])
     except Exception:
         return None
+
 
 def _coerce_numeric_series(d: Optional[Mapping[str, Any]]) -> Dict[str, float]:
     out: Dict[str, float] = {}
@@ -56,6 +69,7 @@ def _coerce_numeric_series(d: Optional[Mapping[str, Any]]) -> Dict[str, float]:
         except Exception:
             pass
     return out
+
 
 def _parse_period_key(p: str) -> Tuple[int, int, int]:
     try:
@@ -72,12 +86,14 @@ def _parse_period_key(p: str) -> Tuple[int, int, int]:
     except Exception:
         return (0, 0, 0)
 
+
 def _latest(d: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
     if not d:
         return None, None
     ks = sorted(d.keys(), key=_parse_period_key)
     k = ks[-1]
     return k, d[k]
+
 
 def _freq_of_key(k: str) -> str:
     s = str(k)
@@ -88,6 +104,7 @@ def _freq_of_key(k: str) -> str:
         if len(parts) >= 2 and parts[0].isdigit():
             return "M"
     return "A"
+
 
 def _trim_series_policy(series: Mapping[str, float], policy: Dict[str, int]) -> Dict[str, float]:
     if not series:
@@ -107,6 +124,72 @@ def _trim_series_policy(series: Mapping[str, float], policy: Dict[str, int]) -> 
         take = ordered[-keep:] if keep > 0 else ordered
         out.update(dict(take))
     return dict(sorted(out.items(), key=lambda kv: _parse_period_key(kv[0])))
+
+# -------------------- recency helpers --------------------
+def _period_to_date(period: Optional[str]) -> _date:
+    """Convert a period like "YYYY", "YYYY-MM" or "YYYY-Qn" into a date.
+
+    We only care about relative age in months, not exact day.
+    """
+    if not period:
+        # Something obviously old so it fails freshness checks
+        return _date(1900, 1, 1)
+    s = str(period)
+
+    # Quarterly form: 'YYYY-Qn'
+    if "-Q" in s:
+        try:
+            year_str, q_str = s.split("-Q", 1)
+            y = int(year_str)
+            q = int(q_str)
+            month = (q - 1) * 3 + 2  # Q1->Feb, Q2->May, etc.
+            month = max(1, min(12, month))
+            return _date(y, month, 1)
+        except Exception:
+            return _date(1900, 1, 1)
+
+    parts = s.split("-")
+    try:
+        if len(parts) == 2:
+            y, m = map(int, parts)
+            m = max(1, min(12, m))
+            return _date(y, m, 1)
+        # plain 'YYYY'
+        y = int(s)
+        return _date(y, 1, 1)
+    except Exception:
+        return _date(1900, 1, 1)
+
+
+def _is_recent_period(
+    period: Optional[str],
+    *,
+    max_age_months: Optional[int] = None,
+    max_age_years: Optional[int] = None,
+    today: Optional[_date] = None,
+) -> bool:
+    """Return True if the given period is recent enough.
+
+    If neither max_age_months nor max_age_years is provided, the period is
+    treated as always fresh.
+    """
+    if period is None:
+        return False
+
+    d = _period_to_date(period)
+    today = today or _date.today()
+
+    total_today = today.year * 12 + today.month
+    total_d = d.year * 12 + d.month
+    diff_months = total_today - total_d
+
+    if max_age_months is not None:
+        return diff_months <= max_age_months
+    if max_age_years is not None:
+        return diff_months <= max_age_years * 12
+
+    return True
+
 
 def _iso_codes(country: str) -> Dict[str, Optional[str]]:
     try:
@@ -140,14 +223,12 @@ def _compat_fetch_series(func_name: str, country: str, keep_hint: int) -> Dict[s
                     raw = fn(**kwargs) or {}
                     if raw:
                         break
-                except TypeError:
-                    continue
                 except Exception:
                     continue
-    return _trim_series_policy(_coerce_numeric_series(raw), HIST_POLICY)
+    return _coerce_numeric_series(raw)
+
 
 def _imf_fetch_series(func_name: str, country: str) -> Dict[str, float]:
-    """Direct IMF provider fallback if compat returns empty."""
     mod = _safe_import("app.providers.imf_provider")
     if not mod:
         return {}
@@ -155,32 +236,11 @@ def _imf_fetch_series(func_name: str, country: str) -> Dict[str, float]:
     if not callable(fn):
         return {}
     try:
-        raw = fn(country=country) or {}
-        return _trim_series_policy(_coerce_numeric_series(raw), HIST_POLICY)
+        raw = fn(country)
+        return _coerce_numeric_series(raw)
     except Exception:
         return {}
 
-def _yoy_from_index(idx: Mapping[str, float]) -> Dict[str, float]:
-    """Compute YoY % from a monthly index series."""
-    if not idx:
-        return {}
-    # ensure sorted
-    keys = sorted(idx.keys(), key=_parse_period_key)
-    out: Dict[str, float] = {}
-    # map year-month → value
-    vals = {k: float(idx[k]) for k in keys}
-    for k in keys:
-        # find same month -12
-        try:
-            y, m = str(k).split("-")[:2]
-            y0, m0 = int(y), int(m)
-            y_prev = y0 - 1
-            k_prev = f"{y_prev:04d}-{m0:02d}"
-            if k_prev in vals and vals[k_prev] != 0:
-                out[k] = (vals[k] / vals[k_prev] - 1.0) * 100.0
-        except Exception:
-            continue
-    return _trim_series_policy(out, HIST_POLICY)
 
 def _wb_fallback_series(country: str, indicator_code: str) -> Dict[str, float]:
     try:
@@ -202,9 +262,11 @@ def _wb_fallback_series(country: str, indicator_code: str) -> Dict[str, float]:
     except Exception:
         return {}
 
+
 # Thread pool for parallel fetch
 _EXEC = _fut.ThreadPoolExecutor(max_workers=8)
 _PER_TASK_TIMEOUT = 3.0  # seconds, keep low to avoid 17s total waits
+
 
 def _fetch_all_parallel(country: str, timing: Dict[str, int]) -> Dict[str, Dict[str, float]]:
     def timed(label: str, fn):
@@ -272,6 +334,24 @@ def _fetch_all_parallel(country: str, timing: Dict[str, int]) -> Dict[str, Dict[
 
     return out
 
+
+def _yoy_from_index(index_series: Mapping[str, float]) -> Dict[str, float]:
+    """Compute YoY % change from an index-like series."""
+    if not index_series:
+        return {}
+    keys = sorted(index_series.keys(), key=_parse_period_key)
+    out: Dict[str, float] = {}
+    for i, k in enumerate(keys):
+        if i < 12:
+            continue
+        k_prev = keys[i - 12]
+        try:
+            v = (index_series[k] / index_series[k_prev] - 1.0) * 100.0
+            out[str(k)] = float(v)
+        except Exception:
+            continue
+    return out
+
 # -------------------- route --------------------
 @router.get("/v1/country-lite", summary="Country Lite")
 def country_lite(
@@ -299,6 +379,17 @@ def country_lite(
     debt_series_full = debt.get("series") or {}
     debt_series = _trim_series_policy(debt_series_full, HIST_POLICY)
     debt_latest = debt.get("latest") or {"year": None, "value": None, "source": "unavailable"}
+    # Recency filter for debt: drop very old debt-to-GDP points
+    debt_year = debt_latest.get("year")
+    try:
+        debt_year_str = str(debt_year) if debt_year is not None else None
+    except Exception:
+        debt_year_str = None
+    if debt_year_str and not _is_recent_period(debt_year_str, max_age_years=5):
+        # Treat as unavailable if older than the recency window
+        debt_series = {}
+        debt_latest = {"year": None, "value": None, "source": debt_latest.get("source")}
+
     t_debt1 = _time.time()
 
     # parallel compat + fallbacks
@@ -318,6 +409,33 @@ def country_lite(
     gdpq_p, gdpq_v = _kvl(series["gdp_q"])
     cab_p, cab_v   = _kvl(series["cab_a"])
     ge_p, ge_v     = _kvl(series["ge_a"])
+
+    # Recency filters for macro indicators: avoid surfacing very old data
+    _now = _date.today()
+    if cpi_p is not None and not _is_recent_period(cpi_p, max_age_months=6, today=_now):
+        series["cpi_m"] = {}
+        cpi_p, cpi_v = None, None
+    if une_p is not None and not _is_recent_period(une_p, max_age_months=12, today=_now):
+        series["une_m"] = {}
+        une_p, une_v = None, None
+    if fx_p is not None and not _is_recent_period(fx_p, max_age_months=3, today=_now):
+        series["fx_m"] = {}
+        fx_p, fx_v = None, None
+    if res_p is not None and not _is_recent_period(res_p, max_age_months=12, today=_now):
+        series["res_m"] = {}
+        res_p, res_v = None, None
+    if pol_p is not None and not _is_recent_period(pol_p, max_age_months=6, today=_now):
+        series["policy_m"] = {}
+        pol_p, pol_v = None, None
+    if gdpq_p is not None and not _is_recent_period(gdpq_p, max_age_months=6, today=_now):
+        series["gdp_q"] = {}
+        gdpq_p, gdpq_v = None, None
+    if cab_p is not None and not _is_recent_period(cab_p, max_age_years=3, today=_now):
+        series["cab_a"] = {}
+        cab_p, cab_v = None, None
+    if ge_p is not None and not _is_recent_period(ge_p, max_age_years=4, today=_now):
+        series["ge_a"] = {}
+        ge_p, ge_v = None, None
 
     payload: Dict[str, Any] = {
         "country": country,
