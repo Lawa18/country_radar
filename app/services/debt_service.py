@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
+from datetime import date as _date
+
 
 def _safe_import(path: str):
     try:
         return __import__(path, fromlist=["*"])
     except Exception:
         return None
+
 
 def _get_iso3(country: str) -> Optional[str]:
     cc_mod = _safe_import("app.utils.country_codes")
@@ -23,10 +26,9 @@ def _get_iso3(country: str) -> Optional[str]:
         or codes.get("iso3")
     )
 
+
 def _wb_years(iso3: str, code: str) -> Dict[str, float]:
-    """
-    Thin wrapper over wb_provider: fetch a WB indicator and return {year: float}.
-    """
+    """Thin wrapper over wb_provider: fetch a WB indicator and return {year: float}."""
     wb_mod = _safe_import("app.providers.wb_provider")
     if not wb_mod:
         return {}
@@ -36,9 +38,23 @@ def _wb_years(iso3: str, code: str) -> Dict[str, float]:
     except Exception:
         return {}
 
-def compute_debt_payload(country: str) -> Dict[str, Any]:
+
+def _is_recent_year(year: Any, *, max_age_years: int = 5, today: Optional[_date] = None) -> bool:
+    """Return True if a given year is within max_age_years of today.
+
+    This is a light guardrail so that extremely old ratios (e.g. a single
+    observation in 1990) are not surfaced as current Debt-to-GDP values.
     """
-    Compute a normalized debt bundle for a country.
+    try:
+        y = int(str(year))
+    except Exception:
+        return False
+    today = today or _date.today()
+    return (today.year - y) <= max_age_years
+
+
+def compute_debt_payload(country: str) -> Dict[str, Any]:
+    """Compute a normalized debt bundle for a country.
 
     For now we:
       - Use World Bank GC.DOD.TOTL.GD.ZS (central gov debt % of GDP) as
@@ -66,6 +82,14 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
     # World Bank: central gov debt % of GDP
     # https://api.worldbank.org/v2/country/MEX/indicator/GC.DOD.TOTL.GD.ZS
     ratio_series = _wb_years(iso3, "GC.DOD.TOTL.GD.ZS")
+
+    # If the series exists but the latest observation is very old, treat it
+    # as effectively unavailable to avoid surfacing 1990-style values.
+    if ratio_series:
+        years = sorted(ratio_series.keys())
+        latest_year = years[-1]
+        if not _is_recent_year(latest_year, max_age_years=5):
+            ratio_series = {}
 
     if ratio_series:
         years = sorted(ratio_series.keys())
@@ -107,5 +131,6 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
         "debt_to_gdp": debt_to_gdp_block,
         "debt_to_gdp_series": debt_to_gdp_series,
     }
+
 
 __all__ = ["compute_debt_payload"]
