@@ -1,4 +1,5 @@
 # app/services/indicator_service.py — v2 builder using provider compat shim
+from app.services.indicator_matrix import INDICATOR_MATRIX
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Literal
