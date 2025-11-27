@@ -32,24 +32,52 @@ def _get_iso3(country: str) -> Optional[str]:
     )
 
 
-def _get_iso_codes(country: str) -> Dict[str, Optional[str]]:
-    """Return a small iso code bundle for the given country name.
+def _get_iso_codes(country_or_code: str) -> Dict[str, Optional[str]]:
+    """Return a small iso code bundle for the given input.
 
-    This is the single source of truth for resolving iso2/iso3 inside this
-    module. It uses the same app.utils.country_codes.get_country_codes helper
-    as _get_iso3, but exposes both ISO2 and ISO3 codes for downstream use.
+    The input may be:
+      - full country name ("Mexico")
+      - ISO2 ("US", "DE")
+      - ISO3 ("USA", "MEX", "DEU")
+
+    We first try app.utils.country_codes.get_country_codes; if that fails
+    to give us usable iso2/iso3, we fall back to some simple heuristics
+    based on the string shape and the legacy _get_iso3 helper.
     """
+    name = country_or_code
+    iso2: Optional[str] = None
+    iso3: Optional[str] = None
+
     cc_mod = _safe_import("app.utils.country_codes")
-    if not cc_mod or not hasattr(cc_mod, "get_country_codes"):
-        return {"name": country, "iso_alpha_2": None, "iso_alpha_3": None}
-    try:
-        codes = cc_mod.get_country_codes(country) or {}
-    except Exception:
-        codes = {}
+    if cc_mod and hasattr(cc_mod, "get_country_codes"):
+        try:
+            codes = cc_mod.get_country_codes(country_or_code) or {}
+        except Exception:
+            codes = {}
+        name = codes.get("name") or name
+        iso2 = codes.get("iso_alpha_2") or codes.get("alpha2") or codes.get("iso2")
+        iso3 = codes.get("iso_alpha_3") or codes.get("alpha3") or codes.get("iso3")
+
+    # If we still don't have iso2/iso3, apply simple heuristics:
+    s = str(country_or_code).strip()
+    if not iso2 and not iso3 and len(s) in (2, 3) and s.isalpha():
+        s_up = s.upper()
+        if len(s_up) == 2:
+            iso2 = s_up
+        elif len(s_up) == 3:
+            iso3 = s_up
+
+    # As an extra safeguard, use the legacy _get_iso3 behaviour if iso3 is
+    # still missing and the caller passed a name or code we've seen before.
+    if not iso3:
+        legacy_iso3 = _get_iso3(country_or_code)
+        if legacy_iso3:
+            iso3 = legacy_iso3
+
     return {
-        "name": codes.get("name") or country,
-        "iso_alpha_2": codes.get("iso_alpha_2") or codes.get("alpha2") or codes.get("iso2"),
-        "iso_alpha_3": codes.get("iso_alpha_3") or codes.get("alpha3") or codes.get("iso3"),
+        "name": name,
+        "iso_alpha_2": iso2,
+        "iso_alpha_3": iso3,
     }
 
 
@@ -165,7 +193,11 @@ def _eurostat_debt_to_gdp_annual(iso2: str) -> Dict[str, float]:
 
 
 def compute_debt_payload(country: str) -> Dict[str, Any]:
-    """Compute a normalized debt bundle for a country.
+    """Compute a normalized debt bundle for a country or ISO code.
+
+    The `country` argument may be a country name ("Mexico") or an ISO2/ISO3
+    code ("MX", "MEX"). We resolve iso2/iso3 using app.utils.country_codes
+    plus some simple heuristics.
 
     Source hierarchy for Debt-to-GDP (% of GDP):
 
@@ -180,7 +212,7 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
     chosen series is older than max_age_years (default 5), we treat the series
     as unavailable instead of surfacing a very old value.
 
-    The returned dict matches what indicator_service.py expects:
+    The returned dict matches what indicator_service.py and country_lite expect:
       {
         "government_debt": { "latest": {...}, "series": {...} },
         "nominal_gdp":     { "latest": {...}, "series": {...} },
@@ -213,11 +245,22 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
             source = "Eurostat (general government gross debt % of GDP)"
 
     # 3) World Bank – last fallback, central gov debt % of GDP
+    #    If we still have no series but we do have iso3, try GC.DOD.TOTL.GD.ZS.
     if not ratio_series and iso3:
         wb_series = _wb_years(iso3, "GC.DOD.TOTL.GD.ZS")
         if wb_series:
             ratio_series = _to_float_year_dict(wb_series)
             source = "World Bank (GC.DOD.TOTL.GD.ZS)"
+
+    # If we STILL have nothing and the `country` argument itself looks like an
+    # ISO3 code, make one last attempt to use it directly for the WB fallback.
+    if not ratio_series and not iso3:
+        s = str(country).strip()
+        if len(s) == 3 and s.isalpha():
+            wb_series = _wb_years(s.upper(), "GC.DOD.TOTL.GD.ZS")
+            if wb_series:
+                ratio_series = _to_float_year_dict(wb_series)
+                source = "World Bank (GC.DOD.TOTL.GD.ZS)"
 
     # Recency guardrail – avoid surfacing very old single observations
     latest_year: Optional[str] = None
