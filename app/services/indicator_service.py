@@ -1,22 +1,25 @@
-# app/services/indicator_service.py — v2 builder using provider compat shim
+# app/services/indicator_service.py — v2 builder + matrix indicators
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Literal
 import math
 from datetime import date
+
 from app.services.indicator_matrix import INDICATOR_MATRIX
 
-# add near top of indicator_service.py
 try:
     from app.services.debt_service import compute_debt_payload as _compute_debt_payload
 except Exception:  # keep the module import non-fatal
     _compute_debt_payload = None
 
-# ----------------------- utils: imports & coercion ----------------------------
+
+# -----------------------------------------------------------------------------
+# utils: imports & coercion
+# -----------------------------------------------------------------------------
 
 def _safe_import(path: str):
     try:
-        module = __import__(path, fromlist=['*'])
+        module = __import__(path, fromlist=["*"])
         return module
     except Exception:
         return None
@@ -44,7 +47,7 @@ def _to_float_map(d: Any) -> Dict[str, float]:
                 continue
         return out
     if isinstance(d, Iterable) and not isinstance(d, (str, bytes)):
-        out = {}
+        out: Dict[str, float] = {}
         for i, v in enumerate(d):
             try:
                 if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
@@ -95,6 +98,7 @@ def _latest(d: Mapping[str, float]) -> Tuple[str, float]:
     k = ks[-1]
     return k, d[k]
 
+
 def _trim_by_keep(series: Dict[str, float], keep: int) -> Dict[str, float]:
     if keep <= 0 or not series:
         return series
@@ -102,6 +106,7 @@ def _trim_by_keep(series: Dict[str, float], keep: int) -> Dict[str, float]:
     if len(keys) <= keep:
         return series
     return {k: series[k] for k in keys[-keep:]}
+
 
 def _apply_series_mode(series: Dict[str, float], mode: Literal["none", "mini", "full"], keep: int) -> Dict[str, float]:
     """Apply mini/full/none mode and keep trimming to a series."""
@@ -113,7 +118,10 @@ def _apply_series_mode(series: Dict[str, float], mode: Literal["none", "mini", "
     # full: respect the global `keep` parameter
     return _trim_by_keep(series, keep=keep)
 
-# -------------------- provider call helper (fixed interface) ------------------
+
+# -----------------------------------------------------------------------------
+# provider call helper (existing compat / IMF interface)
+# -----------------------------------------------------------------------------
 
 def _call_provider(
     module: str,
@@ -151,7 +159,10 @@ def _call_provider(
             continue
     return {}, {"used": None, "tried": tried}
 
-# --------------------------- builder v2 (core) --------------------------------
+
+# -----------------------------------------------------------------------------
+# ISO resolution
+# -----------------------------------------------------------------------------
 
 def _resolve_iso(country: str) -> Dict[str, Any]:
     """
@@ -160,10 +171,6 @@ def _resolve_iso(country: str) -> Dict[str, Any]:
     We keep this logic inside the service to decouple routes from provider
     details. The compat provider is responsible for fuzzy matching etc.
     """
-    series, dbg = _call_provider("app.providers.compat", ("resolve_iso",), query=country)
-    # compat.resolve_iso returns a dict; but _call_provider normalises outputs
-    # to a dict-of-floats shape, which is not what we want here. Instead, we
-    # call compat directly under a try/except.
     try:
         mod = _safe_import("app.providers.compat")
         fn = _safe_get_attr(mod, "resolve_iso")
@@ -184,7 +191,16 @@ def _resolve_iso(country: str) -> Dict[str, Any]:
         }
 
 
-def _init_payload(country: str, iso: Dict[str, Any], series: Literal["none", "mini", "full"], keep: int) -> Dict[str, Any]:
+# -----------------------------------------------------------------------------
+# payload init
+# -----------------------------------------------------------------------------
+
+def _init_payload(
+    country: str,
+    iso: Dict[str, Any],
+    series: Literal["none", "mini", "full"],
+    keep: int,
+) -> Dict[str, Any]:
     return {
         "country": {
             "input": country,
@@ -195,23 +211,73 @@ def _init_payload(country: str, iso: Dict[str, Any], series: Literal["none", "mi
         },
         "series_mode": series,
         "keep_points": keep,
+        # legacy macro indicators (IMF compat)
         "indicators": {
-            "cpi_yoy":          {"series": {}, "latest_period": None, "latest_value": None, "source": None, "freq": "monthly"},
-            "unemployment_rate":{"series": {}, "latest_period": None, "latest_value": None, "source": None, "freq": "monthly"},
-            "fx_rate_usd":      {"series": {}, "latest_period": None, "latest_value": None, "source": None, "freq": "monthly"},
-            "reserves_usd":     {"series": {}, "latest_period": None, "latest_value": None, "source": None, "freq": "monthly"},
-            "policy_rate":      {"series": {}, "latest_period": None, "latest_value": None, "source": None, "freq": "monthly"},
-            "gdp_growth":       {"series": {}, "latest_period": None, "latest_value": None, "source": None, "freq": "quarterly"},
+            "cpi_yoy": {
+                "series": {},
+                "latest_period": None,
+                "latest_value": None,
+                "source": None,
+                "freq": "monthly",
+            },
+            "unemployment_rate": {
+                "series": {},
+                "latest_period": None,
+                "latest_value": None,
+                "source": None,
+                "freq": "monthly",
+            },
+            "fx_rate_usd": {
+                "series": {},
+                "latest_period": None,
+                "latest_value": None,
+                "source": None,
+                "freq": "monthly",
+            },
+            "reserves_usd": {
+                "series": {},
+                "latest_period": None,
+                "latest_value": None,
+                "source": None,
+                "freq": "monthly",
+            },
+            "policy_rate": {
+                "series": {},
+                "latest_period": None,
+                "latest_value": None,
+                "source": None,
+                "freq": "monthly",
+            },
+            "gdp_growth": {
+                "series": {},
+                "latest_period": None,
+                "latest_value": None,
+                "source": None,
+                "freq": "quarterly",
+            },
         },
+        # new matrix-based indicator blocks (TE-style KPIs)
+        "indicators_matrix": {},
+        # debt bundle
         "debt": {
-            "government_debt": {"latest": {"value": None, "date": None, "source": None}, "series": {}},
-            "nominal_gdp":     {"latest": {"value": None, "date": None, "source": None}, "series": {}},
-            "debt_to_gdp":     {"latest": {"value": None, "date": None, "source": "computed:NA/NA"}, "series": {}},
+            "government_debt": {
+                "latest": {"value": None, "date": None, "source": None},
+                "series": {},
+            },
+            "nominal_gdp": {
+                "latest": {"value": None, "date": None, "source": None},
+                "series": {},
+            },
+            "debt_to_gdp": {
+                "latest": {"value": None, "date": None, "source": "computed:NA/NA"},
+                "series": {},
+            },
             "debt_to_gdp_series": {},
         },
         "_debug": {
             "iso": iso,
             "providers": {},
+            "matrix": {},
         },
     }
 
@@ -225,7 +291,7 @@ def _attach_series_block(
     series_mode: Literal["none", "mini", "full"],
     keep: int,
 ) -> None:
-    """Helper to attach time series and metadata for a given indicator."""
+    """Helper to attach time series and metadata for a given legacy indicator."""
     ind = payload["indicators"][indicator_key]
     trimmed = _apply_series_mode(series, series_mode, keep)
     if not trimmed:
@@ -237,6 +303,10 @@ def _attach_series_block(
     ind["source"] = source_label
 
 
+# -----------------------------------------------------------------------------
+# legacy macro population (IMF compat)
+# -----------------------------------------------------------------------------
+
 def _populate_macro_blocks(
     payload: Dict[str, Any],
     iso: Dict[str, Any],
@@ -245,7 +315,6 @@ def _populate_macro_blocks(
     keep: int,
 ) -> None:
     iso2 = iso.get("iso_alpha_2")
-    iso3 = iso.get("iso_alpha_3")
     dbg_root = payload["_debug"]["providers"]
 
     # CPI YoY
@@ -257,8 +326,12 @@ def _populate_macro_blocks(
     cpi_series = _apply_series_mode(cpi_series, series_mode, keep)
     if cpi_series:
         _attach_series_block(
-            payload, "cpi_yoy", cpi_series, "IMF (compat)",
-            series_mode=series_mode, keep=keep,
+            payload,
+            "cpi_yoy",
+            cpi_series,
+            "IMF (compat)",
+            series_mode=series_mode,
+            keep=keep,
         )
     dbg_root["cpi_yoy"] = cpi_dbg
 
@@ -271,8 +344,12 @@ def _populate_macro_blocks(
     unemp_series = _apply_series_mode(unemp_series, series_mode, keep)
     if unemp_series:
         _attach_series_block(
-            payload, "unemployment_rate", unemp_series, "IMF (compat)",
-            series_mode=series_mode, keep=keep,
+            payload,
+            "unemployment_rate",
+            unemp_series,
+            "IMF (compat)",
+            series_mode=series_mode,
+            keep=keep,
         )
     dbg_root["unemployment_rate"] = unemp_dbg
 
@@ -285,8 +362,12 @@ def _populate_macro_blocks(
     fx_series = _apply_series_mode(fx_series, series_mode, keep)
     if fx_series:
         _attach_series_block(
-            payload, "fx_rate_usd", fx_series, "IMF (compat)",
-            series_mode=series_mode, keep=keep,
+            payload,
+            "fx_rate_usd",
+            fx_series,
+            "IMF (compat)",
+            series_mode=series_mode,
+            keep=keep,
         )
     dbg_root["fx_rate_usd"] = fx_dbg
 
@@ -299,8 +380,12 @@ def _populate_macro_blocks(
     res_series = _apply_series_mode(res_series, series_mode, keep)
     if res_series:
         _attach_series_block(
-            payload, "reserves_usd", res_series, "IMF (compat)",
-            series_mode=series_mode, keep=keep,
+            payload,
+            "reserves_usd",
+            res_series,
+            "IMF (compat)",
+            series_mode=series_mode,
+            keep=keep,
         )
     dbg_root["reserves_usd"] = res_dbg
 
@@ -313,8 +398,12 @@ def _populate_macro_blocks(
     pol_series = _apply_series_mode(pol_series, series_mode, keep)
     if pol_series:
         _attach_series_block(
-            payload, "policy_rate", pol_series, "IMF (compat)",
-            series_mode=series_mode, keep=keep,
+            payload,
+            "policy_rate",
+            pol_series,
+            "IMF (compat)",
+            series_mode=series_mode,
+            keep=keep,
         )
     dbg_root["policy_rate"] = pol_dbg
 
@@ -327,11 +416,19 @@ def _populate_macro_blocks(
     gdp_series = _apply_series_mode(gdp_series, series_mode, keep)
     if gdp_series:
         _attach_series_block(
-            payload, "gdp_growth", gdp_series, "IMF (compat)",
-            series_mode=series_mode, keep=keep,
+            payload,
+            "gdp_growth",
+            gdp_series,
+            "IMF (compat)",
+            series_mode=series_mode,
+            keep=keep,
         )
     dbg_root["gdp_growth"] = gdp_dbg
 
+
+# -----------------------------------------------------------------------------
+# debt block
+# -----------------------------------------------------------------------------
 
 def _populate_debt_block(payload: Dict[str, Any], iso: Dict[str, Any]) -> None:
     if _compute_debt_payload is None:
@@ -348,15 +445,12 @@ def _populate_debt_block(payload: Dict[str, Any], iso: Dict[str, Any]) -> None:
         if not isinstance(debt_payload, Mapping):
             raise TypeError("compute_debt_payload returned non-mapping")
 
-        # Expect shape: {"government_debt": {...}, "nominal_gdp": {...}, "debt_to_gdp": {...}}
         debt_block = payload.get("debt", {})
-        # Government debt
+
         if "government_debt" in debt_payload:
             debt_block["government_debt"] = debt_payload["government_debt"]
-        # Nominal GDP
         if "nominal_gdp" in debt_payload:
             debt_block["nominal_gdp"] = debt_payload["nominal_gdp"]
-        # Debt-to-GDP (latest + series)
         if "debt_to_gdp" in debt_payload:
             debt_block["debt_to_gdp"] = debt_payload["debt_to_gdp"]
         if "debt_to_gdp_series" in debt_payload:
@@ -367,7 +461,272 @@ def _populate_debt_block(payload: Dict[str, Any], iso: Dict[str, Any]) -> None:
     except Exception as e:
         payload["_debug"]["debt_error"] = repr(e)
 
-# --------------------------- builder v2 (core) continued ----------------------
+
+# -----------------------------------------------------------------------------
+# NEW: indicator matrix integration
+# -----------------------------------------------------------------------------
+
+def _apply_transform(series: Dict[str, float], transform: Optional[str]) -> Dict[str, float]:
+    """
+    Apply simple transforms like yoy, mom, qoq, ratio.
+
+    This is deliberately generic; for monthly/quarterly vs annual we rely on the
+    input series ordering, not full calendar logic. Good enough for v1.
+    """
+    if not series or not transform or transform == "none":
+        return series
+
+    keys = sorted(series.keys(), key=_parse_period_key)
+    if len(keys) < 2:
+        return series
+
+    def _pct_change(prev: float, curr: float) -> float:
+        if prev in (0.0, 0):
+            return 0.0
+        return (curr / prev - 1.0) * 100.0
+
+    if transform in ("yoy", "mom", "qoq"):
+        out: Dict[str, float] = {}
+        prev_key = None
+        prev_val = None
+        for k in keys:
+            v = series[k]
+            if prev_key is None:
+                prev_key, prev_val = k, v
+                continue
+            out[k] = _pct_change(prev_val, v)  # type: ignore[arg-type]
+            prev_key, prev_val = k, v
+        return out
+
+    # "ratio": assume upstream already computed numerator/denominator
+    # and provided final % series, so we just return as-is.
+    return series
+
+
+def _fetch_series_from_matrix_source(iso: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Given an ISO dict and a SourceSpec from INDICATOR_MATRIX, try to
+    return a {period -> float} dict from the appropriate provider.
+
+    All branches are defensive: if the provider or function isn't there,
+    we just return {} so the next source can be tried.
+    """
+    provider = src.get("provider")
+    dataset = src.get("dataset")
+    indicator = src.get("indicator")
+    func_name = src.get("func")
+
+    iso2 = iso.get("iso_alpha_2")
+    iso3 = iso.get("iso_alpha_3") or iso.get("iso_numeric")
+
+    # IMF
+    if provider == "imf":
+        mod = _safe_import("app.providers.imf_provider")
+        if not mod or not iso2:
+            return {}
+        # If a specific helper is given (e.g. imf_cpi_yoy_monthly), use it:
+        if func_name and hasattr(mod, func_name):
+            try:
+                fn = getattr(mod, func_name)
+                raw = fn(iso2=iso2)
+                return _to_float_map(raw)
+            except Exception:
+                return {}
+        # Otherwise, you can later add a generic IMF series fetcher here
+        return {}
+
+    # World Bank
+    if provider == "world_bank":
+        mod = _safe_import("app.providers.wb_provider")
+        if not mod or not iso3 or not indicator:
+            return {}
+        # Guard for function existence
+        fetch_raw = _safe_get_attr(mod, "fetch_wb_indicator_raw")
+        as_year_dict = _safe_get_attr(mod, "wb_year_dict_from_raw")
+        if not fetch_raw or not as_year_dict:
+            return {}
+        try:
+            raw = fetch_raw(iso3, indicator)
+            return as_year_dict(raw) or {}
+        except Exception:
+            return {}
+
+    # Eurostat
+    if provider == "eurostat":
+        mod = _safe_import("app.providers.eurostat_provider")
+        if not mod:
+            return {}
+        # You can later wire dataset+indicator to a generic eurostat helper
+        return {}
+
+    # OECD
+    if provider == "oecd":
+        mod = _safe_import("app.providers.oecd_provider")
+        if not mod or not iso3:
+            return {}
+        series = _safe_get_attr(mod, "oecd_series")
+        if not series:
+            return {}
+        try:
+            raw = series(iso3=iso3, indicator=indicator or "")
+            return _to_float_map(raw)
+        except Exception:
+            return {}
+
+    # GMD
+    if provider == "gmd":
+        mod = _safe_import("app.providers.gmd_provider")
+        if not mod or not iso3:
+            return {}
+        gmd_series = _safe_get_attr(mod, "gmd_series")
+        if not gmd_series:
+            return {}
+        try:
+            raw = gmd_series(iso3=iso3, indicator=indicator or "")
+            return _to_float_map(raw)
+        except Exception:
+            return {}
+
+    # ECB
+    if provider == "ecb":
+        mod = _safe_import("app.providers.ecb_provider")
+        if not mod:
+            return {}
+        # TODO: call your existing ECB helpers for FX/policy rate
+        return {}
+
+    # DBnomics
+    if provider == "dbnomics":
+        mod = _safe_import("app.providers.dbnomics_provider")
+        if not mod or not iso3:
+            return {}
+        db_series = _safe_get_attr(mod, "dbnomics_series")
+        if not db_series:
+            return {}
+        try:
+            raw = db_series(
+                provider_code=str(dataset or ""),
+                dataset=str(dataset or ""),
+                indicator=str(indicator or ""),
+                iso3=iso3,
+            )
+            return _to_float_map(raw)
+        except Exception:
+            return {}
+
+    return {}
+
+
+def _build_indicator_block_from_matrix(
+    iso: Dict[str, Any],
+    key: str,
+    *,
+    series_mode: Literal["none", "mini", "full"],
+    keep: int,
+) -> Dict[str, Any]:
+    """
+    Use INDICATOR_MATRIX to build a normalized indicator block:
+
+    {
+      "latest": {"value": ..., "date": "...", "source": "..."},
+      "series": {"YYYY-..": value, ...}
+    }
+    """
+    spec = INDICATOR_MATRIX[key]
+    max_age_years = spec.get("max_age_years")
+    sources = spec.get("sources") or []
+
+    debug_tried = []
+
+    for src in sources:
+        series = _fetch_series_from_matrix_source(iso, src)
+        if not series:
+            debug_tried.append(
+                {"provider": src.get("provider"), "dataset": src.get("dataset"), "indicator": src.get("indicator"), "status": "empty"}
+            )
+            continue
+
+        # apply transform if any
+        series = _apply_transform(series, src.get("transform"))
+        if not series:
+            debug_tried.append(
+                {"provider": src.get("provider"), "dataset": src.get("dataset"), "indicator": src.get("indicator"), "status": "after_transform_empty"}
+            )
+            continue
+
+        # sort & find latest
+        keys_sorted = sorted(series.keys(), key=_parse_period_key)
+        latest_key = keys_sorted[-1]
+        latest_val = series[latest_key]
+
+        # recency by years (for annual-data-heavy indicators)
+        if max_age_years and len(str(latest_key)) == 4:
+            try:
+                yr = int(latest_key)
+                if date.today().year - yr > max_age_years:
+                    debug_tried.append(
+                        {
+                            "provider": src.get("provider"),
+                            "dataset": src.get("dataset"),
+                            "indicator": src.get("indicator"),
+                            "status": f"too_old:{latest_key}",
+                        }
+                    )
+                    continue
+            except Exception:
+                pass
+
+        # apply keep to matrix history (use same semantics as series_mode)
+        trimmed = _apply_series_mode(series, series_mode, keep)
+
+        return {
+            "latest": {
+                "value": latest_val,
+                "date": latest_key,
+                "source": f"{src.get('provider')}::{src.get('dataset') or src.get('indicator') or 'series'}",
+            },
+            "series": trimmed,
+            "_debug": {"tried": debug_tried},
+        }
+
+    # if none returned anything usable
+    return {
+        "latest": {"value": None, "date": None, "source": "unavailable"},
+        "series": {},
+        "_debug": {"tried": debug_tried},
+    }
+
+
+def _populate_indicator_matrix(
+    payload: Dict[str, Any],
+    iso: Dict[str, Any],
+    *,
+    series_mode: Literal["none", "mini", "full"],
+    keep: int,
+) -> None:
+    """
+    Populate payload['indicators_matrix'] using INDICATOR_MATRIX.
+
+    This does NOT affect the existing 'indicators' block; it's additive.
+    """
+    out: Dict[str, Any] = {}
+    matrix_debug: Dict[str, Any] = {}
+
+    for key in INDICATOR_MATRIX.keys():
+        block = _build_indicator_block_from_matrix(iso, key, series_mode=series_mode, keep=keep)
+        out[key] = {
+            "latest": block["latest"],
+            "series": block["series"],
+        }
+        matrix_debug[key] = block.get("_debug", {})
+
+    payload["indicators_matrix"] = out
+    payload["_debug"]["matrix"] = matrix_debug
+
+
+# -----------------------------------------------------------------------------
+# builder v2 core
+# -----------------------------------------------------------------------------
 
 def _build_country_payload_v2_core(
     country: str,
@@ -376,25 +735,29 @@ def _build_country_payload_v2_core(
 ) -> Dict[str, Any]:
     """
     Modern builder for Country Radar:
-    - Compat-first IMF monthly/quarterly indicators (via app.providers.compat)
-    - Optional debt bundle via app.services.debt_service.compute_debt_payload
-    - Normalised output schema for use by GPT / UI layers
+    - Compat-first IMF monthly/quarterly indicators (legacy 'indicators' block)
+    - Debt bundle via app.services.debt_service.compute_debt_payload
+    - Matrix-based indicators via INDICATOR_MATRIX ('indicators_matrix')
     """
     iso = _resolve_iso(country)
     payload = _init_payload(country, iso, series, keep)
 
-    # Populate macro indicators
+    # Populate legacy macro indicators
     _populate_macro_blocks(payload, iso, series_mode=series, keep=keep)
 
-    # Attempt to enrich with debt data if available
+    # Populate matrix indicators (IMF + WB + Eurostat + OECD + GMD + DBnomics)
+    _populate_indicator_matrix(payload, iso, series_mode=series, keep=keep)
+
+    # Enrich with debt data if available
     _populate_debt_block(payload, iso)
 
     return payload
 
-# --------------------------- recency handling wrapper -------------------------
 
-# Soft recency rules per-indicator. These are intentionally conservative and can
-# be tuned without touching the core builder implementation.
+# -----------------------------------------------------------------------------
+# recency handling for legacy 'indicators' block
+# -----------------------------------------------------------------------------
+
 INDICATOR_RECENCY_RULES: Dict[str, Dict[str, int]] = {
     # Growth / activity
     "gdp_growth": {
@@ -418,9 +781,6 @@ INDICATOR_RECENCY_RULES: Dict[str, Dict[str, int]] = {
     "reserves_usd": {
         "max_age_months": 24,
     },
-    # Debt-related metrics will be handled separately by debt_service;
-    # we may still introduce a soft rule for their latest year:
-    # e.g. ignore debt older than 7-10 years.
 }
 
 
@@ -437,7 +797,6 @@ def _period_to_date_generic(period: Any) -> date:
     if not s:
         return date(1900, 1, 1)
 
-    # Quarterly form: 'YYYY-Qn'
     if "-Q" in s:
         try:
             year_str, q_str = s.split("-Q", 1)
@@ -464,7 +823,12 @@ def _period_to_date_generic(period: Any) -> date:
     return date(1900, 1, 1)
 
 
-def _is_fresh_for_indicator(name: str, latest_period: Any, *, today: Optional[date] = None) -> bool:
+def _is_fresh_for_indicator(
+    name: str,
+    latest_period: Any,
+    *,
+    today: Optional[date] = None,
+) -> bool:
     """Return True if the given indicator's latest_period is recent enough.
 
     If an indicator has no configured recency rule, we treat it as always fresh.
@@ -490,13 +854,12 @@ def _is_fresh_for_indicator(name: str, latest_period: Any, *, today: Optional[da
 def _apply_recency_to_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
     Walk the payload produced by _build_country_payload_v2_core and blank out
-    "latest" values for indicators whose latest_period is too old according to
-    INDICATOR_RECENCY_RULES.
+    "latest" values for legacy indicators whose latest_period is too old
+    according to INDICATOR_RECENCY_RULES.
 
     This is a non-destructive transformation: we keep the original series and
     latest_* values under a _debug namespace so we can inspect them later.
     """
-    # Handle top-level indicators
     indicators = payload.get("indicators")
     if isinstance(indicators, Mapping):
         for name, block in indicators.items():
@@ -506,8 +869,6 @@ def _apply_recency_to_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             if latest_period is None:
                 continue
             if not _is_fresh_for_indicator(name, latest_period):
-                # Preserve the original values under a debug namespace, but
-                # clear the public latest_* fields so they surface as N/A.
                 if "_debug" not in block:
                     block["_debug"] = {}
                 block["_debug"]["stale_latest_period"] = latest_period
@@ -517,11 +878,14 @@ def _apply_recency_to_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
                 block["latest_value"] = None
 
     # Debt recency could be enforced here if desired. For now we only operate
-    # on the indicators; debt_service is expected to provide reasonably recent
-    # metrics and will be enhanced separately.
-
+    # on the legacy indicators; the matrix indicators enforce max_age_years
+    # directly in _build_indicator_block_from_matrix.
     return payload
 
+
+# -----------------------------------------------------------------------------
+# public entrypoints
+# -----------------------------------------------------------------------------
 
 def build_country_payload_v2(
     country: str,
@@ -531,24 +895,26 @@ def build_country_payload_v2(
     """
     Public entrypoint for the v2 builder.
 
-    The original implementation is preserved as _build_country_payload_v2_core;
-    this thin wrapper delegates to it and then applies recency filtering on the
-    resulting payload. This ensures we do not lose any behaviour while still
-    preventing very old series (e.g. 1990 debt, 1998 FX) from surfacing as
-    current values.
+    - Delegates to _build_country_payload_v2_core
+    - Applies recency filtering on legacy 'indicators'
+    - Leaves 'indicators_matrix' as-is (it already enforces max_age_years)
     """
-    core_payload = _build_country_payload_v2_core(*args, **kwargs)
-    # Be defensive: if core returns something unexpected, just pass it through.
+    core_payload = _build_country_payload_v2_core(
+        country=country,
+        series=series,
+        keep=keep,
+    )
     if not isinstance(core_payload, Mapping):
         return core_payload  # type: ignore[return-value]
     return _apply_recency_to_payload(dict(core_payload))
 
 
-# --------------------------- legacy fallback ----------------------------------
-
-def build_country_payload(country: str, series: str = "mini", keep: int = 60) -> Dict[str, Any]:
+def build_country_payload(
+    country: str,
+    series: str = "mini",
+    keep: int = 60,
+) -> Dict[str, Any]:
     """Compatibility wrapper for legacy callers—delegate to v2 with same signature."""
-    # keep type-safety for `series` by constraining to allowed literals
     mode: Literal["none", "mini", "full"]
     if series not in ("none", "mini", "full"):
         mode = "mini"
