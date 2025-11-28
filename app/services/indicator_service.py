@@ -1,10 +1,10 @@
 # app/services/indicator_service.py — v2 builder using provider compat shim
-from app.services.indicator_matrix import INDICATOR_MATRIX
 from __future__ import annotations
 
 from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Literal
 import math
 from datetime import date
+from app.services.indicator_matrix import INDICATOR_MATRIX
 
 # add near top of indicator_service.py
 try:
@@ -16,7 +16,8 @@ except Exception:  # keep the module import non-fatal
 
 def _safe_import(path: str):
     try:
-        ...
+        module = __import__(path, fromlist=['*'])
+        return module
     except Exception:
         return None
 
@@ -42,26 +43,36 @@ def _to_float_map(d: Any) -> Dict[str, float]:
             except Exception:
                 continue
         return out
-    # Some providers might return a list of (period, value) tuples
-    if isinstance(d, (list, tuple)):
+    if isinstance(d, Iterable) and not isinstance(d, (str, bytes)):
         out = {}
-        for row in d:
+        for i, v in enumerate(d):
             try:
-                if not isinstance(row, (list, tuple)) or len(row) != 2:
-                    continue
-                k, v = row
                 if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
                     continue
-                out[str(k)] = float(v)
+                out[str(i)] = float(v)
             except Exception:
                 continue
         return out
-    return {}
+    # Single scalar → pretend it's a one-point series with a dummy key
+    try:
+        v = float(d)
+    except Exception:
+        return {}
+    if math.isnan(v) or math.isinf(v):
+        return {}
+    return {"0": v}
 
-# --------------------------- period key helpers -------------------------------
 
 def _parse_period_key(p: Any) -> Tuple[int, int, int]:
-    """Turn a period key like '2024', '2024-03', '2024-Q1' into a sortable tuple."""
+    """
+    Normalise period keys for sorting.
+
+    Supports:
+    - "YYYY"
+    - "YYYY-MM"
+    - "YYYY-Qn"
+    - or integer years.
+    """
     try:
         if isinstance(p, (int, float)):
             return (int(p), 0, 0)
@@ -93,37 +104,36 @@ def _trim_by_keep(series: Dict[str, float], keep: int) -> Dict[str, float]:
     return {k: series[k] for k in keys[-keep:]}
 
 def _apply_series_mode(series: Dict[str, float], mode: Literal["none", "mini", "full"], keep: int) -> Dict[str, float]:
+    """Apply mini/full/none mode and keep trimming to a series."""
     if mode == "none":
-        if not series:
-            return {}
-        # still return the latest point so that the "latest_value" meta fields match
-        k, v = _latest(series)
-        return {k: v}
-    if mode == "mini":
-        return _trim_by_keep(series, keep)
-    # full
-    return series
-
-def _collapse_to_annual(d: Dict[str, float]) -> Dict[str, float]:
-    """Collapse monthly/quarterly series into annual by last value per year."""
-    if not d:
         return {}
-    by_year: Dict[str, Tuple[str, float]] = {}
-    for k, v in d.items():
-        y = str(k).split("-")[0]
-        prev = by_year.get(y)
-        if prev is None or _parse_period_key(k) > _parse_period_key(prev[0]):
-            by_year[y] = (str(k), float(v))
-    return {y: v for y, (_, v) in sorted(by_year.items(), key=lambda kv: int(kv[0]))}
+    if mode == "mini":
+        # mini: keep just the last 12 points
+        return _trim_by_keep(series, keep=12)
+    # full: respect the global `keep` parameter
+    return _trim_by_keep(series, keep=keep)
 
 # -------------------- provider call helper (fixed interface) ------------------
 
-def _call_provider(module: str, candidates: Iterable[str], **kwargs) -> Tuple[Dict[str, float], Dict[str, Any]]:
+def _call_provider(
+    module: str,
+    candidates: Iterable[str],
+    **kwargs: Any,
+) -> Tuple[Dict[str, float], Dict[str, Any]]:
     """
-    Call a function by name in a module; coerce dict-of-numbers 
-    and return diagnostics for debugging.
+    Attempt to call one of the named functions from the given module.
 
-    Returns (series, debug_info)
+    The provider is expected to return something convertible to {period -> float}
+    via `_to_float_map`. We return:
+        (series_dict, debug_info)
+
+    debug_info has the shape:
+        {
+            "used": {"module": ..., "func": ...} or None,
+            "tried": [
+                {"module": ..., "func": ..., "found": bool, "error": "...?"}
+            ]
+        }
     """
     mod = _safe_import(module)
     tried = []
@@ -158,22 +168,19 @@ def _resolve_iso(country: str) -> Dict[str, Any]:
         mod = _safe_import("app.providers.compat")
         fn = _safe_get_attr(mod, "resolve_iso")
         if fn is None:
-            raise RuntimeError("compat.resolve_iso not available")
-        iso = fn(query=country)
-        return {
-            "iso_alpha_2": iso.get("iso_alpha_2"),
-            "iso_alpha_3": iso.get("iso_alpha_3"),
-            "iso_numeric": iso.get("iso_numeric"),
-            "name": iso.get("name") or country,
-            "_debug": {"compat": iso, "provider_debug": dbg},
-        }
+            raise RuntimeError("compat.resolve_iso not found")
+        iso = fn(country)
+        if not isinstance(iso, Mapping):
+            raise TypeError("compat.resolve_iso returned non-mapping")
+        return dict(iso)
     except Exception as e:
+        # In a failure case, we still build a payload but mark the error.
         return {
+            "name": country,
             "iso_alpha_2": None,
             "iso_alpha_3": None,
             "iso_numeric": None,
-            "name": country,
-            "_debug": {"error": repr(e), "provider_debug": dbg},
+            "_error": repr(e),
         }
 
 
@@ -203,16 +210,10 @@ def _init_payload(country: str, iso: Dict[str, Any], series: Literal["none", "mi
             "debt_to_gdp_series": {},
         },
         "_debug": {
-            "builder": {
-                "name": "build_country_payload_v2",
-                "version": 1,
-            },
+            "iso": iso,
             "providers": {},
         },
     }
-
-    # --- per-indicator history policy (mini/full caps),
-    # handled per-indicator by _apply_series_mode in build_country_payload_v2
 
 
 def _attach_series_block(
@@ -303,7 +304,7 @@ def _populate_macro_blocks(
         )
     dbg_root["reserves_usd"] = res_dbg
 
-    # Policy rate (policy/short rate proxied via compat)
+    # Policy rate
     pol_series, pol_dbg = _call_provider(
         "app.providers.imf_provider",
         ("imf_policy_rate_monthly",),
@@ -312,7 +313,7 @@ def _populate_macro_blocks(
     pol_series = _apply_series_mode(pol_series, series_mode, keep)
     if pol_series:
         _attach_series_block(
-            payload, "policy_rate", pol_series, "IMF/ECB (compat)",
+            payload, "policy_rate", pol_series, "IMF (compat)",
             series_mode=series_mode, keep=keep,
         )
     dbg_root["policy_rate"] = pol_dbg
@@ -338,29 +339,35 @@ def _populate_debt_block(payload: Dict[str, Any], iso: Dict[str, Any]) -> None:
         return
 
     iso3 = iso.get("iso_alpha_3")
-    try:
-        debt_payload = _compute_debt_payload(iso3)
-    except Exception as e:
-        payload["_debug"]["debt_error"] = repr(e)
+    if not iso3:
+        payload["_debug"]["debt_error"] = "iso_alpha_3 not available"
         return
 
-    payload["debt"] = debt_payload
-    # mirror the commonly used debt_to_gdp fields for convenience
     try:
-        latest = debt_payload.get("debt_to_gdp", {}).get("latest", {})
-        series = debt_payload.get("debt_to_gdp", {}).get("series", {})
-        payload["debt_to_gdp"] = {
-            "latest": {
-                "value": latest.get("value"),
-                "date": latest.get("year") or latest.get("date"),
-                "source": latest.get("source"),
-            },
-            "series": series,
-        }
-        payload["debt_to_gdp_series"] = series
-    except Exception as e:
-        payload["_debug"]["debt_mirror_error"] = repr(e)
+        debt_payload = _compute_debt_payload(iso3=iso3)
+        if not isinstance(debt_payload, Mapping):
+            raise TypeError("compute_debt_payload returned non-mapping")
 
+        # Expect shape: {"government_debt": {...}, "nominal_gdp": {...}, "debt_to_gdp": {...}}
+        debt_block = payload.get("debt", {})
+        # Government debt
+        if "government_debt" in debt_payload:
+            debt_block["government_debt"] = debt_payload["government_debt"]
+        # Nominal GDP
+        if "nominal_gdp" in debt_payload:
+            debt_block["nominal_gdp"] = debt_payload["nominal_gdp"]
+        # Debt-to-GDP (latest + series)
+        if "debt_to_gdp" in debt_payload:
+            debt_block["debt_to_gdp"] = debt_payload["debt_to_gdp"]
+        if "debt_to_gdp_series" in debt_payload:
+            debt_block["debt_to_gdp_series"] = debt_payload["debt_to_gdp_series"]
+
+        payload["debt"] = debt_block
+
+    except Exception as e:
+        payload["_debug"]["debt_error"] = repr(e)
+
+# --------------------------- builder v2 (core) continued ----------------------
 
 def _build_country_payload_v2_core(
     country: str,
@@ -390,19 +397,30 @@ def _build_country_payload_v2_core(
 # be tuned without touching the core builder implementation.
 INDICATOR_RECENCY_RULES: Dict[str, Dict[str, int]] = {
     # Growth / activity
-    "gdp_growth":        {"max_age_months": 6},   # quarterly, ~2 quarters lag
+    "gdp_growth": {
+        "max_age_months": 24,  # up to ~2 years
+    },
     # Prices
-    "cpi_yoy":           {"max_age_months": 6},   # monthly CPI
+    "cpi_yoy": {
+        "max_age_months": 6,
+    },
     # Labour
-    "unemployment_rate": {"max_age_months": 12},  # monthly unemployment
-    # FX & rates
-    "fx_rate_usd":       {"max_age_months": 3},   # FX should be very recent
-    "policy_rate":       {"max_age_months": 6},   # monetary policy
-    # External / buffers
-    "reserves_usd":      {"max_age_months": 12},  # reserves
-    # Structural / annual
-    "debt_to_gdp":       {"max_age_years": 5},    # last 5 years
-    "gov_effectiveness": {"max_age_years": 4},    # governance indices
+    "unemployment_rate": {
+        "max_age_months": 18,
+    },
+    # Rates / FX / reserves
+    "policy_rate": {
+        "max_age_months": 12,
+    },
+    "fx_rate_usd": {
+        "max_age_months": 12,
+    },
+    "reserves_usd": {
+        "max_age_months": 24,
+    },
+    # Debt-related metrics will be handled separately by debt_service;
+    # we may still introduce a soft rule for their latest year:
+    # e.g. ignore debt older than 7-10 years.
 }
 
 
@@ -434,14 +452,16 @@ def _period_to_date_generic(period: Any) -> date:
     parts = s.split("-")
     try:
         if len(parts) == 2:
-            y, m = map(int, parts)
+            y = int(parts[0])
+            m = int(parts[1])
             m = max(1, min(12, m))
             return date(y, m, 1)
-        # plain 'YYYY'
-        y = int(s)
-        return date(y, 1, 1)
+        if len(parts) == 1:
+            y = int(parts[0])
+            return date(y, 1, 1)
     except Exception:
         return date(1900, 1, 1)
+    return date(1900, 1, 1)
 
 
 def _is_fresh_for_indicator(name: str, latest_period: Any, *, today: Optional[date] = None) -> bool:
@@ -458,26 +478,25 @@ def _is_fresh_for_indicator(name: str, latest_period: Any, *, today: Optional[da
 
     total_today = today.year * 12 + today.month
     total_d = d.year * 12 + d.month
-    diff_months = total_today - total_d
 
     max_age_months = rules.get("max_age_months")
-    max_age_years = rules.get("max_age_years")
-
     if max_age_months is not None:
-        return diff_months <= max_age_months
-    if max_age_years is not None:
-        return diff_months <= max_age_years * 12
+        if (total_today - total_d) > max_age_months:
+            return False
 
     return True
 
 
 def _apply_recency_to_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Walk the Country Radar payload and mark stale indicators.
-
-    This function is careful *not* to remove any fields or series; instead, it
-    only adjusts the "latest_*" fields and sets a lightweight "status" flag
-    so upstream consumers (e.g. GPT) can decide how to render stale data.
     """
+    Walk the payload produced by _build_country_payload_v2_core and blank out
+    "latest" values for indicators whose latest_period is too old according to
+    INDICATOR_RECENCY_RULES.
+
+    This is a non-destructive transformation: we keep the original series and
+    latest_* values under a _debug namespace so we can inspect them later.
+    """
+    # Handle top-level indicators
     indicators = payload.get("indicators")
     if isinstance(indicators, Mapping):
         for name, block in indicators.items():
@@ -496,32 +515,21 @@ def _apply_recency_to_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
                 block["latest_period"] = None
                 block["latest_value"] = None
-                # Keep the original source label but also tag status as 'stale'
-                block["status"] = "stale"
 
-    # Debt-to-GDP lives outside the indicators map with a slightly different
-    # shape: {"latest": {"value", "date", "source"}, "series": {...}}
-    debt = payload.get("debt_to_gdp")
-    if isinstance(debt, Mapping):
-        latest = debt.get("latest")
-        if isinstance(latest, Mapping):
-            debt_date = latest.get("date")
-            if debt_date is not None and not _is_fresh_for_indicator("debt_to_gdp", debt_date):
-                if "_debug" not in debt:
-                    debt["_debug"] = {}
-                debt["_debug"]["stale_latest_date"] = debt_date
-                debt["_debug"]["stale_latest_value"] = latest.get("value")
-
-                latest["value"] = None
-                latest["date"] = None
-                # Preserve original source label but tag as stale at the block level
-                debt["status"] = "stale"
+    # Debt recency could be enforced here if desired. For now we only operate
+    # on the indicators; debt_service is expected to provide reasonably recent
+    # metrics and will be enhanced separately.
 
     return payload
 
 
-def build_country_payload_v2(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """Wrapper around the core v2 builder that enforces recency rules.
+def build_country_payload_v2(
+    country: str,
+    series: Literal["none", "mini", "full"] = "mini",
+    keep: int = 60,
+) -> Dict[str, Any]:
+    """
+    Public entrypoint for the v2 builder.
 
     The original implementation is preserved as _build_country_payload_v2_core;
     this thin wrapper delegates to it and then applies recency filtering on the
