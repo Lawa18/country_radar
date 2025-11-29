@@ -8,19 +8,8 @@ It just describes, for each KPI, which providers to try in what order,
 what dataset / indicator code to use, and what transformation (if any)
 is expected.
 
-The idea is that indicator_service.py (or country_lite.py) can do:
-
-    from app.services.indicator_matrix import INDICATOR_MATRIX
-
-    spec = INDICATOR_MATRIX["inflation_yoy"]
-    for source in spec["sources"]:
-        data = fetch_from_provider(source, iso2, iso3)
-        if data is not empty:
-            apply_transform(...)
-            break
-
-This keeps provider-specific logic in app.providers.*, while making
-the "which source do we trust first?" logic explicit and testable.
+indicator_service.py uses INDICATOR_MATRIX to decide which provider
+to call and how to post-process the result.
 """
 
 from __future__ import annotations
@@ -34,11 +23,11 @@ Frequency = Literal["A", "Q", "M", "D"]  # annual, quarterly, monthly, daily
 class SourceSpec(TypedDict, total=False):
     """A single provider candidate for an indicator."""
 
-    provider: str          # "gmd", "imf", "world_bank", "eurostat", "oecd", "ecb", "dbnomics", "local"
-    dataset: Optional[str] # e.g. "WEO", "IFS", "WDI", "gov_10a_ggdebt"
+    provider: str           # "gmd", "imf", "world_bank", "eurostat", "oecd", "ecb", "dbnomics"
+    dataset: Optional[str]  # e.g. "WEO", "IFS", "WDI", "gov_10a_ggdebt"
     indicator: Optional[str]  # provider-specific indicator code or name
-    func: Optional[str]    # optional helper function name in app.providers.*
-    freq: Frequency        # native frequency of the series
+    func: Optional[str]     # optional helper function name in app.providers.*
+    freq: Frequency         # native frequency of the series
     transform: Optional[str]  # "none", "yoy", "qoq", "mom", "ratio", etc.
     notes: Optional[str]
 
@@ -46,12 +35,11 @@ class SourceSpec(TypedDict, total=False):
 class IndicatorSpec(TypedDict, total=False):
     """Configuration for a single logical KPI."""
 
-    key: str            # internal key, e.g. "inflation_yoy"
-    label: str          # human-friendly label, e.g. "Inflation Rate (CPI YoY)"
-    unit: str           # unit as displayed, e.g. "percent", "USD", "EUR bn"
-    preferred_freq: Frequency  # frequency we try to present in the radar
-    sources: List[SourceSpec]  # ordered list of provider candidates
-    # Optionally, some indicators might want a recency tolerance, etc.
+    key: str                  # internal key, e.g. "inflation_yoy"
+    label: str                # human-friendly label
+    unit: str                 # display unit, e.g. "percent", "USD", "EUR bn"
+    preferred_freq: Frequency # frequency we try to present in the radar
+    sources: List[SourceSpec] # ordered list of provider candidates
     max_age_years: Optional[int]
 
 
@@ -67,26 +55,26 @@ INDICATOR_MATRIX: Dict[str, IndicatorSpec] = {
     "currency": {
         "key": "currency",
         "label": "Currency vs USD",
-        "unit": "per USD",           # e.g. 1.16 EUR per USD
+        "unit": "per USD",          # e.g. 18.76 MXN per USD
         "preferred_freq": "M",
         "max_age_years": 1,
         "sources": [
-            # Primary: IMF IFS monthly FX rates vs USD
+            # Primary: IMF monthly FX vs USD via your existing helper
             {
                 "provider": "imf",
                 "dataset": "IFS",
-                "indicator": "FX_USD",  # <-- align with your imf_provider naming
-                "func": None,           # or a helper like "imf_fx_usd_monthly"
+                "indicator": "FX_USD",
+                "func": "imf_fx_to_usd_monthly",  # re-use legacy IMF helper
                 "freq": "M",
                 "transform": "none",
-                "notes": "Monthly FX vs USD from IMF IFS if available.",
+                "notes": "Monthly FX vs USD from IMF IFS via imf_fx_to_usd_monthly(iso2).",
             },
             # Euro area / ECB: EUR/USD from ECB (for eurozone countries)
             {
                 "provider": "ecb",
                 "dataset": "ECB_FX",
                 "indicator": "EURUSD",
-                "func": None,           # e.g. ecb_fx_rate("EUR", "USD")
+                "func": None,           # e.g. ecb_fx_rate('EUR', 'USD') later
                 "freq": "D",
                 "transform": "none",
                 "notes": "ECB FX reference rate (EUR/USD) for euro area.",
@@ -114,17 +102,17 @@ INDICATOR_MATRIX: Dict[str, IndicatorSpec] = {
         "preferred_freq": "Q",
         "max_age_years": 2,
         "sources": [
-            # Preferred: IMF quarterly real GDP (IFS/WEO), transform -> QoQ or YoY
+            # Preferred: use your existing IMF helper that already returns quarterly GDP growth
             {
                 "provider": "imf",
                 "dataset": "IFS",
-                "indicator": "RGDP_Q",
-                "func": None,          # e.g. "imf_gdp_real_quarterly"
+                "indicator": "GDP_GROWTH_Q",
+                "func": "imf_gdp_growth_quarterly",  # reuse legacy helper
                 "freq": "Q",
-                "transform": "qoq",    # or "yoy", depending on your choice
-                "notes": "Quarterly real GDP from IMF; compute growth rate.",
+                "transform": "none",                  # function already returns growth
+                "notes": "Quarterly GDP growth from IMF via imf_gdp_growth_quarterly(iso2).",
             },
-            # EU: Eurostat quarterly chain-linked real GDP
+            # EU: Eurostat quarterly chain-linked real GDP (if you later want to compute from levels)
             {
                 "provider": "eurostat",
                 "dataset": "namq_10_gdp",
@@ -132,7 +120,7 @@ INDICATOR_MATRIX: Dict[str, IndicatorSpec] = {
                 "func": None,
                 "freq": "Q",
                 "transform": "qoq",
-                "notes": "Quarterly GDP (B1GQ) via Eurostat; used for EU countries.",
+                "notes": "Quarterly GDP (B1GQ) via Eurostat; compute QoQ growth.",
             },
             # Fallback: annual growth from GMD if quarterly is not available
             {
@@ -185,7 +173,7 @@ INDICATOR_MATRIX: Dict[str, IndicatorSpec] = {
                 "func": None,
                 "freq": "A",
                 "transform": "yoy",
-                "notes": "World Bank real GDP (constant 2015 US$); compute YoY.",
+                "notes": "World Bank real GDP (constant US$); compute YoY.",
             },
         ],
     },
@@ -220,7 +208,7 @@ INDICATOR_MATRIX: Dict[str, IndicatorSpec] = {
                 "transform": "none",
                 "notes": "OECD unemployment rate series for OECD members.",
             },
-            # IMF / ILO / GMD: annual unemployment rate
+            # Fallback: annual unemployment rate from GMD
             {
                 "provider": "gmd",
                 "dataset": "GMD",
@@ -243,7 +231,7 @@ INDICATOR_MATRIX: Dict[str, IndicatorSpec] = {
         "preferred_freq": "M",
         "max_age_years": 1,
         "sources": [
-            # Preferred: IMF CPI YoY (you already have imf_cpi_yoy_monthly)
+            # Preferred: IMF CPI YoY via existing helper
             {
                 "provider": "imf",
                 "dataset": "IFS",
@@ -253,7 +241,7 @@ INDICATOR_MATRIX: Dict[str, IndicatorSpec] = {
                 "transform": "none",
                 "notes": "CPI YoY from IMF IFS via imf_cpi_yoy_monthly(iso2).",
             },
-            # EU: Eurostat HICP index -> compute YoY if CPI_YOY not available
+            # EU: Eurostat HICP index -> compute YoY if needed
             {
                 "provider": "eurostat",
                 "dataset": "prc_hicp_midx",
@@ -271,9 +259,9 @@ INDICATOR_MATRIX: Dict[str, IndicatorSpec] = {
                 "func": None,
                 "freq": "M",
                 "transform": "yoy",
-                "notes": "OECD CPI index; compute YoY inflation where IMF/Eurostat missing.",
+                "notes": "OECD CPI index; compute YoY inflation.",
             },
-            # Fallback: annual CPI inflation from WB / GMD
+            # Fallback: annual CPI inflation from WB
             {
                 "provider": "world_bank",
                 "dataset": "WDI",
@@ -339,15 +327,15 @@ INDICATOR_MATRIX: Dict[str, IndicatorSpec] = {
         "preferred_freq": "M",
         "max_age_years": 1,
         "sources": [
-            # IMF: policy rate series in IFS
+            # IMF: policy rate series in IFS (implementation later)
             {
                 "provider": "imf",
                 "dataset": "IFS",
                 "indicator": "POLICY_RATE",
-                "func": None,
+                "func": "imf_policy_rate_monthly",  # if you have this helper
                 "freq": "M",
                 "transform": "none",
-                "notes": "Central bank policy rate from IMF IFS if available.",
+                "notes": "Central bank policy rate from IMF IFS.",
             },
             # Euro area: ECB main refinancing / deposit facility rate
             {
@@ -525,7 +513,7 @@ INDICATOR_MATRIX: Dict[str, IndicatorSpec] = {
             {
                 "provider": "imf",
                 "dataset": "WEO",
-                "indicator": "GGXWDG_NGDP",  # WEO code for gross debt % GDP
+                "indicator": "GGXWDG_NGDP",
                 "func": None,
                 "freq": "A",
                 "transform": "none",
