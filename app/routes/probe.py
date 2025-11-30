@@ -15,11 +15,120 @@ logger = logging.getLogger("country-radar")
 router = APIRouter(tags=["probe"])
 
 # -----------------------------------------------------------------------------
-# History policy + compat helpers
+# Small helpers and shared utilities
 # -----------------------------------------------------------------------------
-HIST_POLICY = {"A": 20, "Q": 4, "M": 12}  # Annual, Quarterly, Monthly window sizes
 
-# --- tiny response cache for /v1/country-lite --------------------------------
+
+def _safe_import(module: str):
+    try:
+        return __import__(module, fromlist=["*"])
+    except Exception:
+        return None
+
+
+def _iter_public_callables(mod: Any) -> Iterable[Tuple[str, Any]]:
+    for name in dir(mod):
+        if name.startswith("_"):
+            continue
+        obj = getattr(mod, name, None)
+        if callable(obj):
+            yield name, obj
+
+
+def _iso_codes(country: str) -> Dict[str, Optional[str]]:
+    try:
+        from app.utils.country_codes import get_country_codes
+
+        codes = get_country_codes(country) or {}
+        return {
+            "name": codes.get("name"),
+            "iso_alpha_2": codes.get("iso_alpha_2"),
+            "iso_alpha_3": codes.get("iso_alpha_3"),
+            "iso_numeric": codes.get("iso_numeric"),
+        }
+    except Exception:
+        return {
+            "name": country,
+            "iso_alpha_2": None,
+            "iso_alpha_3": None,
+            "iso_numeric": None,
+        }
+
+
+def _coerce_numeric_series(d: Optional[Mapping[str, Any]]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    if not d or not isinstance(d, Mapping):
+        return out
+    for k, v in d.items():
+        try:
+            out[str(k)] = float(v)
+        except Exception:
+            # ignore non-numeric
+            pass
+    return out
+
+
+def _latest(series: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
+    if not series:
+        return None, None
+    # sort by key; this assumes period-like keys but is fine for diagnostics
+    keys = sorted(series.keys())
+    k = keys[-1]
+    return k, series[k]
+
+
+def _freq_of_key(k: str) -> str:
+    """
+    Very rough frequency detection from a period key.
+    - YYYY       -> A
+    - YYYY-Qn    -> Q
+    - YYYY-MM    -> M
+    """
+    s = str(k)
+    if "-Q" in s:
+        return "Q"
+    if "-" in s:
+        # if second part looks like MM, treat as monthly
+        parts = s.split("-")
+        if len(parts) >= 2 and parts[0].isdigit():
+            return "M"
+    return "A"
+
+
+def _trim_series_policy(series: Mapping[str, float], policy: Dict[str, int]) -> Dict[str, float]:
+    """
+    Trim a mixed or single-freq series to the policy windows by freq.
+    For mixed keys (rare), we group by freq and trim each group.
+    """
+    if not series:
+        return {}
+    buckets: Dict[str, Dict[str, float]] = {"A": {}, "Q": {}, "M": {}}
+    for k, v in series.items():
+        freq = _freq_of_key(k)
+        if freq not in buckets:
+            freq = "A"
+        try:
+            buckets[freq][k] = float(v)
+        except Exception:
+            pass
+
+    out: Dict[str, float] = {}
+    for freq, ser in buckets.items():
+        keep = policy.get(freq, len(ser))
+        keys = sorted(ser.keys())
+        if len(keys) <= keep:
+            out.update({k: ser[k] for k in keys})
+        else:
+            out.update({k: ser[k] for k in keys[-keep:]})
+    return out
+
+
+# Global history policy (years/quarters/months)
+HIST_POLICY: Dict[str, int] = {"A": 20, "Q": 12, "M": 48}
+
+# -----------------------------------------------------------------------------
+# Tiny response cache for /v1/country-lite
+# -----------------------------------------------------------------------------
 _COUNTRY_CACHE: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _COUNTRY_TTL = 600.0  # 10 minutes
 
@@ -39,198 +148,64 @@ def _cache_set(country: str, payload: Dict[str, Any]) -> None:
 
 
 # -----------------------------------------------------------------------------
-# Low-level utilities (defensive: never raise in probes)
+# Compat provider wrapper (with retries + basic timeouts)
 # -----------------------------------------------------------------------------
-def _safe_import(module: str):
+_EXECUTOR = _futures.ThreadPoolExecutor(max_workers=8)
+
+
+def _with_timeout(timeout_s: float, fn, *args, **kwargs):
+    """
+    Run fn(*args, **kwargs) in a thread pool with a hard timeout.
+    Used to keep country-lite from blocking on heavy calls.
+    """
+    fut = _EXECUTOR.submit(fn, *args, **kwargs)
     try:
-        return __import__(module, fromlist=["*"])
+        return fut.result(timeout=timeout_s)
     except Exception:
+        try:
+            fut.cancel()
+        except Exception:
+            pass
         return None
 
 
-def _coerce_numeric_series(d: Optional[Mapping[str, Any]]) -> Dict[str, float]:
-    """Keep only numeric values; keys as strings; ignore junk."""
-    out: Dict[str, float] = {}
-    if not isinstance(d, Mapping):
-        return out
-    for k, v in d.items():
-        try:
-            out[str(k)] = float(v)
-        except Exception:
-            # ignore non-numeric
-            pass
-    return out
-
-
-def _parse_period_key(p: str) -> Tuple[int, int, int]:
-    """
-    Sort keys like 'YYYY', 'YYYY-MM', 'YYYY-Qn' robustly.
-    Returns (year, month, quarter) for sorting.
-    """
-    try:
-        if isinstance(p, (int, float)):
-            return (int(p), 0, 0)
-        s = str(p)
-        if "-Q" in s:
-            y, q = s.split("-Q", 1)
-            return (int(y), 0, int(q))
-        if "-" in s:
-            y, m = s.split("-", 1)
-            return (int(y), int(m), 0)
-        return (int(s), 0, 0)
-    except Exception:
-        return (0, 0, 0)
-
-
-def _latest(d: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
-    if not d:
-        return None, None
-    ks = sorted(d.keys(), key=_parse_period_key)
-    k = ks[-1]
-    return k, d[k]
-
-
-def _to_annual_latest(d: Mapping[str, float]) -> Dict[str, float]:
-    """Collapse to annual by taking latest period per year (for display/length)."""
-    if not d:
-        return {}
-    by_year: Dict[str, Tuple[str, float]] = {}
-    for k, v in d.items():
-        y = str(k).split("-")[0]
-        prev = by_year.get(y)
-        if prev is None or _parse_period_key(k) > _parse_period_key(prev[0]):
-            by_year[y] = (str(k), float(v))
-    return {y: v for y, (_, v) in sorted(by_year.items(), key=lambda kv: int(kv[0]))}
-
-
-def _freq_of_key(k: str) -> str:
-    """Crude freq detector: 'YYYY-Qn' -> Q ; 'YYYY-MM' -> M ; else 'A'."""
-    s = str(k)
-    if "-Q" in s:
-        return "Q"
-    if "-" in s:
-        parts = s.split("-")
-        if len(parts) >= 2 and parts[0].isdigit():
-            return "M"
-    return "A"
-
-
-def _trim_series_policy(series: Mapping[str, float], policy: Dict[str, int]) -> Dict[str, float]:
-    """
-    Trim a mixed or single-freq series to the policy windows by freq.
-    For mixed keys (rare), we group by freq and trim each group.
-    """
-    if not series:
-        return {}
-    buckets: Dict[str, Dict[str, float]] = {"A": {}, "Q": {}, "M": {}}
-    for k, v in series.items():
-        try:
-            freq = _freq_of_key(k)
-            buckets[freq][str(k)] = float(v)
-        except Exception:
-            continue
-    out: Dict[str, float] = {}
-    for f, sub in buckets.items():
-        if not sub:
-            continue
-        keep = policy.get(f, 0)
-        ordered = sorted(sub.items(), key=lambda kv: _parse_period_key(kv[0]))
-        take = ordered[-keep:] if keep > 0 else ordered
-        out.update(dict(take))
-    return dict(sorted(out.items(), key=lambda kv: _parse_period_key(kv[0])))
-
-
-# -----------------------------------------------------------------------------
-# ISO + provider probes
-# -----------------------------------------------------------------------------
-def _iso_codes(country: str) -> Dict[str, Optional[str]]:
-    """
-    Resolve ISO codes defensively; never raise.
-    Expects app.utils.country_codes.get_country_codes(name) → dict or similar.
-    """
-    try:
-        cc_mod = _safe_import("app.utils.country_codes")
-        if cc_mod and hasattr(cc_mod, "get_country_codes"):
-            codes = cc_mod.get_country_codes(country)
-            if isinstance(codes, Mapping):
-                return {
-                    "name": str(codes.get("name") or country),
-                    "iso_alpha_2": codes.get("iso_alpha_2") or codes.get("alpha2") or codes.get("iso2"),
-                    "iso_alpha_3": codes.get("iso_alpha_3") or codes.get("alpha3") or codes.get("iso3"),
-                    "iso_numeric": codes.get("iso_numeric") or codes.get("numeric"),
-                }
-    except Exception:
-        pass
-    return {"name": country, "iso_alpha_2": None, "iso_alpha_3": None, "iso_numeric": None}
-
-
-def _probe_provider(module_name: str, fns: Iterable[str], **kwargs) -> Tuple[Dict[str, float], Dict[str, Any]]:
-    """
-    Try calling a list of function names in a provider; return coerced numeric series and a small debug trace.
-    Accepts {'country': 'Germany'} or legacy alias {'name': 'Germany'}.
-    """
-    mod = _safe_import(module_name)
-    dbg: Dict[str, Any] = {"module": module_name, "tried": []}
-    if mod is None:
-        dbg["error"] = "import_failed"
-        return {}, dbg
-
-    kw_variants = [kwargs]
-    if "country" in kwargs:
-        kv = dict(kwargs)
-        kv["name"] = kv.pop("country")
-        kw_variants.append(kv)
-
-    for fn in fns:
-        f = getattr(mod, fn, None)
-        if not callable(f):
-            dbg["tried"].append({fn: "missing"})
-            continue
-        for kv in kw_variants:
-            try:
-                data = f(**kv)
-                dbg["tried"].append({fn: {"ok": True}})
-                return _coerce_numeric_series(data), dbg
-            except Exception as e:
-                dbg["tried"].append({fn: {"error": str(e)}})
-    return {}, dbg
-
-
-# -----------------------------------------------------------------------------
-# Compat fetchers (primary) + WB fallback (sync, no threads)
-# -----------------------------------------------------------------------------
 def _compat_fetch_series(func_name: str, country: str, want_freq: str, keep_hint: int) -> Dict[str, float]:
     """
-    Fetch from compat with hints; fall back to plain call; coerce + trim.
-    keep_hint should be >= policy window (e.g., 24 for safety), we then trim strictly.
+    Call app.providers.compat.<func_name>(country=...) and coerce numeric series.
     """
     mod = _safe_import("app.providers.compat")
-    raw: Mapping[str, Any] = {}
-    if mod:
-        fn = getattr(mod, func_name, None)
-        if callable(fn):
-            for kwargs in (
-                {"country": country, "series": "mini", "keep": max(keep_hint, 24)},
-                {"country": country, "series": "full"},
-                {"country": country},
-            ):
-                try:
-                    raw = fn(**kwargs) or {}
-                    if raw:
-                        break
-                except TypeError:
-                    continue
-                except Exception:
-                    continue
-    data = _coerce_numeric_series(raw)
-    return _trim_series_policy(data, HIST_POLICY)
+    if not mod:
+        return {}
+    fn = getattr(mod, func_name, None)
+    if not callable(fn):
+        return {}
+    try:
+        raw = fn(country, keep=keep_hint)
+    except TypeError:
+        # older compat signatures might not accept keep=
+        raw = fn(country)
+    except Exception:
+        return {}
+    series = _coerce_numeric_series(raw)
+    return _trim_series_policy(series, HIST_POLICY)
 
 
-def _compat_fetch_series_retry(func_name: str, country: str, want_freq: str, keep_hint: int) -> Dict[str, float]:
-    s = _compat_fetch_series(func_name, country, want_freq, keep_hint)
-    if s:
-        return s
-    # tiny backoff and try once more
+def _compat_fetch_series_retry(
+    func_name: str,
+    country: str,
+    want_freq: str,
+    keep_hint: int,
+    retries: int = 1,
+) -> Dict[str, float]:
+    """
+    Retry compat fetch once on failure (simple heuristic).
+    """
+    series = _compat_fetch_series(func_name, country, want_freq, keep_hint)
+    if series:
+        return series
+    if retries <= 0:
+        return series
+    # brief pause and try once more
     _time.sleep(0.1)
     return _compat_fetch_series(func_name, country, want_freq, keep_hint)
 
@@ -246,341 +221,92 @@ def _get_iso3(country: str) -> Optional[str]:
 def _wb_series_from_helpers(country: str, helper_name: str) -> Dict[str, float]:
     """
     Call a World Bank *helper* (e.g., wb_current_account_balance_pct_gdp_annual)
-    which expects (iso3: str) and returns a dict[str->float].
+    exposed on app.providers.wb_provider if present.
     """
+    mod = _safe_import("app.providers.wb_provider")
+    if not mod:
+        return {}
+    helper = getattr(mod, helper_name, None)
+    if not callable(helper):
+        return {}
     try:
-        wb = _safe_import("app.providers.wb_provider")
-        if not wb:
-            return {}
-        fn = getattr(wb, helper_name, None)
-        if not callable(fn):
-            return {}
         iso3 = _get_iso3(country)
         if not iso3:
             return {}
-        raw = fn(iso3=iso3)
-        return _trim_series_policy(_coerce_numeric_series(raw), HIST_POLICY)
+        raw = helper(iso3)
+        series = _coerce_numeric_series(raw)
+        return _trim_series_policy(series, HIST_POLICY)
     except Exception:
         return {}
 
 
 def _wb_series_generic(country: str, indicator_code: str) -> Dict[str, float]:
     """
-    Direct World Bank indicator by code (e.g., BN.CAB.XOKA.GD.ZS → CAB % GDP).
+    Generic call to World Bank WDI using country ISO3 and an indicator code.
     """
+    mod = _safe_import("app.providers.wb_provider")
+    if not mod:
+        return {}
+    fetch = getattr(mod, "fetch_wb_indicator_raw", None)
+    to_year = getattr(mod, "wb_year_dict_from_raw", None)
+    if not callable(fetch) or not callable(to_year):
+        return {}
     try:
-        wb = _safe_import("app.providers.wb_provider")
-        if not wb:
-            return {}
-        fetch = getattr(wb, "fetch_wb_indicator_raw", None)
-        to_year = getattr(wb, "wb_year_dict_from_raw", None)
-        if not callable(fetch) or not callable(to_year):
-            return {}
         iso3 = _get_iso3(country)
         if not iso3:
             return {}
-        raw = fetch(iso3=iso3, code=indicator_code)
+        raw = fetch(iso3, indicator_code)
         series = _coerce_numeric_series(to_year(raw))
         return _trim_series_policy(series, HIST_POLICY)
     except Exception:
         return {}
 
 
-def _with_timeout(seconds: float, fn, *args, **kwargs):
-    """
-    Run fn(*args, **kwargs) in a thread with timeout.
-    Return {} on timeout/error to avoid blocking the route.
-    """
-    try:
-        with _futures.ThreadPoolExecutor(max_workers=1) as ex:
-            fut = ex.submit(fn, *args, **kwargs)
-            return fut.result(timeout=seconds)
-    except Exception:
-        return {}
-
-
 # -----------------------------------------------------------------------------
-# Routes
+# Provider probe endpoint (for diagnostics)
 # -----------------------------------------------------------------------------
 
-# ——— Reachability ------------------------------------------------------------
-@router.get("/__action_probe", summary="Connectivity probe", operation_id="action_probe_get__action_probe")
-def action_probe_get() -> Dict[str, Any]:
-    return {"ok": True, "path": "/__action_probe"}
 
-
-@router.options("/__action_probe", include_in_schema=False)
-def action_probe_options() -> Response:
-    # Allow preflights to succeed fast
-    return Response(status_code=204)
-
-
-# ——— Series probe ------------------------------------------------------------
-@router.get("/__probe_series", summary="Probe Series", operation_id="probe_series__probe_series",
-            description="Quick availability check for core indicators across providers.\n"
-                        "Returns length and latest period per source; never raises.")
-def probe_series(
-    country: str = Query(..., description="Full country name, e.g., Germany"),
-) -> Dict[str, Any]:
+@router.get("/v1/provider-probe")
+def provider_probe() -> JSONResponse:
     """
-    Diagnostic only. Direct provider calls may show 'missing' even if compat-based
-    country-lite is healthy. That’s expected on minimal deployments.
+    Introspect compat/imf/wb providers and list public callables.
     """
-    iso = _iso_codes(country)
-
-    # CPI (YoY or equivalent)
-    imf_cpi, dbg_imf_cpi = _probe_provider(
-        "app.providers.imf_provider",
-        ("get_cpi_yoy_monthly", "cpi_yoy_monthly", "get_cpi_yoy", "cpi_yoy"),
-        country=country,
-    )
-    eu_cpi, dbg_eu_cpi = _probe_provider(
-        "app.providers.eurostat_provider",
-        ("get_hicp_yoy", "hicp_yoy", "get_cpi_yoy", "cpi_yoy"),
-        country=country,
-    )
-    # WB helper (annual CPI YoY)
-    wb_cpi = _wb_series_from_helpers(country, "wb_cpi_yoy_annual")
-    dbg_wb_cpi = {"module": "app.providers.wb_provider", "fn": "wb_cpi_yoy_annual", "iso3": iso.get("iso_alpha_3"),
-                  "len": len(wb_cpi)}
-
-    # Unemployment
-    imf_une, dbg_imf_une = _probe_provider(
-        "app.providers.imf_provider",
-        ("get_unemployment_rate_monthly", "unemployment_rate_monthly", "get_unemployment_rate", "unemployment_rate"),
-        country=country,
-    )
-    eu_une, dbg_eu_une = _probe_provider(
-        "app.providers.eurostat_provider",
-        ("get_unemployment_rate_monthly", "unemployment_rate_monthly", "get_unemployment_rate", "unemployment_rate"),
-        country=country,
-    )
-    wb_une = _wb_series_from_helpers(country, "wb_unemployment_rate_annual")
-    dbg_wb_une = {"module": "app.providers.wb_provider", "fn": "wb_unemployment_rate_annual", "iso3": iso.get("iso_alpha_3"),
-                  "len": len(wb_une)}
-
-    # FX vs USD (monthly compat; direct IMF may be absent)
-    imf_fx, dbg_imf_fx = _probe_provider(
-        "app.providers.imf_provider",
-        ("get_fx_rate_usd_monthly", "fx_rate_usd_monthly", "get_fx_rate_usd", "fx_rate_usd"),
-        country=country,
-    )
-
-    # Reserves (USD)
-    imf_res, dbg_imf_res = _probe_provider(
-        "app.providers.imf_provider",
-        ("get_reserves_usd_monthly", "reserves_usd_monthly", "get_reserves_usd", "reserves_usd"),
-        country=country,
-    )
-
-    # Policy rate
-    imf_pr, dbg_imf_pr = _probe_provider(
-        "app.providers.imf_provider",
-        ("get_policy_rate_monthly", "policy_rate_monthly", "get_policy_rate", "policy_rate"),
-        country=country,
-    )
-
-    # GDP growth (quarterly preferred)
-    imf_gdpq, dbg_imf_gdpq = _probe_provider(
-        "app.providers.imf_provider",
-        ("get_gdp_growth_quarterly", "gdp_growth_quarterly"),
-        country=country,
-    )
-    wb_gdpa = _wb_series_from_helpers(country, "wb_gdp_growth_annual_pct")
-    dbg_wb_gdpa = {"module": "app.providers.wb_provider", "fn": "wb_gdp_growth_annual_pct", "iso3": iso.get("iso_alpha_3"),
-                   "len": len(wb_gdpa)}
-
-    def _brief(series: Mapping[str, float]) -> Dict[str, Any]:
-        if not series:
-            return {"len": 0, "latest": None}
-        period, _ = _latest(series)
-        return {"len": len(series), "latest": period}
-
-    cpi_wb_annual = _to_annual_latest(wb_cpi)
-    une_wb_annual = _to_annual_latest(wb_une)
-
-    resp = {
-        "ok": True,
-        "country": country,
-        "iso2": iso.get("iso_alpha_2"),
-        "iso3": iso.get("iso_alpha_3"),
-        "series": {
-            "cpi": {
-                "IMF": _brief(imf_cpi),
-                "Eurostat": _brief(eu_cpi),
-                "WB_annual": _brief(cpi_wb_annual),
-            },
-            "unemployment": {
-                "IMF": _brief(imf_une),
-                "Eurostat": _brief(eu_une),
-                "WB_annual": _brief(une_wb_annual),
-            },
-            "fx": {"IMF": _brief(imf_fx)},
-            "reserves": {"IMF": _brief(imf_res)},
-            "policy_rate": {"IMF": _brief(imf_pr)},
-            "gdp_growth": {
-                "IMF_quarterly": _brief(imf_gdpq),
-                "WB_annual": _brief(wb_gdpa),
-            },
-        },
-        "_debug": {
-            "cpi": {"IMF": dbg_imf_cpi, "Eurostat": dbg_eu_cpi, "WB": dbg_wb_cpi},
-            "unemployment": {"IMF": dbg_imf_une, "Eurostat": dbg_eu_une, "WB": dbg_wb_une},
-            "fx": {"IMF": dbg_imf_fx},
-            "reserves": {"IMF": dbg_imf_res},
-            "policy_rate": {"IMF": dbg_imf_pr},
-            "gdp_growth": {"IMF_q": dbg_imf_gdpq, "WB_a": dbg_wb_gdpa},
-        },
-    }
-    return resp
-
-
-@router.options("/__probe_series", include_in_schema=False)
-def probe_series_options() -> Response:
-    return Response(status_code=204)
-
-
-# ——— Compat probe ------------------------------------------------------------
-@router.get("/__compat_probe", summary="Inspect compat normalization for one indicator",
-            operation_id="compat_probe__compat_probe")
-def compat_probe(
-    indicator: str,
-    country: str = "Mexico",
-    freq: str = "auto",  # monthly/annual/quarterly/auto
-):
-    import app.providers.compat as compat
-
-    name_map = {
-        ("cpi_yoy", "monthly"): "get_cpi_yoy_monthly",
-        ("cpi_yoy", "annual"): "get_cpi_annual",
-        ("unemployment_rate", "monthly"): "get_unemployment_rate_monthly",
-        ("unemployment_rate", "annual"): "get_unemployment_rate_annual",
-        ("fx_rate_usd", "monthly"): "get_fx_rate_usd_monthly",
-        ("fx_rate_usd", "annual"): "get_fx_official_annual",
-        ("reserves_usd", "monthly"): "get_reserves_usd_monthly",
-        ("reserves_usd", "annual"): "get_reserves_annual",
-        ("policy_rate", "monthly"): "get_policy_rate_monthly",
-        ("gdp_growth", "quarterly"): "get_gdp_growth_quarterly",
-        ("gdp_growth", "annual"): "get_gdp_growth_annual",
-    }
-    if indicator == "gdp_growth":
-        key = (indicator, "quarterly" if freq in ("auto", "quarterly") else "annual")
-    else:
-        key = (indicator, "monthly" if freq in ("auto", "monthly") else "annual")
-    fn_name = name_map.get(key)
-    fn = getattr(compat, fn_name, None) if fn_name else None
-    if not callable(fn):
-        return {"error": f"compat function not found: {fn_name}"}
-
-    series = fn(country=country)
-    head = dict(list(series.items())[:10])
-    return {
-        "indicator": indicator,
-        "compat_fn": fn_name,
-        "country": country,
-        "normalized_len": len(series),
-        "normalized_head": head,
+    modules = {
+        "compat": _safe_import("app.providers.compat"),
+        "imf": _safe_import("app.providers.imf_provider"),
+        "wb": _safe_import("app.providers.wb_provider"),
     }
 
-
-# --- Provider introspection helpers ------------------------------------------
-@router.get("/__provider_fns", summary="List callables exported by a provider module",
-            operation_id="provider_fns__provider_fns",
-            description="List top-level callables in a provider module so we can see what's actually deployed.\n"
-                        "Example: /__provider_fns?module=app.providers.wb_provider")
-def provider_fns(module: str):
-    mod = _safe_import(module)
-    if not mod:
-        return {"ok": False, "module": module, "error": "import_failed"}
-    fns = []
-    for name, obj in vars(mod).items():
-        if name.startswith("_"):
+    info: Dict[str, Any] = {}
+    for name, mod in modules.items():
+        if not mod:
+            info[name] = {"available": False}
             continue
-        if callable(obj):
+        info[name] = {
+            "available": True,
+            "public_callables": [],
+        }
+        for fn_name, fn in _iter_public_callables(mod):
             try:
-                sig = str(inspect.signature(obj))
+                sig = str(inspect.signature(fn))
             except Exception:
-                sig = "(?)"
-            fns.append({"name": name, "signature": sig})
-    return {"ok": True, "module": module, "count": len(fns), "functions": sorted(fns, key=lambda x: x["name"])}
+                sig = "(unknown)"
+            info[name]["public_callables"].append(
+                {
+                    "name": fn_name,
+                    "signature": sig,
+                }
+            )
+
+    return JSONResponse(content={"modules": info})
 
 
-@router.get("/__codes", summary="Show resolved ISO codes for a country", operation_id="show_codes__codes")
-def show_codes(country: str = "Mexico"):
-    from app.utils.country_codes import get_country_codes
-    codes = get_country_codes(country)
-    return {"country": country, "codes": codes}
+# -----------------------------------------------------------------------------
+# Country-lite: compat-first, WB-backed, bounded windows
+# -----------------------------------------------------------------------------
 
 
-@router.get("/__provider_raw", summary="Call a provider function directly and preview result",
-            operation_id="provider_raw__provider_raw",
-            description="Call a specific function in a provider with various arg shapes (country/name/iso2/iso3/code)\n"
-                        "and return a short preview of the raw payload.")
-def provider_raw(
-    module: str,
-    fn: str,
-    country: str = "Mexico",
-):
-    mod = _safe_import(module)
-    if not mod:
-        return {"ok": False, "module": module, "fn": fn, "error": "import_failed"}
-    f = getattr(mod, fn, None)
-    if not callable(f):
-        return {"ok": False, "module": module, "fn": fn, "error": "fn_missing"}
-    # variants
-    from app.utils import country_codes as cc
-    codes = (cc.get_country_codes(country) or {}) if hasattr(cc, "get_country_codes") else {}
-    trials = [
-        {"country": country},
-        {"name": country},
-        {"iso2": codes.get("iso_alpha_2")},
-        {"iso3": codes.get("iso_alpha_3")},
-        {"code": codes.get("iso_alpha_3") or codes.get("iso_alpha_2")},
-    ]
-    tried = []
-    res = None
-    for kv in trials:
-        if any(v is None for v in kv.values()):
-            continue
-        try:
-            res = f(**kv)
-            tried.append({"kwargs": kv, "ok": True})
-            break
-        except TypeError as e:
-            tried.append({"kwargs": kv, "error": str(e)})
-        except Exception as e:
-            tried.append({"kwargs": kv, "error": f"{type(e).__name__}: {e}"})
-    if res is None:
-        # final positional attempt
-        try:
-            res = f(country)
-            tried.append({"args": [country], "ok": True})
-        except Exception as e:
-            tried.append({"args": [country], "error": f"{type(e).__name__}: {e}"})
-
-    def _preview(obj: Any, limit: int = 12):
-        if obj is None:
-            return None
-        if isinstance(obj, dict):
-            keys = list(obj.keys())
-            head = keys[:limit]
-            small = {str(k): obj[k] for k in head}
-            return {"type": "mapping", "len": len(keys), "head_keys": head, "head_values": small}
-        if isinstance(obj, (list, tuple)):
-            return {"type": "sequence", "len": len(obj), "head": list(obj)[:limit]}
-        return {"type": type(obj).__name__, "repr": repr(obj)[:400]}
-
-    return {
-        "ok": res is not None,
-        "module": module,
-        "fn": fn,
-        "tried": tried,
-        "result_type": None if res is None else type(res).__name__,
-        "result_preview": _preview(res),
-    }
-
-
-# --- Country Lite (compat-first, bounded history, cached) — with WB helpers ---
 @router.get(
     "/v1/country-lite",
     summary="Country Lite",
@@ -590,9 +316,9 @@ def provider_raw(
         "Compat-first snapshot with bounded history windows:\n"
         "  - Debt-to-GDP (annual, last 20y) — hard timeout to avoid route blocking\n"
         "  - GDP growth (quarterly, last 4q)\n"
-        "  - Monthly set (CPI YoY, Unemployment, FX, Reserves, Policy rate) last 12m\n"
-        "  - Current Account % GDP (annual, last 20y) — WB helper → generic fallback\n"
-        "  - Government Effectiveness (annual, last 20y) — WB helper → generic fallback"
+        "  - Monthly set (CPI YoY, Unemployment, FX, Reserves, Policy Rate)\n"
+        "  - Annual set (Current Account % GDP, Government Effectiveness)\n"
+        "This is a lighter-weight alternative to the full /country-data route."
     ),
 )
 def country_lite(
@@ -614,6 +340,7 @@ def country_lite(
     # 1) Try the heavy service, but don't let it block the route
     try:
         from app.services.debt_service import compute_debt_payload
+
         heavy_debt = _with_timeout(2.0, compute_debt_payload, country) or {}
         if heavy_debt.get("series"):
             debt_series_full = heavy_debt.get("series") or {}
@@ -641,7 +368,6 @@ def country_lite(
             }
 
     debt_series = _trim_series_policy(debt_series_full, HIST_POLICY)
-
 
     # ---- Quarterly GDP growth (compat) — keep_hint=12
     gdp_growth_q = _compat_fetch_series_retry("get_gdp_growth_quarterly", country, "Q", keep_hint=12)
@@ -675,6 +401,19 @@ def country_lite(
     cab_p, cab_v = _kvl(cab_a)
     ge_p, ge_v = _kvl(ge_a)
 
+    # --- indicators_matrix from indicator_service (non-fatal)
+    indicators_matrix: Dict[str, Any] = {}
+    matrix_debug: Dict[str, Any] = {}
+    try:
+        from app.services.indicator_service import build_country_payload_v2
+
+        matrix_payload = build_country_payload_v2(country=country, series="mini", keep=60)
+        if isinstance(matrix_payload, dict):
+            indicators_matrix = matrix_payload.get("indicators_matrix") or {}
+            matrix_debug = matrix_payload.get("_debug") or {}
+    except Exception as e:
+        matrix_debug = {"error": repr(e)}
+
     resp: Dict[str, Any] = {
         "country": country,
         "iso_codes": iso,
@@ -692,44 +431,62 @@ def country_lite(
         "nominal_gdp": {"latest": {"value": None, "date": None, "source": None}, "series": {}},
         "debt_to_gdp": {"latest": {"value": None, "date": None, "source": None}, "series": {}},
         "debt_to_gdp_series": {},
+        "indicators_matrix": indicators_matrix,
         # Indicators (trimmed)
         "additional_indicators": {
             "cpi_yoy": {
-                "latest_value": cpi_v, "latest_period": cpi_p,
-                "source": "compat/IMF", "series": cpi_m,
+                "latest_value": cpi_v,
+                "latest_period": cpi_p,
+                "source": "compat/IMF",
+                "series": cpi_m,
             },
             "unemployment_rate": {
-                "latest_value": une_v, "latest_period": une_p,
-                "source": "compat/IMF", "series": une_m,
+                "latest_value": une_v,
+                "latest_period": une_p,
+                "source": "compat/IMF",
+                "series": une_m,
             },
             "fx_rate_usd": {
-                "latest_value": fx_v, "latest_period": fx_p,
-                "source": "compat/IMF", "series": fx_m,
+                "latest_value": fx_v,
+                "latest_period": fx_p,
+                "source": "compat/IMF",
+                "series": fx_m,
             },
             "reserves_usd": {
-                "latest_value": res_v, "latest_period": res_p,
-                "source": "compat/IMF", "series": res_m,
+                "latest_value": res_v,
+                "latest_period": res_p,
+                "source": "compat/IMF",
+                "series": res_m,
             },
             "policy_rate": {
-                "latest_value": pol_v, "latest_period": pol_p,
-                "source": "compat/IMF/ECB", "series": policy_m,
+                "latest_value": pol_v,
+                "latest_period": pol_p,
+                "source": "compat/IMF/ECB",
+                "series": policy_m,
             },
             "gdp_growth": {
-                "latest_value": gdpq_v, "latest_period": gdpq_p,
-                "source": "compat/IMF", "series": gdp_growth_q,
+                "latest_value": gdpq_v,
+                "latest_period": gdpq_p,
+                "source": "compat/IMF",
+                "series": gdp_growth_q,
             },
             "current_account_balance_pct_gdp": {
-                "latest_value": cab_v, "latest_period": cab_p,
-                "source": "WB(helper/generic)", "series": cab_a,
+                "latest_value": cab_v,
+                "latest_period": cab_p,
+                "source": "WB(helper/generic)",
+                "series": cab_a,
             },
             "government_effectiveness": {
-                "latest_value": ge_v, "latest_period": ge_p,
-                "source": "WB(helper/generic)", "series": ge_a,
+                "latest_value": ge_v,
+                "latest_period": ge_p,
+                "source": "WB(helper/generic)",
+                "series": ge_a,
             },
         },
         "_debug": {
-            "builder": "country_lite (sync + cache + WB-helpers + compat)",
+            "builder": "country_lite v3 (probe + compat + WB-helpers + matrix)",
             "history_policy": HIST_POLICY,
+            "matrix_from_indicator_service": matrix_debug,
         },
     }
 
