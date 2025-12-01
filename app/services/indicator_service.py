@@ -168,31 +168,45 @@ def _resolve_iso(country: str) -> Dict[str, Any]:
     """
     Resolve ISO codes for a country using the same logic as country_lite / probe.
 
-    Returns a dict suitable for debug + provider calls:
+    Returns a dict suitable for debug + provider calls, e.g.:
       {
         "name": <canonical country name>,
         "iso_alpha_2": "DE",
         "iso_alpha_3": "DEU",
         "iso_numeric": "276"
       }
+
+    If resolution fails, we still return a dict with the input country name and
+    null ISO codes plus an "_error" hint for debugging.
     """
     try:
         from app.utils.country_codes import get_country_codes
 
         codes = get_country_codes(country) or {}
+        # When get_country_codes returns nothing, we still preserve the input.
+        if not codes:
+            return {
+                "name": country,
+                "iso_alpha_2": None,
+                "iso_alpha_3": None,
+                "iso_numeric": None,
+                "_error": "get_country_codes returned empty result",
+            }
+
         return {
             "name": codes.get("name", country),
             "iso_alpha_2": codes.get("iso_alpha_2"),
             "iso_alpha_3": codes.get("iso_alpha_3"),
             "iso_numeric": codes.get("iso_numeric"),
         }
-    except Exception:
-        # Fallback – at least preserve the country name
+    except Exception as e:
+        # Fallback – at least preserve the country name, and expose the error for _debug.
         return {
             "name": country,
             "iso_alpha_2": None,
             "iso_alpha_3": None,
             "iso_numeric": None,
+            "_error": repr(e),
         }
 
 def _resolve_iso(country: str) -> Dict[str, Any]:
