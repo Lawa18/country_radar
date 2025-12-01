@@ -209,33 +209,6 @@ def _resolve_iso(country: str) -> Dict[str, Any]:
             "_error": repr(e),
         }
 
-def _resolve_iso(country: str) -> Dict[str, Any]:
-    """
-    Resolve a country identifier into ISO codes via compat provider.
-
-    We keep this logic inside the service to decouple routes from provider
-    details. The compat provider is responsible for fuzzy matching etc.
-    """
-    try:
-        mod = _safe_import("app.providers.compat")
-        fn = _safe_get_attr(mod, "resolve_iso")
-        if fn is None:
-            raise RuntimeError("compat.resolve_iso not found")
-        iso = fn(country)
-        if not isinstance(iso, Mapping):
-            raise TypeError("compat.resolve_iso returned non-mapping")
-        return dict(iso)
-    except Exception as e:
-        # In a failure case, we still build a payload but mark the error.
-        return {
-            "name": country,
-            "iso_alpha_2": None,
-            "iso_alpha_3": None,
-            "iso_numeric": None,
-            "_error": repr(e),
-        }
-
-
 # -----------------------------------------------------------------------------
 # payload init
 # -----------------------------------------------------------------------------
