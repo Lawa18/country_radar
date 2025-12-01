@@ -166,6 +166,37 @@ def _call_provider(
 
 def _resolve_iso(country: str) -> Dict[str, Any]:
     """
+    Resolve ISO codes for a country using the same logic as country_lite / probe.
+
+    Returns a dict suitable for debug + provider calls:
+      {
+        "name": <canonical country name>,
+        "iso_alpha_2": "DE",
+        "iso_alpha_3": "DEU",
+        "iso_numeric": "276"
+      }
+    """
+    try:
+        from app.utils.country_codes import get_country_codes
+
+        codes = get_country_codes(country) or {}
+        return {
+            "name": codes.get("name", country),
+            "iso_alpha_2": codes.get("iso_alpha_2"),
+            "iso_alpha_3": codes.get("iso_alpha_3"),
+            "iso_numeric": codes.get("iso_numeric"),
+        }
+    except Exception:
+        # Fallback – at least preserve the country name
+        return {
+            "name": country,
+            "iso_alpha_2": None,
+            "iso_alpha_3": None,
+            "iso_numeric": None,
+        }
+
+def _resolve_iso(country: str) -> Dict[str, Any]:
+    """
     Resolve a country identifier into ISO codes via compat provider.
 
     We keep this logic inside the service to decouple routes from provider
