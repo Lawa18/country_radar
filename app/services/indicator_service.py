@@ -459,7 +459,7 @@ def _populate_debt_block(payload: Dict[str, Any], iso: Dict[str, Any]) -> None:
         return
 
     try:
-        debt_payload = _compute_debt_payload(country=country_name)
+        debt_payload = _compute_debt_payload(country=country)
         if not isinstance(debt_payload, Mapping):
             raise TypeError("compute_debt_payload returned non-mapping")
 
