@@ -325,177 +325,224 @@ def country_lite(
     country: str = Query(..., description="Full country name, e.g., Mexico"),
     fresh: bool = Query(False, description="Bypass cache if true"),
 ) -> JSONResponse:
-    # 0) Cache
-    if not fresh:
-        cached = _cache_get(country)
-        if cached:
-            return JSONResponse(content=cached)
-
-    iso = _iso_codes(country)
-
-    # ---- Debt block: try light WB-based ratio instead of heavy compute_debt_payload
-    debt_series_full: Dict[str, float] = {}
-    debt_latest: Dict[str, Any] = {"year": None, "value": None, "source": "computed:NA/Timeout"}
-
-    # 1) Try the heavy service, but don't let it block the route
+    started = time.time()
     try:
-        from app.services.debt_service import compute_debt_payload
+        # 0) Cache
+        if not fresh:
+            cached = _cache_get(country)
+            if cached:
+                logger.info("country_lite cache hit | country=%s", country)
+                return JSONResponse(content=cached)
 
-        heavy_debt = _with_timeout(2.0, compute_debt_payload, country) or {}
-        if heavy_debt.get("series"):
-            debt_series_full = heavy_debt.get("series") or {}
-            debt_latest = heavy_debt.get("latest") or debt_latest
-    except Exception:
-        # ignore any errors here; we fall back to WB
-        pass
+        iso = _iso_codes(country)
 
-    # 2) If still empty, fall back to a direct World Bank debt-to-GDP ratio
-    if not debt_series_full:
-        # NOTE: GC.DOD.TOTL.GD.ZS is the standard WB code for
-        # "Central government debt, total (% of GDP)".
-        # If your wb_provider uses a different code, adjust here.
-        wb_debt = _wb_series_generic(country, "GC.DOD.TOTL.GD.ZS")
-        if wb_debt:
-            debt_series_full = wb_debt
-            period, value = _latest(wb_debt)
-            year_for_latest = None
-            if period:
-                year_for_latest = str(period).split("-")[0]
-            debt_latest = {
-                "year": year_for_latest,
-                "value": value,
-                "source": "World Bank (ratio)",
-            }
+        # ---- Debt block: try light WB-based ratio instead of heavy compute_debt_payload
+        debt_series_full: Dict[str, float] = {}
+        debt_latest: Dict[str, Any] = {
+            "year": None,
+            "value": None,
+            "source": "computed:NA/Timeout",
+        }
 
-    debt_series = _trim_series_policy(debt_series_full, HIST_POLICY)
+        # 1) Try the heavy service, but don't let it block the route
+        try:
+            from app.services.debt_service import compute_debt_payload
 
-    # ---- Quarterly GDP growth (compat) — keep_hint=12
-    gdp_growth_q = _compat_fetch_series_retry("get_gdp_growth_quarterly", country, "Q", keep_hint=12)
+            heavy_debt = _with_timeout(2.0, compute_debt_payload, country) or {}
+            if heavy_debt.get("series"):
+                debt_series_full = heavy_debt.get("series") or {}
+                debt_latest = heavy_debt.get("latest") or debt_latest
+        except Exception:
+            # ignore any errors here; we fall back to WB
+            pass
 
-    # ---- Monthly set (compat) — increased keep hints (M:36; policy:48)
-    cpi_m = _compat_fetch_series_retry("get_cpi_yoy_monthly", country, "M", keep_hint=36)
-    une_m = _compat_fetch_series_retry("get_unemployment_rate_monthly", country, "M", keep_hint=36)
-    fx_m = _compat_fetch_series_retry("get_fx_rate_usd_monthly", country, "M", keep_hint=36)
-    res_m = _compat_fetch_series_retry("get_reserves_usd_monthly", country, "M", keep_hint=36)
-    policy_m = _compat_fetch_series_retry("get_policy_rate_monthly", country, "M", keep_hint=48)
+        # 2) If still empty, fall back to a direct World Bank debt-to-GDP ratio
+        if not debt_series_full:
+            # GC.DOD.TOTL.GD.ZS = "Central government debt, total (% of GDP)" (World Bank)
+            wb_debt = _wb_series_generic(country, "GC.DOD.TOTL.GD.ZS")
+            if wb_debt:
+                debt_series_full = wb_debt
+                period, value = _latest(wb_debt)
+                year_for_latest = None
+                if period:
+                    year_for_latest = str(period).split("-")[0]
+                debt_latest = {
+                    "year": year_for_latest,
+                    "value": value,
+                    "source": "World Bank (ratio)",
+                }
 
-    # ---- Annual set — WB helpers first (iso3), then generic indicator fallback
-    cab_a = _wb_series_from_helpers(country, "wb_current_account_balance_pct_gdp_annual")
-    if not cab_a:
-        cab_a = _wb_series_generic(country, "BN.CAB.XOKA.GD.ZS")
+        debt_series = _trim_series_policy(debt_series_full, HIST_POLICY)
 
-    ge_a = _wb_series_from_helpers(country, "wb_government_effectiveness_annual")
-    if not ge_a:
-        ge_a = _wb_series_generic(country, "GE.EST")
+        # ---- Quarterly GDP growth (compat) — keep_hint=12
+        gdp_growth_q = _compat_fetch_series_retry(
+            "get_gdp_growth_quarterly", country, "Q", keep_hint=12
+        )
 
-    # ---- Latest extraction
-    def _kvl(d: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
-        return _latest(d)
+        # ---- Monthly set (compat) — increased keep hints (M:36; policy:48)
+        cpi_m = _compat_fetch_series_retry(
+            "get_cpi_yoy_monthly", country, "M", keep_hint=36
+        )
+        une_m = _compat_fetch_series_retry(
+            "get_unemployment_rate_monthly", country, "M", keep_hint=36
+        )
+        fx_m = _compat_fetch_series_retry(
+            "get_fx_rate_usd_monthly", country, "M", keep_hint=36
+        )
+        res_m = _compat_fetch_series_retry(
+            "get_reserves_usd_monthly", country, "M", keep_hint=36
+        )
+        policy_m = _compat_fetch_series_retry(
+            "get_policy_rate_monthly", country, "M", keep_hint=48
+        )
 
-    cpi_p, cpi_v = _kvl(cpi_m)
-    une_p, une_v = _kvl(une_m)
-    fx_p, fx_v = _kvl(fx_m)
-    res_p, res_v = _kvl(res_m)
-    pol_p, pol_v = _kvl(policy_m)
-    gdpq_p, gdpq_v = _kvl(gdp_growth_q)
-    cab_p, cab_v = _kvl(cab_a)
-    ge_p, ge_v = _kvl(ge_a)
+        # ---- Annual set — WB helpers first (iso3), then generic indicator fallback
+        cab_a = _wb_series_from_helpers(
+            country, "wb_current_account_balance_pct_gdp_annual"
+        )
+        if not cab_a:
+            cab_a = _wb_series_generic(country, "BN.CAB.XOKA.GD.ZS")
 
-    # --- indicators_matrix from indicator_service (non-fatal)
-    indicators_matrix: Dict[str, Any] = {}
-    matrix_debug: Dict[str, Any] = {}
-    try:
-        from app.services.indicator_service import build_country_payload_v2
+        ge_a = _wb_series_from_helpers(
+            country, "wb_government_effectiveness_annual"
+        )
+        if not ge_a:
+            ge_a = _wb_series_generic(country, "GE.EST")
 
-        matrix_payload = build_country_payload_v2(country=country, series="mini", keep=60)
-        if isinstance(matrix_payload, dict):
-            indicators_matrix = matrix_payload.get("indicators_matrix") or {}
-            matrix_debug = matrix_payload.get("_debug") or {}
-    except Exception as e:
-        matrix_debug = {"error": repr(e)}
+        # ---- Latest extraction helper
+        def _kvl(d: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
+            return _latest(d)
 
-    resp: Dict[str, Any] = {
-        "country": country,
-        "iso_codes": iso,
-        # Debt block (annual, trimmed)
-        "latest": {
-            "year": debt_latest.get("year"),
-            "value": debt_latest.get("value"),
+        cpi_p, cpi_v = _kvl(cpi_m)
+        une_p, une_v = _kvl(une_m)
+        fx_p, fx_v = _kvl(fx_m)
+        res_p, res_v = _kvl(res_m)
+        pol_p, pol_v = _kvl(policy_m)
+        gdpq_p, gdpq_v = _kvl(gdp_growth_q)
+        cab_p, cab_v = _kvl(cab_a)
+        ge_p, ge_v = _kvl(ge_a)
+
+        # --- indicators_matrix from indicator_service (non-fatal, now with timeout)
+        indicators_matrix: Dict[str, Any] = {}
+        matrix_debug: Dict[str, Any] = {}
+        try:
+            from app.services.indicator_service import build_country_payload_v2
+
+            # Hard cap time spent in multi-provider matrix builder
+            matrix_payload = _with_timeout(
+                3.0,  # seconds; adjust if needed
+                build_country_payload_v2,
+                country,
+                # kwargs for the builder:
+                series="mini",
+                keep=60,
+            ) or {}
+
+            if isinstance(matrix_payload, dict):
+                indicators_matrix = (
+                    matrix_payload.get("indicators_matrix") or {}
+                )
+                matrix_debug = matrix_payload.get("_debug") or {}
+        except Exception as e:
+            matrix_debug = {"error": repr(e)}
+
+        resp: Dict[str, Any] = {
+            "country": country,
+            "iso_codes": iso,
+            # Debt block (annual, trimmed)
+            "latest": {
+                "year": debt_latest.get("year"),
+                "value": debt_latest.get("value"),
+                "source": debt_latest.get("source"),
+            },
+            "series": debt_series,
             "source": debt_latest.get("source"),
-        },
-        "series": debt_series,
-        "source": debt_latest.get("source"),
-        # Legacy top-levels retained (compatibility with older clients)
-        "imf_data": {},
-        "government_debt": {"latest": {"value": None, "date": None, "source": None}, "series": {}},
-        "nominal_gdp": {"latest": {"value": None, "date": None, "source": None}, "series": {}},
-        "debt_to_gdp": {"latest": {"value": None, "date": None, "source": None}, "series": {}},
-        "debt_to_gdp_series": {},
-        "indicators_matrix": indicators_matrix,
-        # Indicators (trimmed)
-        "additional_indicators": {
-            "cpi_yoy": {
-                "latest_value": cpi_v,
-                "latest_period": cpi_p,
-                "source": "compat/IMF",
-                "series": cpi_m,
+            # Legacy top-levels retained (compatibility with older clients)
+            "imf_data": {},
+            "government_debt": {
+                "latest": {"value": None, "date": None, "source": None},
+                "series": {},
             },
-            "unemployment_rate": {
-                "latest_value": une_v,
-                "latest_period": une_p,
-                "source": "compat/IMF",
-                "series": une_m,
+            "nominal_gdp": {
+                "latest": {"value": None, "date": None, "source": None},
+                "series": {},
             },
-            "fx_rate_usd": {
-                "latest_value": fx_v,
-                "latest_period": fx_p,
-                "source": "compat/IMF",
-                "series": fx_m,
+            "debt_to_gdp": {
+                "latest": {"value": None, "date": None, "source": None},
+                "series": {},
             },
-            "reserves_usd": {
-                "latest_value": res_v,
-                "latest_period": res_p,
-                "source": "compat/IMF",
-                "series": res_m,
+            "debt_to_gdp_series": {},
+            "indicators_matrix": indicators_matrix,
+            # Indicators (trimmed)
+            "additional_indicators": {
+                "cpi_yoy": {
+                    "latest_value": cpi_v,
+                    "latest_period": cpi_p,
+                    "source": "compat/IMF",
+                    "series": cpi_m,
+                },
+                "unemployment_rate": {
+                    "latest_value": une_v,
+                    "latest_period": une_p,
+                    "source": "compat/IMF",
+                    "series": une_m,
+                },
+                "fx_rate_usd": {
+                    "latest_value": fx_v,
+                    "latest_period": fx_p,
+                    "source": "compat/IMF",
+                    "series": fx_m,
+                },
+                "reserves_usd": {
+                    "latest_value": res_v,
+                    "latest_period": res_p,
+                    "source": "compat/IMF",
+                    "series": res_m,
+                },
+                "policy_rate": {
+                    "latest_value": pol_v,
+                    "latest_period": pol_p,
+                    "source": "compat/IMF/ECB",
+                    "series": policy_m,
+                },
+                "gdp_growth": {
+                    "latest_value": gdpq_v,
+                    "latest_period": gdpq_p,
+                    "source": "compat/IMF",
+                    "series": gdp_growth_q,
+                },
+                "current_account_balance_pct_gdp": {
+                    "latest_value": cab_v,
+                    "latest_period": cab_p,
+                    "source": "WB(helper/generic)",
+                    "series": cab_a,
+                },
+                "government_effectiveness": {
+                    "latest_value": ge_v,
+                    "latest_period": ge_p,
+                    "source": "WB(helper/generic)",
+                    "series": ge_a,
+                },
             },
-            "policy_rate": {
-                "latest_value": pol_v,
-                "latest_period": pol_p,
-                "source": "compat/IMF/ECB",
-                "series": policy_m,
+            "_debug": {
+                "builder": "country_lite v3 (probe + compat + WB-helpers + matrix)",
+                "history_policy": HIST_POLICY,
+                "matrix_from_indicator_service": matrix_debug,
             },
-            "gdp_growth": {
-                "latest_value": gdpq_v,
-                "latest_period": gdpq_p,
-                "source": "compat/IMF",
-                "series": gdp_growth_q,
-            },
-            "current_account_balance_pct_gdp": {
-                "latest_value": cab_v,
-                "latest_period": cab_p,
-                "source": "WB(helper/generic)",
-                "series": cab_a,
-            },
-            "government_effectiveness": {
-                "latest_value": ge_v,
-                "latest_period": ge_p,
-                "source": "WB(helper/generic)",
-                "series": ge_a,
-            },
-        },
-        "_debug": {
-            "builder": "country_lite v3 (probe + compat + WB-helpers + matrix)",
-            "history_policy": HIST_POLICY,
-            "matrix_from_indicator_service": matrix_debug,
-        },
-    }
+        }
 
-    try:
-        _cache_set(country, resp)
-    except Exception:
-        pass
+        try:
+            _cache_set(country, resp)
+        except Exception:
+            pass
 
-    return JSONResponse(content=resp)
+        return JSONResponse(content=resp)
+
+    finally:
+        elapsed = time.time() - started
+        logger.info(
+            "country_lite done | country=%s | elapsed=%.2fs", country, elapsed
+        )
 
 
 @router.options("/v1/country-lite", include_in_schema=False)
