@@ -325,7 +325,7 @@ def country_lite(
     country: str = Query(..., description="Full country name, e.g., Mexico"),
     fresh: bool = Query(False, description="Bypass cache if true"),
 ) -> JSONResponse:
-    started = time.time()
+    started = _time.time()
     try:
         # 0) Cache
         if not fresh:
@@ -539,7 +539,7 @@ def country_lite(
         return JSONResponse(content=resp)
 
     finally:
-        elapsed = time.time() - started
+        elapsed = _time.time() - started
         logger.info(
             "country_lite done | country=%s | elapsed=%.2fs", country, elapsed
         )
