@@ -397,22 +397,31 @@ def country_lite(
         )
 
         # ---- Annual set — WB helpers first (iso3), then generic indicator fallback
-        cab_a = _wb_series_from_helpers(
-            country, "wb_current_account_balance_pct_gdp_annual"
-        )
+
+        cab_a = _wb_series_from_helpers(country, "wb_current_account_balance_pct_gdp_annual")
         if not cab_a:
             cab_a = _wb_series_generic(country, "BN.CAB.XOKA.GD.ZS")
-
-        ge_a = _wb_series_from_helpers(
-            country, "wb_government_effectiveness_annual"
-        )
+    
+        ge_a = _wb_series_from_helpers(country, "wb_government_effectiveness_annual")
         if not ge_a:
             ge_a = _wb_series_generic(country, "GE.EST")
-
-        # ---- Latest extraction helper
+    
+        # Annual real GDP growth (% y/y) from World Bank
+        # NY.GDP.MKTP.KD.ZG = GDP growth (annual %) in constant prices
+        gdp_growth_a = _wb_series_generic(country, "NY.GDP.MKTP.KD.ZG")
+    
+        # Current account level (USD)
+        # BN.CAB.XOKA.CD = Current account balance (BoP, current US$)
+        ca_level_a = _wb_series_generic(country, "BN.CAB.XOKA.CD")
+    
+        # Fiscal balance % of GDP (if available)
+        # GC.BAL.CASH.GD.ZS = Cash surplus/deficit (% of GDP)
+        fiscal_a = _wb_series_generic(country, "GC.BAL.CASH.GD.ZS")
+    
+        # ---- Latest extraction
         def _kvl(d: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
             return _latest(d)
-
+    
         cpi_p, cpi_v = _kvl(cpi_m)
         une_p, une_v = _kvl(une_m)
         fx_p, fx_v = _kvl(fx_m)
@@ -421,6 +430,9 @@ def country_lite(
         gdpq_p, gdpq_v = _kvl(gdp_growth_q)
         cab_p, cab_v = _kvl(cab_a)
         ge_p, ge_v = _kvl(ge_a)
+        gdpya_p, gdpya_v = _kvl(gdp_growth_a)
+        ca_lvl_p, ca_lvl_v = _kvl(ca_level_a)
+        fiscal_p, fiscal_v = _kvl(fiscal_a)
 
         # --- indicators_matrix from indicator_service (non-fatal, now with timeout)
         indicators_matrix: Dict[str, Any] = {}
@@ -505,25 +517,57 @@ def country_lite(
                     "source": "compat/IMF/ECB",
                     "series": policy_m,
                 },
+                # Quarterly real GDP growth (q/q)
                 "gdp_growth": {
                     "latest_value": gdpq_v,
                     "latest_period": gdpq_p,
                     "source": "compat/IMF",
                     "series": gdp_growth_q,
                 },
+                # Annual real GDP growth (y/y, %)
+                "gdp_growth_annual": {
+                    "latest_value": gdpya_v,
+                    "latest_period": gdpya_p,
+                    "source": "WB(helper/generic)",
+                    "series": gdp_growth_a,
+                },
+                # Current account balance as % of GDP
                 "current_account_balance_pct_gdp": {
                     "latest_value": cab_v,
                     "latest_period": cab_p,
                     "source": "WB(helper/generic)",
                     "series": cab_a,
                 },
+                # Current account balance (USD level)
+                "current_account_level_usd": {
+                    "latest_value": ca_lvl_v,
+                    "latest_period": ca_lvl_p,
+                    "source": "WB(helper/generic)",
+                    "series": ca_level_a,
+                },
+                # Government effectiveness index
                 "government_effectiveness": {
                     "latest_value": ge_v,
                     "latest_period": ge_p,
                     "source": "WB(helper/generic)",
                     "series": ge_a,
                 },
+                # Government debt % of GDP, mirroring the top-level debt_latest/series
+                "gov_debt_pct_gdp": {
+                    "latest_value": debt_latest.get("value"),
+                    "latest_period": debt_latest.get("year"),
+                    "source": debt_latest.get("source"),
+                    "series": debt_series,
+                },
+                # Fiscal balance % of GDP (if WDI has it)
+                "fiscal_balance_pct_gdp": {
+                    "latest_value": fiscal_v,
+                    "latest_period": fiscal_p,
+                    "source": "WB(helper/generic)",
+                    "series": fiscal_a,
+                },
             },
+
             "_debug": {
                 "builder": "country_lite v3 (probe + compat + WB-helpers + matrix)",
                 "history_policy": HIST_POLICY,
