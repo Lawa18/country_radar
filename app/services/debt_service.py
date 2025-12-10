@@ -191,7 +191,6 @@ def _eurostat_debt_to_gdp_annual(iso2: str) -> Dict[str, float]:
             return series
     return {}
 
-
 def compute_debt_payload(country: str) -> Dict[str, Any]:
     """Compute a normalized debt bundle for a country or ISO code.
 
@@ -206,7 +205,10 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
       2. Eurostat general government gross debt (% of GDP), via
          app.providers.eurostat_provider (if implemented) – mainly for EU.
       3. World Bank GC.DOD.TOTL.GD.ZS (central gov debt % of GDP) as a
-         last-resort fallback when IMF/Eurostat are not available.
+         preferred WB ratio.
+      4. If WB ratio is missing, derive Debt-to-GDP from levels:
+           - GC.DOD.TOTL.CN vs NY.GDP.MKTP.CN  (LCU)
+           - GC.DOD.TOTL.CD vs NY.GDP.MKTP.CD  (USD)
 
     We also enforce a simple recency rule: if the latest observation for the
     chosen series is older than max_age_years (default 5), we treat the series
@@ -227,6 +229,54 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
     ratio_series: Dict[str, float] = {}
     source: Optional[str] = None
 
+    # Small helper: compute WB debt/GDP ratio from level series
+    def _wb_debt_ratio_from_levels(iso3_code: str) -> Dict[str, float]:
+        """
+        Try to compute Debt/GDP (%) from WB level series using:
+          - GC.DOD.TOTL.CN vs NY.GDP.MKTP.CN  (LCU)
+          - GC.DOD.TOTL.CD vs NY.GDP.MKTP.CD  (USD)
+        Returns a {year: ratio} dict, or {} if nothing usable.
+        """
+        # Raw WB level series (as returned by _wb_years)
+        debt_lcu_raw = _wb_years(iso3_code, "GC.DOD.TOTL.CN")
+        gdp_lcu_raw = _wb_years(iso3_code, "NY.GDP.MKTP.CN")
+
+        debt_usd_raw = _wb_years(iso3_code, "GC.DOD.TOTL.CD")
+        gdp_usd_raw = _wb_years(iso3_code, "NY.GDP.MKTP.CD")
+
+        # Normalize to {year -> float}
+        debt_lcu = _to_float_year_dict(debt_lcu_raw) if debt_lcu_raw else {}
+        gdp_lcu = _to_float_year_dict(gdp_lcu_raw) if gdp_lcu_raw else {}
+        debt_usd = _to_float_year_dict(debt_usd_raw) if debt_usd_raw else {}
+        gdp_usd = _to_float_year_dict(gdp_usd_raw) if gdp_usd_raw else {}
+
+        def _compute_ratio(
+            debt: Dict[str, float],
+            gdp: Dict[str, float],
+        ) -> Dict[str, float]:
+            out: Dict[str, float] = {}
+            for year, d_val in debt.items():
+                g_val = gdp.get(year)
+                if g_val is None:
+                    continue
+                try:
+                    if float(g_val) == 0.0:
+                        continue
+                    out[year] = float(d_val) / float(g_val) * 100.0
+                except Exception:
+                    continue
+            return out
+
+        ratio_lcu = _compute_ratio(debt_lcu, gdp_lcu) if debt_lcu and gdp_lcu else {}
+        ratio_usd = _compute_ratio(debt_usd, gdp_usd) if debt_usd and gdp_usd else {}
+
+        # Prefer the pair with more valid points
+        if ratio_lcu and len(ratio_lcu) >= len(ratio_usd):
+            return ratio_lcu
+        if ratio_usd:
+            return ratio_usd
+        return {}
+
     # 1) IMF – primary global source for general government debt % of GDP
     if iso2:
         imf_series = _imf_debt_to_gdp_annual(iso2)
@@ -235,32 +285,42 @@ def compute_debt_payload(country: str) -> Dict[str, Any]:
             source = "IMF (general government debt % of GDP)"
 
     # 2) Eurostat – optional override for EU countries if implemented
-    #    We do not attempt to detect EU membership here; we simply ask
-    #    eurostat_provider, and if it returns a non-empty series we treat
-    #    that as authoritative for the given iso2.
     if iso2:
         eurostat_series = _eurostat_debt_to_gdp_annual(iso2)
         if eurostat_series:
             ratio_series = eurostat_series
             source = "Eurostat (general government gross debt % of GDP)"
 
-    # 3) World Bank – last fallback, central gov debt % of GDP
-    #    If we still have no series but we do have iso3, try GC.DOD.TOTL.GD.ZS.
+    # 3) World Bank – preferred ratio GC.DOD.TOTL.GD.ZS
     if not ratio_series and iso3:
-        wb_series = _wb_years(iso3, "GC.DOD.TOTL.GD.ZS")
-        if wb_series:
-            ratio_series = _to_float_year_dict(wb_series)
+        wb_ratio_raw = _wb_years(iso3, "GC.DOD.TOTL.GD.ZS")
+        wb_ratio = _to_float_year_dict(wb_ratio_raw) if wb_ratio_raw else {}
+        if wb_ratio:
+            ratio_series = wb_ratio
             source = "World Bank (GC.DOD.TOTL.GD.ZS)"
+        else:
+            # 3.1) If ratio missing, derive from levels (CN/CD vs GDP CN/CD)
+            derived = _wb_debt_ratio_from_levels(iso3)
+            if derived:
+                ratio_series = derived
+                source = "World Bank (derived from levels)"
 
     # If we STILL have nothing and the `country` argument itself looks like an
     # ISO3 code, make one last attempt to use it directly for the WB fallback.
     if not ratio_series and not iso3:
         s = str(country).strip()
         if len(s) == 3 and s.isalpha():
-            wb_series = _wb_years(s.upper(), "GC.DOD.TOTL.GD.ZS")
-            if wb_series:
-                ratio_series = _to_float_year_dict(wb_series)
+            iso3_fallback = s.upper()
+            wb_ratio_raw = _wb_years(iso3_fallback, "GC.DOD.TOTL.GD.ZS")
+            wb_ratio = _to_float_year_dict(wb_ratio_raw) if wb_ratio_raw else {}
+            if wb_ratio:
+                ratio_series = wb_ratio
                 source = "World Bank (GC.DOD.TOTL.GD.ZS)"
+            else:
+                derived = _wb_debt_ratio_from_levels(iso3_fallback)
+                if derived:
+                    ratio_series = derived
+                    source = "World Bank (derived from levels)"
 
     # Recency guardrail – avoid surfacing very old single observations
     latest_year: Optional[str] = None
