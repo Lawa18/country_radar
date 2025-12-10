@@ -127,6 +127,26 @@ def fetch_worldbank_data(iso2: str, iso3: str) -> Dict[str, Optional[List[Dict[s
 # -------------------------------------------------------------------
 # INDICATOR HELPERS USED BY COUNTRY-LITE BUILDER
 # -------------------------------------------------------------------
+from typing import Dict, Optional
+
+MAX_YEARS_DEFAULT = 20  # or whatever you're using elsewhere
+
+def _wb_indicator_annual(
+    iso3: str,
+    indicator: str,
+    years: int = MAX_YEARS_DEFAULT,
+) -> Dict[str, float]:
+    """
+    Existing generic helper that:
+      - calls World Bank
+      - returns { "YYYY": value, ... } (only last `years` entries)
+    You likely already have something like this – reuse your version.
+    """
+    ...
+    # placeholder: use your existing implementation
+    return {}
+
+
 def _wb_years(iso3: str, code: str) -> Dict[str, float]:
     try:
         raw = fetch_wb_indicator_raw(iso3, code)
@@ -134,6 +154,84 @@ def _wb_years(iso3: str, code: str) -> Dict[str, float]:
     except Exception:
         return {}
 
+def wb_gov_debt_pct_gdp_annual(
+    iso3: str,
+    years: int = MAX_YEARS_DEFAULT,
+) -> Dict[str, float]:
+    """
+    Government debt as % of GDP, annual, last `years`.
+
+    Priority:
+      1) GC.DOD.TOTL.GD.ZS  (ratio directly from WB)
+      2) If missing: compute ratio from levels:
+           - GC.DOD.TOTL.CN vs NY.GDP.MKTP.CN  (LCU)
+           - GC.DOD.TOTL.CD vs NY.GDP.MKTP.CD  (USD)
+    """
+    # ---- Tier 1: direct ratio
+    direct = _wb_indicator_annual(iso3, "GC.DOD.TOTL.GD.ZS", years)
+    if direct:
+        return direct
+
+    # ---- Tier 2: compute from levels in LCU or USD
+    debt_lcu = _wb_indicator_annual(iso3, "GC.DOD.TOTL.CN", years)
+    gdp_lcu = _wb_indicator_annual(iso3, "NY.GDP.MKTP.CN", years)
+
+    debt_usd = _wb_indicator_annual(iso3, "GC.DOD.TOTL.CD", years)
+    gdp_usd = _wb_indicator_annual(iso3, "NY.GDP.MKTP.CD", years)
+
+    def _compute_ratio(
+        debt: Dict[str, float],
+        gdp: Dict[str, float],
+    ) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for year, debt_val in debt.items():
+            gdp_val = gdp.get(year)
+            if gdp_val is None or gdp_val == 0:
+                continue
+            out[year] = float(debt_val) / float(gdp_val) * 100.0
+        return out
+
+    # Prefer consistent currency pairs
+    ratio_lcu = _compute_ratio(debt_lcu, gdp_lcu) if debt_lcu and gdp_lcu else {}
+    ratio_usd = _compute_ratio(debt_usd, gdp_usd) if debt_usd and gdp_usd else {}
+
+    # Choose whichever has more data
+    if ratio_lcu and (len(ratio_lcu) >= len(ratio_usd)):
+        ratios = ratio_lcu
+    elif ratio_usd:
+        ratios = ratio_usd
+    else:
+        return {}
+
+    # Optionally trim to last `years` entries if needed
+    if len(ratios) > years:
+        # sort by year, keep most recent `years`
+        items = sorted(ratios.items(), key=lambda kv: kv[0])[-years:]
+        ratios = {k: v for k, v in items}
+
+    return ratios
+
+FISCAL_BALANCE_RATIO_CODES = [
+    "GC.NLD.TOTL.GD.ZS",    # Net lending (+) / borrowing (-), % of GDP
+    "GC.BAL.CASH.GD.ZS",    # Cash surplus / deficit, % of GDP
+]
+
+def wb_fiscal_balance_pct_gdp_annual(
+    iso3: str,
+    years: int = MAX_YEARS_DEFAULT,
+) -> Dict[str, float]:
+    """
+    Fiscal balance (% of GDP), annual, last `years`.
+
+    Tries several WB codes and returns the first one that has data.
+    """
+    for code in FISCAL_BALANCE_RATIO_CODES:
+        series = _wb_indicator_annual(iso3, code, years)
+        if series:
+            return series
+
+    # (Optional) later: compute from level indicators if you want.
+    return {}
 
 def wb_cpi_yoy_annual(iso3: str) -> Dict[str, float]:
     return _wb_years(iso3, "FP.CPI.TOTL.ZG")
