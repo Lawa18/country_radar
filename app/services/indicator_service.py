@@ -766,10 +766,82 @@ def _build_country_payload_v2_core(
     # Populate matrix indicators (IMF + WB + Eurostat + OECD + GMD + DBnomics)
     _populate_indicator_matrix(payload, iso, series_mode=series, keep=keep)
 
-    # Enrich with debt data if available
+    # Enrich with debt data if available (uses compute_debt_payload under the hood)
     _populate_debt_block(payload, iso)
 
+    # Make sure additional_indicators.gov_debt_pct_gdp is wired
+    # from the normalized debt_to_gdp bundle (IMF/Eurostat/WB/derived).
+    _populate_debt_fiscal_additional_indicators(payload)
+
     return payload
+
+
+def _populate_debt_fiscal_additional_indicators(payload: Dict[str, Any]) -> None:
+    """
+    Ensure that the normalized Debt-to-GDP series coming from debt_service
+    is surfaced in additional_indicators.gov_debt_pct_gdp so that clients
+    (and /v1/country-lite) see a consistent debt % of GDP field.
+
+    - Reads from top-level payload["debt_to_gdp"] and/or payload["debt_to_gdp_series"]
+      which are populated by _populate_debt_block (compute_debt_payload).
+    - Only touches additional_indicators["gov_debt_pct_gdp"].
+    - If that block already exists, it will only backfill missing latest_value /
+      series; it will not overwrite non-null values.
+    """
+    # Ensure we have an additional_indicators dict
+    addl = payload.setdefault("additional_indicators", {})
+
+    # ---- Extract debt_to_gdp info from the top-level bundle ----
+    debt_block = payload.get("debt_to_gdp")
+    series_from_block: Dict[str, float] = {}
+    latest_value: Optional[float] = None
+    latest_period: Optional[str] = None
+    latest_source: Optional[str] = None
+
+    if isinstance(debt_block, Mapping):
+        latest = debt_block.get("latest") or {}
+        series_from_block = debt_block.get("series") or {}
+        latest_value = latest.get("value")
+        latest_period = latest.get("date")
+        latest_source = latest.get("source")
+    else:
+        # Fallback: compute latest from debt_to_gdp_series if present
+        raw_series = payload.get("debt_to_gdp_series") or {}
+        if isinstance(raw_series, Mapping) and raw_series:
+            series_from_block = raw_series
+            try:
+                years_sorted = sorted(series_from_block.keys(), key=lambda y: int(str(y)))
+                latest_period = years_sorted[-1]
+                latest_value = series_from_block[latest_period]
+            except Exception:
+                latest_period = None
+                latest_value = None
+
+    # If we still have nothing, there's nothing to map
+    if latest_value is None and not series_from_block:
+        return
+
+    # ---- Wire into additional_indicators.gov_debt_pct_gdp ----
+    gov_block = addl.get("gov_debt_pct_gdp")
+
+    if not isinstance(gov_block, Mapping):
+        # Create a fresh block
+        addl["gov_debt_pct_gdp"] = {
+            "latest_value": latest_value,
+            "latest_period": latest_period,
+            "source": latest_source or "debt_service",
+            "series": series_from_block,
+        }
+    else:
+        # Backfill missing fields without clobbering existing good data
+        if gov_block.get("latest_value") is None and latest_value is not None:
+            gov_block["latest_value"] = latest_value
+            gov_block["latest_period"] = latest_period
+            if latest_source:
+                gov_block["source"] = latest_source
+
+        if not gov_block.get("series") and series_from_block:
+            gov_block["series"] = series_from_block
 
 
 # -----------------------------------------------------------------------------
