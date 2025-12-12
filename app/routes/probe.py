@@ -301,7 +301,6 @@ def provider_probe() -> JSONResponse:
 
     return JSONResponse(content={"modules": info})
 
-
 # -----------------------------------------------------------------------------
 # Country-lite: compat-first, WB-backed, bounded windows
 # -----------------------------------------------------------------------------
@@ -348,33 +347,39 @@ def country_lite(
     try:
         from app.services.debt_service import compute_debt_payload
 
-        # Wrap in a hard timeout so /v1/country-lite never blocks on heavy debt logic.
+        # Hard timeout so /v1/country-lite never blocks on debt logic
         bundle = _with_timeout(2.0, compute_debt_payload, country) or {}
-        if isinstance(bundle, Mapping):
-            debt_bundle = bundle
+    except Exception as e:
+        logger.warning("country_lite debt block import/call error for %s: %r", country, e)
+        bundle = {}
 
-            # Preferred: normalized block from debt_service
-            debt_block = bundle.get("debt_to_gdp") or {}
-            series = debt_block.get("series") or bundle.get("debt_to_gdp_series") or {}
+    if isinstance(bundle, Mapping):
+        debt_bundle = bundle
 
-            if isinstance(series, Mapping) and series:
-                # Trim history using the same HIST_POLICY as other A/Q/M series
-                debt_series_full = series
-                try:
-                    years_sorted = sorted(series.keys(), key=lambda y: int(str(y)))
-                    latest_year = years_sorted[-1]
-                    latest_val = series[latest_year]
-                except Exception:
-                    latest_year = None
-                    latest_val = None
+        # Prefer normalized block from debt_service
+        debt_block = bundle.get("debt_to_gdp") or {}
+        series = debt_block.get("series") or bundle.get("debt_to_gdp_series") or {}
 
-                latest_meta = debt_block.get("latest") or {}
-                debt_latest_summary = {
-                    "year": latest_year,
-                    "value": latest_val,
-                    "source": latest_meta.get("source")
-                    or "debt_service",
-                }
+        if isinstance(series, Mapping) and series:
+            debt_series_full = series
+            try:
+                years_sorted = sorted(series.keys(), key=lambda y: int(str(y)))
+                latest_year = years_sorted[-1]
+                latest_val = series[latest_year]
+            except Exception:
+                latest_year = None
+                latest_val = None
+
+            latest_meta = debt_block.get("latest") or {}
+            debt_latest_summary = {
+                "year": latest_year,
+                "value": latest_val,
+                "source": latest_meta.get("source") or "debt_service",
+            }
+
+    # Apply history trimming (annual window from HIST_POLICY["A"])
+    debt_series = _trim_series_policy(debt_series_full, HIST_POLICY)
+
     except Exception as e:
         # We don't want debt issues to break the whole route.
         logger.warning("country_lite debt block error for %s: %r", country, e)
