@@ -336,43 +336,51 @@ def country_lite(
 
         iso = _iso_codes(country)
 
-        # ---- Debt block: try light WB-based ratio instead of heavy compute_debt_payload
-        debt_series_full: Dict[str, float] = {}
-        debt_latest: Dict[str, Any] = {
-            "year": None,
-            "value": None,
-            "source": "computed:NA/Timeout",
-        }
+    # ---- Debt block: reuse normalized bundle from debt_service (with timeout)
+    debt_series_full: Dict[str, float] = {}
+    debt_latest_summary: Dict[str, Any] = {
+        "year": None,
+        "value": None,
+        "source": "computed:NA/Timeout",
+    }
+    debt_bundle: Dict[str, Any] = {}
 
-        # 1) Try the heavy service, but don't let it block the route
-        try:
-            from app.services.debt_service import compute_debt_payload
+    try:
+        from app.services.debt_service import compute_debt_payload
 
-            heavy_debt = _with_timeout(2.0, compute_debt_payload, country) or {}
-            if heavy_debt.get("series"):
-                debt_series_full = heavy_debt.get("series") or {}
-                debt_latest = heavy_debt.get("latest") or debt_latest
-        except Exception:
-            # ignore any errors here; we fall back to WB
-            pass
+        # Wrap in a hard timeout so /v1/country-lite never blocks on heavy debt logic.
+        bundle = _with_timeout(2.0, compute_debt_payload, country) or {}
+        if isinstance(bundle, Mapping):
+            debt_bundle = bundle
 
-        # 2) If still empty, fall back to a direct World Bank debt-to-GDP ratio
-        if not debt_series_full:
-            # GC.DOD.TOTL.GD.ZS = "Central government debt, total (% of GDP)" (World Bank)
-            wb_debt = _wb_series_generic(country, "GC.DOD.TOTL.GD.ZS")
-            if wb_debt:
-                debt_series_full = wb_debt
-                period, value = _latest(wb_debt)
-                year_for_latest = None
-                if period:
-                    year_for_latest = str(period).split("-")[0]
-                debt_latest = {
-                    "year": year_for_latest,
-                    "value": value,
-                    "source": "World Bank (ratio)",
+            # Preferred: normalized block from debt_service
+            debt_block = bundle.get("debt_to_gdp") or {}
+            series = debt_block.get("series") or bundle.get("debt_to_gdp_series") or {}
+
+            if isinstance(series, Mapping) and series:
+                # Trim history using the same HIST_POLICY as other A/Q/M series
+                debt_series_full = series
+                try:
+                    years_sorted = sorted(series.keys(), key=lambda y: int(str(y)))
+                    latest_year = years_sorted[-1]
+                    latest_val = series[latest_year]
+                except Exception:
+                    latest_year = None
+                    latest_val = None
+
+                latest_meta = debt_block.get("latest") or {}
+                debt_latest_summary = {
+                    "year": latest_year,
+                    "value": latest_val,
+                    "source": latest_meta.get("source")
+                    or "debt_service",
                 }
+    except Exception as e:
+        # We don't want debt issues to break the whole route.
+        logger.warning("country_lite debt block error for %s: %r", country, e)
 
-        debt_series = _trim_series_policy(debt_series_full, HIST_POLICY)
+    # Apply history trimming (annual window from HIST_POLICY["A"])
+    debt_series = _trim_series_policy(debt_series_full, HIST_POLICY)
 
         # ---- Quarterly GDP growth (compat) — keep_hint=12
         gdp_growth_q = _compat_fetch_series_retry(
@@ -463,27 +471,21 @@ def country_lite(
             "iso_codes": iso,
             # Debt block (annual, trimmed)
             "latest": {
-                "year": debt_latest.get("year"),
-                "value": debt_latest.get("value"),
-                "source": debt_latest.get("source"),
+                "year": debt_latest_summary.get("year"),
+                "value": debt_latest_summary.get("value"),
+                "source": debt_latest_summary.get("source"),
             },
             "series": debt_series,
-            "source": debt_latest.get("source"),
+            "source": debt_latest_summary.get("source"),
             # Legacy top-levels retained (compatibility with older clients)
             "imf_data": {},
-            "government_debt": {
-                "latest": {"value": None, "date": None, "source": None},
-                "series": {},
-            },
-            "nominal_gdp": {
-                "latest": {"value": None, "date": None, "source": None},
-                "series": {},
-            },
-            "debt_to_gdp": {
-                "latest": {"value": None, "date": None, "source": None},
-                "series": {},
-            },
-            "debt_to_gdp_series": {},
+            "government_debt": debt_bundle.get("government_debt")
+            or {"latest": {"value": None, "date": None, "source": None}, "series": {}},
+            "nominal_gdp": debt_bundle.get("nominal_gdp")
+            or {"latest": {"value": None, "date": None, "source": None}, "series": {}},
+            "debt_to_gdp": debt_bundle.get("debt_to_gdp")
+            or {"latest": {"value": None, "date": None, "source": None}, "series": {}},
+            "debt_to_gdp_series": debt_bundle.get("debt_to_gdp_series") or debt_series,
             "indicators_matrix": indicators_matrix,
             # Indicators (trimmed)
             "additional_indicators": {
@@ -517,57 +519,25 @@ def country_lite(
                     "source": "compat/IMF/ECB",
                     "series": policy_m,
                 },
-                # Quarterly real GDP growth (q/q)
                 "gdp_growth": {
                     "latest_value": gdpq_v,
                     "latest_period": gdpq_p,
                     "source": "compat/IMF",
                     "series": gdp_growth_q,
                 },
-                # Annual real GDP growth (y/y, %)
-                "gdp_growth_annual": {
-                    "latest_value": gdpya_v,
-                    "latest_period": gdpya_p,
-                    "source": "WB(helper/generic)",
-                    "series": gdp_growth_a,
-                },
-                # Current account balance as % of GDP
                 "current_account_balance_pct_gdp": {
                     "latest_value": cab_v,
                     "latest_period": cab_p,
                     "source": "WB(helper/generic)",
                     "series": cab_a,
                 },
-                # Current account balance (USD level)
-                "current_account_level_usd": {
-                    "latest_value": ca_lvl_v,
-                    "latest_period": ca_lvl_p,
-                    "source": "WB(helper/generic)",
-                    "series": ca_level_a,
-                },
-                # Government effectiveness index
                 "government_effectiveness": {
                     "latest_value": ge_v,
                     "latest_period": ge_p,
                     "source": "WB(helper/generic)",
                     "series": ge_a,
                 },
-                # Government debt % of GDP, mirroring the top-level debt_latest/series
-                "gov_debt_pct_gdp": {
-                    "latest_value": debt_latest.get("value"),
-                    "latest_period": debt_latest.get("year"),
-                    "source": debt_latest.get("source"),
-                    "series": debt_series,
-                },
-                # Fiscal balance % of GDP (if WDI has it)
-                "fiscal_balance_pct_gdp": {
-                    "latest_value": fiscal_v,
-                    "latest_period": fiscal_p,
-                    "source": "WB(helper/generic)",
-                    "series": fiscal_a,
-                },
             },
-
             "_debug": {
                 "builder": "country_lite v3 (probe + compat + WB-helpers + matrix)",
                 "history_policy": HIST_POLICY,
