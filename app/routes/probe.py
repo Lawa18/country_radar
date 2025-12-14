@@ -325,15 +325,15 @@ def country_lite(
     fresh: bool = Query(False, description="Bypass cache if true"),
 ) -> JSONResponse:
     started = _time.time()
-    try:
-        # 0) Cache
-        if not fresh:
-            cached = _cache_get(country)
-            if cached:
-                logger.info("country_lite cache hit | country=%s", country)
-                return JSONResponse(content=cached)
 
-        iso = _iso_codes(country)
+    # 0) Cache
+    if not fresh:
+        cached = _cache_get(country)
+        if cached:
+            logger.info("country_lite cache hit | country=%s", country)
+            return JSONResponse(content=cached)
+
+    iso = _iso_codes(country)
 
     # ---- Debt block: reuse normalized bundle from debt_service (with timeout)
     debt_series_full: Dict[str, float] = {}
@@ -346,26 +346,23 @@ def country_lite(
 
     try:
         from app.services.debt_service import compute_debt_payload
-
-        # Hard timeout so /v1/country-lite never blocks on debt logic
         bundle = _with_timeout(2.0, compute_debt_payload, country) or {}
     except Exception as e:
         logger.warning("country_lite debt block import/call error for %s: %r", country, e)
         bundle = {}
 
     if isinstance(bundle, Mapping):
-        debt_bundle = bundle
+        debt_bundle = dict(bundle)
 
-        # Prefer normalized block from debt_service
         debt_block = bundle.get("debt_to_gdp") or {}
         series = debt_block.get("series") or bundle.get("debt_to_gdp_series") or {}
 
         if isinstance(series, Mapping) and series:
-            debt_series_full = series
+            debt_series_full = dict(series)
             try:
-                years_sorted = sorted(series.keys(), key=lambda y: int(str(y)))
+                years_sorted = sorted(debt_series_full.keys(), key=lambda y: int(str(y)))
                 latest_year = years_sorted[-1]
-                latest_val = series[latest_year]
+                latest_val = debt_series_full[latest_year]
             except Exception:
                 latest_year = None
                 latest_val = None
@@ -380,96 +377,69 @@ def country_lite(
     # Apply history trimming (annual window from HIST_POLICY["A"])
     debt_series = _trim_series_policy(debt_series_full, HIST_POLICY)
 
+    # ---- Quarterly GDP growth (compat) — keep_hint=12
+    gdp_growth_q = _compat_fetch_series_retry("get_gdp_growth_quarterly", country, "Q", keep_hint=12)
+
+    # ---- Monthly set (compat)
+    cpi_m = _compat_fetch_series_retry("get_cpi_yoy_monthly", country, "M", keep_hint=36)
+    une_m = _compat_fetch_series_retry("get_unemployment_rate_monthly", country, "M", keep_hint=36)
+    fx_m = _compat_fetch_series_retry("get_fx_rate_usd_monthly", country, "M", keep_hint=36)
+    res_m = _compat_fetch_series_retry("get_reserves_usd_monthly", country, "M", keep_hint=36)
+    policy_m = _compat_fetch_series_retry("get_policy_rate_monthly", country, "M", keep_hint=48)
+
+    # ---- Annual set — WB helpers first (iso3), then generic indicator fallback
+    cab_a = _wb_series_from_helpers(country, "wb_current_account_balance_pct_gdp_annual")
+    if not cab_a:
+        cab_a = _wb_series_generic(country, "BN.CAB.XOKA.GD.ZS")
+
+    ge_a = _wb_series_from_helpers(country, "wb_government_effectiveness_annual")
+    if not ge_a:
+        ge_a = _wb_series_generic(country, "GE.EST")
+
+    # Annual real GDP growth (% y/y)
+    gdp_growth_a = _wb_series_generic(country, "NY.GDP.MKTP.KD.ZG")
+
+    # Current account level (USD)
+    ca_level_a = _wb_series_generic(country, "BN.CAB.XOKA.CD")
+
+    # Fiscal balance % GDP (WB)
+    fiscal_a = _wb_series_generic(country, "GC.BAL.CASH.GD.ZS")
+
+    # ---- Latest extraction
+    def _kvl(d: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
+        return _latest(d)
+
+    cpi_p, cpi_v = _kvl(cpi_m)
+    une_p, une_v = _kvl(une_m)
+    fx_p, fx_v = _kvl(fx_m)
+    res_p, res_v = _kvl(res_m)
+    pol_p, pol_v = _kvl(policy_m)
+    gdpq_p, gdpq_v = _kvl(gdp_growth_q)
+    cab_p, cab_v = _kvl(cab_a)
+    ge_p, ge_v = _kvl(ge_a)
+    gdpya_p, gdpya_v = _kvl(gdp_growth_a)
+    ca_lvl_p, ca_lvl_v = _kvl(ca_level_a)
+    fiscal_p, fiscal_v = _kvl(fiscal_a)
+
+    # --- indicators_matrix from indicator_service (non-fatal, with timeout)
+    indicators_matrix: Dict[str, Any] = {}
+    matrix_debug: Dict[str, Any] = {}
+    try:
+        from app.services.indicator_service import build_country_payload_v2
+
+        matrix_payload = _with_timeout(
+            3.0,
+            build_country_payload_v2,
+            country,
+            series="mini",
+            keep=60,
+        ) or {}
+
+        if isinstance(matrix_payload, dict):
+            indicators_matrix = matrix_payload.get("indicators_matrix") or {}
+            matrix_debug = matrix_payload.get("_debug") or {}
     except Exception as e:
-        # We don't want debt issues to break the whole route.
-        logger.warning("country_lite debt block error for %s: %r", country, e)
-
-    # Apply history trimming (annual window from HIST_POLICY["A"])
-    debt_series = _trim_series_policy(debt_series_full, HIST_POLICY)
-
-        # ---- Quarterly GDP growth (compat) — keep_hint=12
-        gdp_growth_q = _compat_fetch_series_retry(
-            "get_gdp_growth_quarterly", country, "Q", keep_hint=12
-        )
-
-        # ---- Monthly set (compat) — increased keep hints (M:36; policy:48)
-        cpi_m = _compat_fetch_series_retry(
-            "get_cpi_yoy_monthly", country, "M", keep_hint=36
-        )
-        une_m = _compat_fetch_series_retry(
-            "get_unemployment_rate_monthly", country, "M", keep_hint=36
-        )
-        fx_m = _compat_fetch_series_retry(
-            "get_fx_rate_usd_monthly", country, "M", keep_hint=36
-        )
-        res_m = _compat_fetch_series_retry(
-            "get_reserves_usd_monthly", country, "M", keep_hint=36
-        )
-        policy_m = _compat_fetch_series_retry(
-            "get_policy_rate_monthly", country, "M", keep_hint=48
-        )
-
-        # ---- Annual set — WB helpers first (iso3), then generic indicator fallback
-
-        cab_a = _wb_series_from_helpers(country, "wb_current_account_balance_pct_gdp_annual")
-        if not cab_a:
-            cab_a = _wb_series_generic(country, "BN.CAB.XOKA.GD.ZS")
-    
-        ge_a = _wb_series_from_helpers(country, "wb_government_effectiveness_annual")
-        if not ge_a:
-            ge_a = _wb_series_generic(country, "GE.EST")
-    
-        # Annual real GDP growth (% y/y) from World Bank
-        # NY.GDP.MKTP.KD.ZG = GDP growth (annual %) in constant prices
-        gdp_growth_a = _wb_series_generic(country, "NY.GDP.MKTP.KD.ZG")
-    
-        # Current account level (USD)
-        # BN.CAB.XOKA.CD = Current account balance (BoP, current US$)
-        ca_level_a = _wb_series_generic(country, "BN.CAB.XOKA.CD")
-    
-        # Fiscal balance % of GDP (if available)
-        # GC.BAL.CASH.GD.ZS = Cash surplus/deficit (% of GDP)
-        fiscal_a = _wb_series_generic(country, "GC.BAL.CASH.GD.ZS")
-    
-        # ---- Latest extraction
-        def _kvl(d: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
-            return _latest(d)
-    
-        cpi_p, cpi_v = _kvl(cpi_m)
-        une_p, une_v = _kvl(une_m)
-        fx_p, fx_v = _kvl(fx_m)
-        res_p, res_v = _kvl(res_m)
-        pol_p, pol_v = _kvl(policy_m)
-        gdpq_p, gdpq_v = _kvl(gdp_growth_q)
-        cab_p, cab_v = _kvl(cab_a)
-        ge_p, ge_v = _kvl(ge_a)
-        gdpya_p, gdpya_v = _kvl(gdp_growth_a)
-        ca_lvl_p, ca_lvl_v = _kvl(ca_level_a)
-        fiscal_p, fiscal_v = _kvl(fiscal_a)
-
-        # --- indicators_matrix from indicator_service (non-fatal, now with timeout)
-        indicators_matrix: Dict[str, Any] = {}
-        matrix_debug: Dict[str, Any] = {}
-        try:
-            from app.services.indicator_service import build_country_payload_v2
-
-            # Hard cap time spent in multi-provider matrix builder
-            matrix_payload = _with_timeout(
-                3.0,  # seconds; adjust if needed
-                build_country_payload_v2,
-                country,
-                # kwargs for the builder:
-                series="mini",
-                keep=60,
-            ) or {}
-
-            if isinstance(matrix_payload, dict):
-                indicators_matrix = (
-                    matrix_payload.get("indicators_matrix") or {}
-                )
-                matrix_debug = matrix_payload.get("_debug") or {}
-        except Exception as e:
-            matrix_debug = {"error": repr(e)}
+        matrix_debug = {"error": repr(e)}
 
         resp: Dict[str, Any] = {
             "country": country,
