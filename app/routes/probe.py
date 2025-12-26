@@ -63,7 +63,6 @@ def _coerce_numeric_series(d: Optional[Mapping[str, Any]]) -> Dict[str, float]:
         try:
             out[str(k)] = float(v)
         except Exception:
-            # ignore non-numeric
             pass
     return out
 
@@ -71,24 +70,16 @@ def _coerce_numeric_series(d: Optional[Mapping[str, Any]]) -> Dict[str, float]:
 def _latest(series: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
     if not series:
         return None, None
-    # sort by key; this assumes period-like keys but is fine for diagnostics
     keys = sorted(series.keys())
     k = keys[-1]
     return k, series[k]
 
 
 def _freq_of_key(k: str) -> str:
-    """
-    Very rough frequency detection from a period key.
-    - YYYY       -> A
-    - YYYY-Qn    -> Q
-    - YYYY-MM    -> M
-    """
     s = str(k)
     if "-Q" in s:
         return "Q"
     if "-" in s:
-        # if second part looks like MM, treat as monthly
         parts = s.split("-")
         if len(parts) >= 2 and parts[0].isdigit():
             return "M"
@@ -96,10 +87,6 @@ def _freq_of_key(k: str) -> str:
 
 
 def _trim_series_policy(series: Mapping[str, float], policy: Dict[str, int]) -> Dict[str, float]:
-    """
-    Trim a mixed or single-freq series to the policy windows by freq.
-    For mixed keys (rare), we group by freq and trim each group.
-    """
     if not series:
         return {}
     buckets: Dict[str, Dict[str, float]] = {"A": {}, "Q": {}, "M": {}}
@@ -144,20 +131,15 @@ def _cache_get(country: str) -> Optional[Dict[str, Any]]:
 
 
 def _cache_set(country: str, payload: Dict[str, Any]) -> None:
-    # Cache key normalized to avoid "Mexico" vs "mexico" misses.
     _COUNTRY_CACHE[country.lower()] = (_time.time(), payload)
 
 # -----------------------------------------------------------------------------
-# Compat provider wrapper (with retries + basic timeouts)
+# Thread pool + timeouts
 # -----------------------------------------------------------------------------
-_EXECUTOR = _futures.ThreadPoolExecutor(max_workers=8)
+_EXECUTOR = _futures.ThreadPoolExecutor(max_workers=10)
 
 
 def _with_timeout(timeout_s: float, fn, *args, **kwargs):
-    """
-    Run fn(*args, **kwargs) in a thread pool with a hard timeout.
-    Used to keep country-lite from blocking on heavy calls.
-    """
     fut = _EXECUTOR.submit(fn, *args, **kwargs)
     try:
         return fut.result(timeout=timeout_s)
@@ -169,10 +151,10 @@ def _with_timeout(timeout_s: float, fn, *args, **kwargs):
         return None
 
 
-def _compat_fetch_series(func_name: str, country: str, want_freq: str, keep_hint: int) -> Dict[str, float]:
-    """
-    Call app.providers.compat.<func_name>(country=...) and coerce numeric series.
-    """
+# -----------------------------------------------------------------------------
+# Compat provider wrapper (with retries)
+# -----------------------------------------------------------------------------
+def _compat_fetch_series(func_name: str, country: str, keep_hint: int) -> Dict[str, float]:
     mod = _safe_import("app.providers.compat")
     if not mod:
         return {}
@@ -182,8 +164,10 @@ def _compat_fetch_series(func_name: str, country: str, want_freq: str, keep_hint
     try:
         raw = fn(country, keep=keep_hint)
     except TypeError:
-        # older compat signatures might not accept keep=
-        raw = fn(country)
+        try:
+            raw = fn(country)
+        except Exception:
+            return {}
     except Exception:
         return {}
     series = _coerce_numeric_series(raw)
@@ -193,57 +177,26 @@ def _compat_fetch_series(func_name: str, country: str, want_freq: str, keep_hint
 def _compat_fetch_series_retry(
     func_name: str,
     country: str,
-    want_freq: str,
     keep_hint: int,
     retries: int = 1,
 ) -> Dict[str, float]:
-    """
-    Retry compat fetch once on failure (simple heuristic).
-    """
-    series = _compat_fetch_series(func_name, country, want_freq, keep_hint)
+    series = _compat_fetch_series(func_name, country, keep_hint)
     if series:
         return series
     if retries <= 0:
         return series
-    # brief pause and try once more
     _time.sleep(0.1)
-    return _compat_fetch_series(func_name, country, want_freq, keep_hint)
+    return _compat_fetch_series(func_name, country, keep_hint)
 
 
 def _get_iso3(country: str) -> Optional[str]:
     try:
-        codes = _iso_codes(country)
-        return codes.get("iso_alpha_3")
+        return (_iso_codes(country) or {}).get("iso_alpha_3")
     except Exception:
         return None
 
 
-def _wb_series_from_helpers(country: str, helper_name: str) -> Dict[str, float]:
-    """
-    Call a World Bank *helper* (e.g., wb_current_account_balance_pct_gdp_annual)
-    exposed on app.providers.wb_provider if present.
-    """
-    mod = _safe_import("app.providers.wb_provider")
-    if not mod:
-        return {}
-    helper = getattr(mod, helper_name, None)
-    if not callable(helper):
-        return {}
-    try:
-        iso3 = _get_iso3(country)
-        if not iso3:
-            return {}
-        raw = helper(iso3)
-        series = _coerce_numeric_series(raw)
-        return _trim_series_policy(series, HIST_POLICY)
-    except Exception:
-        return {}
-
-
 def _wb_series_generic(country: str, indicator_code: str) -> Dict[str, float]:
-    """
-    Generic call to World Bank WDI using country ISO3 and an indicator code.
-    """
     mod = _safe_import("app.providers.wb_provider")
     if not mod:
         return {}
@@ -265,12 +218,8 @@ def _wb_series_generic(country: str, indicator_code: str) -> Dict[str, float]:
 # -----------------------------------------------------------------------------
 # Provider probe endpoint (for diagnostics)
 # -----------------------------------------------------------------------------
-
 @router.get("/v1/provider-probe")
 def provider_probe() -> JSONResponse:
-    """
-    Introspect compat/imf/wb providers and list public callables.
-    """
     modules = {
         "compat": _safe_import("app.providers.compat"),
         "imf": _safe_import("app.providers.imf_provider"),
@@ -282,29 +231,20 @@ def provider_probe() -> JSONResponse:
         if not mod:
             info[name] = {"available": False}
             continue
-        info[name] = {
-            "available": True,
-            "public_callables": [],
-        }
+        info[name] = {"available": True, "public_callables": []}
         for fn_name, fn in _iter_public_callables(mod):
             try:
                 sig = str(inspect.signature(fn))
             except Exception:
                 sig = "(unknown)"
-            info[name]["public_callables"].append(
-                {
-                    "name": fn_name,
-                    "signature": sig,
-                }
-            )
+            info[name]["public_callables"].append({"name": fn_name, "signature": sig})
 
     return JSONResponse(content={"modules": info})
 
-# -----------------------------------------------------------------------------
-# Country-lite: compat-first, WB-backed, bounded windows
-# -----------------------------------------------------------------------------
 
-
+# -----------------------------------------------------------------------------
+# Country-lite: fast, bounded, cached
+# -----------------------------------------------------------------------------
 @router.get(
     "/v1/country-lite",
     summary="Country Lite",
@@ -313,9 +253,9 @@ def provider_probe() -> JSONResponse:
     description=(
         "Compat-first snapshot with bounded history windows:\n"
         "  - Debt-to-GDP (annual, last 20y) — hard timeout to avoid route blocking\n"
-        "  - GDP growth (quarterly, last 4q)\n"
+        "  - GDP growth (quarterly, last 12q)\n"
         "  - Monthly set (CPI YoY, Unemployment, FX, Reserves, Policy Rate)\n"
-        "  - Annual set (Current Account % GDP, Government Effectiveness)\n"
+        "  - Annual set (Current Account % GDP, Government Effectiveness, GDP growth annual)\n"
         "This is a lighter-weight alternative to the full /country-data route."
     ),
 )
@@ -325,9 +265,7 @@ def country_lite(
 ) -> JSONResponse:
     started = _time.time()
 
-    # ----------------------------
     # 0) Cache
-    # ----------------------------
     if not fresh:
         cached = _cache_get(country)
         if cached:
@@ -337,22 +275,7 @@ def country_lite(
     iso = _iso_codes(country)
 
     # ----------------------------
-    # Helper to safely fetch compat series without killing the route
-    # ----------------------------
-    def _safe_compat(fn_name: str, freq: str, keep_hint: int) -> Dict[str, float]:
-        try:
-            return _compat_fetch_series_retry(fn_name, country, freq, keep_hint=keep_hint) or {}
-        except Exception:
-            return {}
-
-    def _safe_wb(indicator_code: str) -> Dict[str, float]:
-        try:
-            return _wb_series_generic(country, indicator_code) or {}
-        except Exception:
-            return {}
-
-    # ----------------------------
-    # 1) Debt (hard timeout)
+    # 1) Debt bundle (hard timeout)
     # ----------------------------
     debt_series_full: Dict[str, float] = {}
     debt_latest_summary: Dict[str, Any] = {"year": None, "value": None, "source": "computed:NA/Timeout"}
@@ -360,7 +283,7 @@ def country_lite(
 
     try:
         from app.services.debt_service import compute_debt_payload
-        bundle = _with_timeout(1.8, compute_debt_payload, country) or {}
+        bundle = _with_timeout(2.0, compute_debt_payload, country) or {}
     except Exception as e:
         logger.warning("country_lite debt import/call error for %s: %r", country, e)
         bundle = {}
@@ -372,89 +295,89 @@ def country_lite(
 
         if isinstance(series, Mapping) and series:
             debt_series_full = dict(series)
+            y, v = _latest(debt_series_full)
             try:
-                years_sorted = sorted(debt_series_full.keys(), key=lambda y: int(str(y)))
-                latest_year = years_sorted[-1]
-                latest_val = debt_series_full[latest_year]
+                y_norm = str(y) if y is not None else None
             except Exception:
-                latest_year = None
-                latest_val = None
+                y_norm = None
 
-            latest_meta = debt_block.get("latest") or {}
+            meta = debt_block.get("latest") or {}
             debt_latest_summary = {
-                "year": latest_year,
-                "value": latest_val,
-                "source": latest_meta.get("source") or "debt_service",
+                "year": y_norm,
+                "value": v,
+                "source": meta.get("source") or "debt_service",
             }
 
     debt_series = _trim_series_policy(debt_series_full, HIST_POLICY)
 
     # ----------------------------
-    # 2) Parallel fetches (compat monthly+quarterly + WB annual)
-    #    This prevents serial 20–60s behavior.
+    # 2) Parallel bounded fetches
     # ----------------------------
-    futures: Dict[str, Any] = {}
-    with _futures.ThreadPoolExecutor(max_workers=10) as ex:
-        # Quarterly (compat)
-        futures["gdp_growth_q"] = ex.submit(_safe_compat, "get_gdp_growth_quarterly", "Q", 12)
+    futs: Dict[str, Any] = {}
+    futs["gdp_growth_q"] = _EXECUTOR.submit(_compat_fetch_series_retry, "get_gdp_growth_quarterly", country, 12, 1)
 
-        # Monthly (compat)
-        futures["cpi_m"] = ex.submit(_safe_compat, "get_cpi_yoy_monthly", "M", 36)
-        futures["une_m"] = ex.submit(_safe_compat, "get_unemployment_rate_monthly", "M", 36)
-        futures["fx_m"] = ex.submit(_safe_compat, "get_fx_rate_usd_monthly", "M", 36)
-        futures["res_m"] = ex.submit(_safe_compat, "get_reserves_usd_monthly", "M", 36)
-        futures["policy_m"] = ex.submit(_safe_compat, "get_policy_rate_monthly", "M", 48)
+    futs["cpi_m"] = _EXECUTOR.submit(_compat_fetch_series_retry, "get_cpi_yoy_monthly", country, 36, 1)
+    futs["une_m"] = _EXECUTOR.submit(_compat_fetch_series_retry, "get_unemployment_rate_monthly", country, 36, 1)
+    futs["fx_m"] = _EXECUTOR.submit(_compat_fetch_series_retry, "get_fx_rate_usd_monthly", country, 36, 1)
+    futs["res_m"] = _EXECUTOR.submit(_compat_fetch_series_retry, "get_reserves_usd_monthly", country, 36, 1)
+    futs["policy_m"] = _EXECUTOR.submit(_compat_fetch_series_retry, "get_policy_rate_monthly", country, 48, 1)
 
-        # Annual (World Bank)
-        futures["cab_pct_a"] = ex.submit(_safe_wb, "BN.CAB.XOKA.GD.ZS")      # CA % GDP
-        futures["ge_a"] = ex.submit(_safe_wb, "GE.EST")                     # governance
-        futures["gdp_growth_a"] = ex.submit(_safe_wb, "NY.GDP.MKTP.KD.ZG")   # GDP growth annual %
-        futures["ca_level_a"] = ex.submit(_safe_wb, "BN.CAB.XOKA.CD")        # CA USD
-        futures["fiscal_a"] = ex.submit(_safe_wb, "GC.BAL.CASH.GD.ZS")       # fiscal balance % GDP (often sparse)
+    futs["cab_pct_a"] = _EXECUTOR.submit(_wb_series_generic, country, "BN.CAB.XOKA.GD.ZS")
+    futs["ge_a"] = _EXECUTOR.submit(_wb_series_generic, country, "GE.EST")
+    futs["gdp_growth_a"] = _EXECUTOR.submit(_wb_series_generic, country, "NY.GDP.MKTP.KD.ZG")
+    futs["ca_level_a"] = _EXECUTOR.submit(_wb_series_generic, country, "BN.CAB.XOKA.CD")
+    # Fiscal balance: still try the common code, but it is often missing
+    futs["fiscal_a"] = _EXECUTOR.submit(_wb_series_generic, country, "GC.BAL.CASH.GD.ZS")
 
-        # If your debt service timed out, at least try WB gov debt % GDP quickly:
-        # (keeps Nigeria/Mexico from returning empty debt too often)
-        if not debt_series:
-            futures["wb_debt_ratio"] = ex.submit(_safe_wb, "GC.DOD.TOTL.GD.ZS")
+    # If debt bundle produced nothing, do a quick WB ratio fallback so Mexico/Nigeria aren't empty
+    if not debt_series:
+        futs["wb_debt_ratio"] = _EXECUTOR.submit(_wb_series_generic, country, "GC.DOD.TOTL.GD.ZS")
 
-        # Collect with a hard ceiling so route doesn't block forever
-        def _get(name: str, timeout: float = 4.0) -> Dict[str, float]:
-            fut = futures.get(name)
-            if not fut:
-                return {}
-            try:
-                return fut.result(timeout=timeout) or {}
-            except Exception:
-                return {}
+    def _get(name: str, timeout: float = 3.5) -> Dict[str, float]:
+        fut = futs.get(name)
+        if not fut:
+            return {}
+        try:
+            res = fut.result(timeout=timeout) or {}
+            # ensure trimmed
+            return _trim_series_policy(res, HIST_POLICY)
+        except Exception:
+            return {}
 
-        gdp_growth_q = _get("gdp_growth_q", 4.0)
+    gdp_growth_q = _get("gdp_growth_q")
 
-        cpi_m = _get("cpi_m", 4.0)
-        une_m = _get("une_m", 4.0)
-        fx_m = _get("fx_m", 4.0)
-        res_m = _get("res_m", 4.0)
-        policy_m = _get("policy_m", 4.0)
+    cpi_m = _get("cpi_m")
+    une_m = _get("une_m")
+    fx_m = _get("fx_m")
+    res_m = _get("res_m")
+    policy_m = _get("policy_m")
 
-        cab_a = _get("cab_pct_a", 4.0)
-        ge_a = _get("ge_a", 4.0)
-        gdp_growth_a = _get("gdp_growth_a", 4.0)
-        ca_level_a = _get("ca_level_a", 4.0)
-        fiscal_a = _get("fiscal_a", 4.0)
+    cab_a = _get("cab_pct_a")
+    ge_a = _get("ge_a")
+    gdp_growth_a = _get("gdp_growth_a")
+    ca_level_a = _get("ca_level_a")
+    fiscal_a = _get("fiscal_a")
 
-        # Apply WB debt fallback if needed
-        if not debt_series:
-            wb_debt = _get("wb_debt_ratio", 4.0)
-            if wb_debt:
-                debt_series = wb_debt
-                period, value = _latest(wb_debt)
-                debt_latest_summary = {
-                    "year": (str(period).split("-")[0] if period else None),
-                    "value": value,
-                    "source": "World Bank (ratio)",
-                }
+    if not debt_series:
+        wb_debt = _get("wb_debt_ratio")
+        if wb_debt:
+            debt_series = wb_debt
+            y, v = _latest(wb_debt)
+            debt_latest_summary = {
+                "year": str(y) if y is not None else None,
+                "value": v,
+                "source": "World Bank (ratio)",
+            }
+            # IMPORTANT: backfill legacy debt_to_gdp blocks too
+            debt_bundle.setdefault("debt_to_gdp", {"latest": {"value": None, "date": None, "source": None}, "series": {}})
+            debt_bundle["debt_to_gdp"] = {
+                "latest": {"value": v, "date": str(y) if y is not None else None, "source": "World Bank (ratio)"},
+                "series": dict(wb_debt),
+            }
+            debt_bundle["debt_to_gdp_series"] = dict(wb_debt)
 
     # ----------------------------
-    # 3) Latest extraction helper
+    # 3) Latest extraction
     # ----------------------------
     def _kvl(d: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
         return _latest(d)
@@ -473,11 +396,10 @@ def country_lite(
     fiscal_p, fiscal_v = _kvl(fiscal_a)
 
     # ----------------------------
-    # 4) indicators_matrix (optional, off by default for speed)
+    # 4) indicators_matrix (OFF by default)
     # ----------------------------
     indicators_matrix: Dict[str, Any] = {}
     matrix_debug: Dict[str, Any] = {}
-    # Keep this OFF until the matrix builder is proven fast.
     ENABLE_MATRIX = False
 
     if ENABLE_MATRIX:
@@ -491,13 +413,13 @@ def country_lite(
             matrix_debug = {"error": repr(e)}
 
     # ----------------------------
-    # 5) Build response (ALWAYS)
+    # 5) Response (matches your contract)
     # ----------------------------
     resp: Dict[str, Any] = {
         "country": country,
         "iso_codes": iso,
 
-        # Debt block (annual, trimmed)
+        # Legacy debt summary (kept)
         "latest": {
             "year": debt_latest_summary.get("year"),
             "value": debt_latest_summary.get("value"),
@@ -506,7 +428,10 @@ def country_lite(
         "series": debt_series,
         "source": debt_latest_summary.get("source"),
 
-        # Legacy top-levels retained (compatibility with older clients)
+        # New: explicit debt bundle object for GPT mapping (and for debugging)
+        "debt": debt_bundle,
+
+        # Legacy top-levels retained
         "imf_data": {},
         "government_debt": debt_bundle.get("government_debt")
             or {"latest": {"value": None, "date": None, "source": None}, "series": {}},
@@ -541,9 +466,6 @@ def country_lite(
         },
     }
 
-    # ----------------------------
-    # 6) Cache + return
-    # ----------------------------
     try:
         _cache_set(country, resp)
     except Exception:
@@ -552,3 +474,7 @@ def country_lite(
     logger.info("country_lite done | country=%s | elapsed=%.2fs", country, (_time.time() - started))
     return JSONResponse(content=resp)
 
+
+@router.options("/v1/country-lite", include_in_schema=False)
+def country_lite_options() -> Response:
+    return Response(status_code=204)
