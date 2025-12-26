@@ -1,7 +1,7 @@
-# app/providers/compat.py — provider bridge (robust fallbacks + shape normalization)
+# app/providers/compat.py — provider bridge (matches deployed IMF provider functions)
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Sequence, Optional, Callable, List, Tuple
+from typing import Any, Dict, Mapping, Sequence, Optional, Callable
 
 # -----------------------------------------------------------------------------
 # safe import + country codes
@@ -31,7 +31,7 @@ def _get_codes(country: str) -> Dict[str, Optional[str]]:
 
 
 # -----------------------------------------------------------------------------
-# normalization utilities
+# normalization + trimming
 # -----------------------------------------------------------------------------
 
 def _coerce_float(x: Any) -> Optional[float]:
@@ -45,16 +45,14 @@ def _coerce_float(x: Any) -> Optional[float]:
 
 
 def _normalize_series(data: Any) -> Dict[str, float]:
-    """Flexible normalizer → {period: float} for common shapes."""
+    """Normalize common shapes → {period: float}."""
     if data is None:
         return {}
 
-    # mapping of period->value
     if isinstance(data, Mapping):
         out: Dict[str, float] = {}
         for k, v in data.items():
             if isinstance(v, Mapping):
-                # {period: {"value": ...}} or {period: {"OBS_VALUE": ...}}
                 for vk in ("value", "val", "v", "y", "OBS_VALUE", "obs_value"):
                     if vk in v:
                         fv = _coerce_float(v[vk])
@@ -67,7 +65,6 @@ def _normalize_series(data: Any) -> Dict[str, float]:
                     out[str(k)] = fv
         return out
 
-    # list of (period, value) or list of dicts
     if isinstance(data, Sequence) and not isinstance(data, (str, bytes, bytearray)):
         out: Dict[str, float] = {}
         for row in data:
@@ -77,16 +74,11 @@ def _normalize_series(data: Any) -> Dict[str, float]:
                 if fv is not None:
                     out[p] = fv
             elif isinstance(row, Mapping):
-                period = (
-                    row.get("period")
-                    or row.get("date")
-                    or row.get("time")
-                    or row.get("TIME_PERIOD")
-                )
+                period = row.get("period") or row.get("date") or row.get("time") or row.get("TIME_PERIOD")
                 if not period:
-                    y = row.get("year") or row.get("y")
-                    m = row.get("month") or row.get("m")
-                    q = row.get("quarter") or row.get("q")
+                    y = row.get("year")
+                    m = row.get("month")
+                    q = row.get("quarter")
                     if y and q:
                         period = f"{int(y)}-Q{int(q)}"
                     elif y and m:
@@ -107,7 +99,6 @@ def _normalize_series(data: Any) -> Dict[str, float]:
 
 
 def _trim_keep(series: Dict[str, float], keep: int) -> Dict[str, float]:
-    """Keep last N points (best-effort order by key)."""
     if not series or keep <= 0:
         return series or {}
     keys = sorted(series.keys())
@@ -117,308 +108,205 @@ def _trim_keep(series: Dict[str, float], keep: int) -> Dict[str, float]:
     return {k: series[k] for k in tail}
 
 
-# -----------------------------------------------------------------------------
-# robust calling: try multiple signatures
-# -----------------------------------------------------------------------------
-
-def _call_provider(fn: Callable[..., Any], *, country: str, iso2: Optional[str], iso3: Optional[str]) -> Any:
-    """
-    Try a few common call signatures:
-      - fn(iso2=...)
-      - fn(iso2)
-      - fn(country=...)
-      - fn(country)
-      - fn(iso3=...) / fn(iso3) (rare)
-    """
-    # keyword iso2
-    if iso2:
-        try:
-            return fn(iso2=iso2)
-        except TypeError:
-            pass
-        except Exception:
-            return None
+def _call_iso2(fn: Callable[..., Any], iso2: str) -> Any:
+    """Try iso2= kw then positional."""
+    try:
+        return fn(iso2=iso2)
+    except TypeError:
         try:
             return fn(iso2)
         except Exception:
             return None
+    except Exception:
+        return None
 
-    # keyword country
+
+def _call_iso3(fn: Callable[..., Any], iso3: str) -> Any:
+    """Try iso3= kw then positional."""
     try:
-        return fn(country=country)
+        return fn(iso3=iso3)
     except TypeError:
-        pass
-    except Exception:
-        return None
-    try:
-        return fn(country)
-    except Exception:
-        return None
-
-    # keyword iso3 (rare)
-    if iso3:
-        try:
-            return fn(iso3=iso3)
-        except TypeError:
-            pass
-        except Exception:
-            return None
         try:
             return fn(iso3)
         except Exception:
             return None
-
-    return None
-
-
-def _try_imf(mod: Any, fn_names: List[str], *, country: str, iso2: Optional[str], iso3: Optional[str]) -> Dict[str, float]:
-    """
-    Try IMF provider functions in order until one returns a non-empty series.
-    """
-    if not mod:
-        return {}
-    for name in fn_names:
-        fn = getattr(mod, name, None)
-        if not callable(fn):
-            continue
-        raw = _call_provider(fn, country=country, iso2=iso2, iso3=iso3)
-        ser = _normalize_series(raw)
-        if ser:
-            return ser
-    return {}
-
-
-def _try_wb(mod: Any, fn_names: List[str], *, iso3: Optional[str]) -> Dict[str, float]:
-    """
-    Try WB helper functions in order until one returns a non-empty series.
-    """
-    if not mod or not iso3:
-        return {}
-    for name in fn_names:
-        fn = getattr(mod, name, None)
-        if not callable(fn):
-            continue
-        try:
-            raw = fn(iso3=iso3)
-        except TypeError:
-            try:
-                raw = fn(iso3)
-            except Exception:
-                continue
-        except Exception:
-            continue
-        ser = _normalize_series(raw)
-        if ser:
-            return ser
-    return {}
+    except Exception:
+        return None
 
 
 # -----------------------------------------------------------------------------
-# Public API (these are what probe.py calls)
+# Public functions used by probe.py
 # -----------------------------------------------------------------------------
 
 def get_cpi_yoy_monthly(country: str, keep: int = 36) -> Dict[str, float]:
     codes = _get_codes(country)
+    iso2, iso3 = codes.get("iso2"), codes.get("iso3")
+
+    # IMF monthly CPI YoY (or computed YoY from index inside provider)
     imf = _safe_import("app.providers.imf_provider")
+    if imf and iso2:
+        fn = getattr(imf, "imf_cpi_yoy_monthly", None)
+        if callable(fn):
+            ser = _normalize_series(_call_iso2(fn, iso2))
+            if ser:
+                return _trim_keep(ser, keep)
 
-    # Try a few plausible IMF function names (DBnomics endpoints change)
-    ser = _try_imf(
-        imf,
-        fn_names=[
-            "imf_cpi_yoy_monthly",
-            "imf_cpi_yoy_m",
-            "imf_cpi_yoy",
-            "imf_cpi_inflation_yoy_monthly",
-        ],
-        country=country,
-        iso2=codes["iso2"],
-        iso3=codes["iso3"],
-    )
-    if ser:
-        return _trim_keep(ser, keep)
-
-    # Fallback to WB annual CPI inflation (%)
+    # Fallback WB annual inflation (%)
     wb = _safe_import("app.providers.wb_provider")
-    ser = _try_wb(wb, fn_names=["wb_cpi_yoy_annual"], iso3=codes["iso3"])
-    return _trim_keep(ser, keep) if ser else {}
+    if wb and iso3:
+        wbf = getattr(wb, "wb_cpi_yoy_annual", None)
+        if callable(wbf):
+            ser = _normalize_series(_call_iso3(wbf, iso3))
+            if ser:
+                return _trim_keep(ser, keep)
+
+    return {}
 
 
 def get_unemployment_rate_monthly(country: str, keep: int = 36) -> Dict[str, float]:
     codes = _get_codes(country)
-    imf = _safe_import("app.providers.imf_provider")
+    iso2, iso3 = codes.get("iso2"), codes.get("iso3")
 
-    ser = _try_imf(
-        imf,
-        fn_names=[
-            "imf_unemployment_rate_monthly",
-            "imf_unemployment_monthly",
-            "imf_labor_unemployment_rate_monthly",
-            "imf_lur_monthly",
-        ],
-        country=country,
-        iso2=codes["iso2"],
-        iso3=codes["iso3"],
-    )
-    if ser:
-        return _trim_keep(ser, keep)
+    imf = _safe_import("app.providers.imf_provider")
+    if imf and iso2:
+        fn = getattr(imf, "imf_unemployment_rate_monthly", None)
+        if callable(fn):
+            ser = _normalize_series(_call_iso2(fn, iso2))
+            if ser:
+                return _trim_keep(ser, keep)
 
     wb = _safe_import("app.providers.wb_provider")
-    ser = _try_wb(wb, fn_names=["wb_unemployment_rate_annual"], iso3=codes["iso3"])
-    return _trim_keep(ser, keep) if ser else {}
+    if wb and iso3:
+        wbf = getattr(wb, "wb_unemployment_rate_annual", None)
+        if callable(wbf):
+            ser = _normalize_series(_call_iso3(wbf, iso3))
+            if ser:
+                return _trim_keep(ser, keep)
+
+    return {}
 
 
 def get_fx_rate_usd_monthly(country: str, keep: int = 36) -> Dict[str, float]:
     codes = _get_codes(country)
-    imf = _safe_import("app.providers.imf_provider")
+    iso2, iso3 = codes.get("iso2"), codes.get("iso3")
 
-    ser = _try_imf(
-        imf,
-        fn_names=[
-            "imf_fx_usd_monthly",
-            "imf_fx_rate_usd_monthly",
-            "imf_exchange_rate_usd_monthly",
-        ],
-        country=country,
-        iso2=codes["iso2"],
-        iso3=codes["iso3"],
-    )
-    if ser:
-        return _trim_keep(ser, keep)
+    imf = _safe_import("app.providers.imf_provider")
+    if imf and iso2:
+        fn = getattr(imf, "imf_fx_usd_monthly", None)
+        if callable(fn):
+            ser = _normalize_series(_call_iso2(fn, iso2))
+            if ser:
+                return _trim_keep(ser, keep)
 
     wb = _safe_import("app.providers.wb_provider")
-    ser = _try_wb(wb, fn_names=["wb_fx_rate_usd_annual"], iso3=codes["iso3"])
-    return _trim_keep(ser, keep) if ser else {}
+    if wb and iso3:
+        wbf = getattr(wb, "wb_fx_rate_usd_annual", None)
+        if callable(wbf):
+            ser = _normalize_series(_call_iso3(wbf, iso3))
+            if ser:
+                return _trim_keep(ser, keep)
+
+    return {}
 
 
 def get_reserves_usd_monthly(country: str, keep: int = 36) -> Dict[str, float]:
     codes = _get_codes(country)
-    imf = _safe_import("app.providers.imf_provider")
+    iso2, iso3 = codes.get("iso2"), codes.get("iso3")
 
-    ser = _try_imf(
-        imf,
-        fn_names=[
-            "imf_reserves_usd_monthly",
-            "imf_fx_reserves_usd_monthly",
-            "imf_reserves_monthly_usd",
-            "imf_reserves_usd",
-        ],
-        country=country,
-        iso2=codes["iso2"],
-        iso3=codes["iso3"],
-    )
-    if ser:
-        return _trim_keep(ser, keep)
+    imf = _safe_import("app.providers.imf_provider")
+    if imf and iso2:
+        fn = getattr(imf, "imf_reserves_usd_monthly", None)
+        if callable(fn):
+            ser = _normalize_series(_call_iso2(fn, iso2))
+            if ser:
+                return _trim_keep(ser, keep)
 
     wb = _safe_import("app.providers.wb_provider")
-    ser = _try_wb(wb, fn_names=["wb_reserves_usd_annual"], iso3=codes["iso3"])
-    return _trim_keep(ser, keep) if ser else {}
+    if wb and iso3:
+        wbf = getattr(wb, "wb_reserves_usd_annual", None)
+        if callable(wbf):
+            ser = _normalize_series(_call_iso3(wbf, iso3))
+            if ser:
+                return _trim_keep(ser, keep)
+
+    return {}
 
 
 def get_policy_rate_monthly(country: str, keep: int = 48) -> Dict[str, float]:
     codes = _get_codes(country)
+    iso2 = codes.get("iso2")
 
-    # ECB first (EU-only), then IMF
+    # ECB override (EU only)
     ecb = _safe_import("app.providers.ecb_provider")
-    ecbf = getattr(ecb, "ecb_policy_rate_for_country", None) if ecb else None
-    if callable(ecbf) and codes["iso2"]:
-        try:
-            raw = ecbf(iso2=codes["iso2"])
-        except TypeError:
-            try:
-                raw = ecbf(codes["iso2"])
-            except Exception:
-                raw = None
-        except Exception:
-            raw = None
-        ser = _normalize_series(raw)
-        if ser:
-            return _trim_keep(ser, keep)
+    if ecb and iso2:
+        ecbf = getattr(ecb, "ecb_policy_rate_for_country", None)
+        if callable(ecbf):
+            ser = _normalize_series(_call_iso2(ecbf, iso2))
+            if ser:
+                return _trim_keep(ser, keep)
 
+    # IMF policy rate monthly
     imf = _safe_import("app.providers.imf_provider")
-    ser = _try_imf(
-        imf,
-        fn_names=[
-            "imf_policy_rate_monthly",
-            "imf_policy_rate_m",
-            "imf_fpolm_monthly",
-        ],
-        country=country,
-        iso2=codes["iso2"],
-        iso3=codes["iso3"],
-    )
-    return _trim_keep(ser, keep) if ser else {}
+    if imf and iso2:
+        fn = getattr(imf, "imf_policy_rate_monthly", None)
+        if callable(fn):
+            ser = _normalize_series(_call_iso2(fn, iso2))
+            if ser:
+                return _trim_keep(ser, keep)
+
+    return {}
 
 
 def get_gdp_growth_quarterly(country: str, keep: int = 12) -> Dict[str, float]:
     """
-    WARNING: true q/q GDP growth is patchy.
-    This wrapper tries IMF quarterly series; if missing, falls back to WB annual growth.
+    IMF provider returns *YoY quarterly* (computed from levels).
+    We'll still call it "gdp_growth_quarterly" for the route's schema.
     """
     codes = _get_codes(country)
+    iso2, iso3 = codes.get("iso2"), codes.get("iso3")
+
     imf = _safe_import("app.providers.imf_provider")
+    if imf and iso2:
+        fn = getattr(imf, "imf_gdp_growth_quarterly", None)
+        if callable(fn):
+            ser = _normalize_series(_call_iso2(fn, iso2))
+            if ser:
+                return _trim_keep(ser, keep)
 
-    ser = _try_imf(
-        imf,
-        fn_names=[
-            "imf_gdp_growth_quarterly",
-            "imf_gdp_qoq_quarterly",
-            "imf_real_gdp_growth_quarterly",
-            "imf_ngdp_r_growth_quarterly",
-        ],
-        country=country,
-        iso2=codes["iso2"],
-        iso3=codes["iso3"],
-    )
-    if ser:
-        return _trim_keep(ser, keep)
-
+    # WB annual growth fallback if IMF quarterly missing
     wb = _safe_import("app.providers.wb_provider")
-    ser = _try_wb(wb, fn_names=["wb_gdp_growth_annual_pct"], iso3=codes["iso3"])
-    return _trim_keep(ser, keep) if ser else {}
+    if wb and iso3:
+        wbf = getattr(wb, "wb_gdp_growth_annual_pct", None)
+        if callable(wbf):
+            ser = _normalize_series(_call_iso3(wbf, iso3))
+            if ser:
+                return _trim_keep(ser, keep)
+
+    return {}
 
 
 def get_debt_to_gdp_annual(country: str, keep: int = 20) -> Dict[str, float]:
     """
-    Keep this for legacy callers; primary debt logic lives in debt_service.
-    We try:
-      1) IMF WEO (if provider has it)
-      2) IMF debt_to_gdp
-      3) WB gov debt % GDP (ratio/derived levels) via wb_provider helper if present
-      4) debt_service.compute_debt_payload as last resort (normalized)
+    Prefer IMF WEO debt-to-GDP (annual). Fallback WB debt ratio helper if present.
     """
     codes = _get_codes(country)
-    imf = _safe_import("app.providers.imf_provider")
+    iso2, iso3 = codes.get("iso2"), codes.get("iso3")
 
-    ser = _try_imf(
-        imf,
-        fn_names=[
-            "imf_weo_debt_to_gdp_annual",
-            "imf_debt_to_gdp_annual",
-        ],
-        country=country,
-        iso2=codes["iso2"],
-        iso3=codes["iso3"],
-    )
-    if ser:
-        return _trim_keep(ser, keep)
+    imf = _safe_import("app.providers.imf_provider")
+    if imf and iso2:
+        fn = getattr(imf, "imf_weo_debt_to_gdp_annual", None) or getattr(imf, "imf_debt_to_gdp_annual", None)
+        if callable(fn):
+            ser = _normalize_series(_call_iso2(fn, iso2))
+            if ser:
+                return _trim_keep(ser, keep)
 
     wb = _safe_import("app.providers.wb_provider")
-    ser = _try_wb(wb, fn_names=["wb_gov_debt_pct_gdp_annual"], iso3=codes["iso3"])
-    if ser:
-        return _trim_keep(ser, keep)
-
-    # Last resort: call debt_service normalized output
-    ds = _safe_import("app.services.debt_service")
-    compute = getattr(ds, "compute_debt_payload", None) if ds else None
-    if callable(compute):
-        try:
-            bundle = compute(country) or {}
-            block = bundle.get("debt_to_gdp") or {}
-            series = block.get("series") or bundle.get("debt_to_gdp_series") or {}
-            ser2 = _normalize_series(series)
-            return _trim_keep(ser2, keep) if ser2 else {}
-        except Exception:
-            return {}
+    if wb and iso3:
+        wbf = getattr(wb, "wb_gov_debt_pct_gdp_annual", None)
+        if callable(wbf):
+            ser = _normalize_series(_call_iso3(wbf, iso3))
+            if ser:
+                return _trim_keep(ser, keep)
 
     return {}
 
