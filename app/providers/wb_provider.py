@@ -14,12 +14,15 @@ WB_RETRIES = int(os.getenv("WB_RETRIES", "2"))
 WB_BACKOFF = float(os.getenv("WB_BACKOFF", "0.6"))
 WB_DEBUG = os.getenv("WB_DEBUG", "0") == "1"
 
-# Avoid absurd page sizes. WB API is fast enough with 200–500.
+# Keep payloads reasonable (WB returns newest->oldest anyway)
 WB_PER_PAGE = int(os.getenv("WB_PER_PAGE", "200"))
-
 MAX_YEARS_DEFAULT = int(os.getenv("WB_MAX_YEARS_DEFAULT", "20"))
 
 WB_BASE = "https://api.worldbank.org/v2"
+
+# Small in-process cache to avoid repeated WB calls across requests
+WB_CACHE_TTL = float(os.getenv("WB_CACHE_TTL", "900"))  # 15 minutes
+_WB_CACHE: Dict[str, Tuple[float, Any]] = {}
 
 # Stable World Bank indicator codes used by Country Radar
 WB_CODES = [
@@ -42,12 +45,10 @@ FISCAL_BALANCE_RATIO_CODES = [
     "GC.BAL.CASH.GD.ZS",    # Cash surplus / deficit, % of GDP
 ]
 
-
 # -------------------------------------------------------------------
-# HTTP WRAPPER
+# HTTP CLIENT (shared)
 # -------------------------------------------------------------------
 def _timeout() -> httpx.Timeout:
-    # Separate phase timeouts helps avoid "stuck" calls.
     return httpx.Timeout(
         timeout=WB_TIMEOUT,
         connect=min(2.0, WB_TIMEOUT),
@@ -57,14 +58,60 @@ def _timeout() -> httpx.Timeout:
     )
 
 
-def _http_get_json(client: httpx.Client, url: str) -> Optional[Any]:
+_CLIENT: Optional[httpx.Client] = None
+
+
+def _get_client() -> httpx.Client:
+    global _CLIENT
+    if _CLIENT is not None:
+        return _CLIENT
+
+    limits = httpx.Limits(
+        max_connections=int(os.getenv("WB_MAX_CONNECTIONS", "20")),
+        max_keepalive_connections=int(os.getenv("WB_MAX_KEEPALIVE", "10")),
+        keepalive_expiry=float(os.getenv("WB_KEEPALIVE_EXPIRY", "30")),
+    )
+
+    _CLIENT = httpx.Client(
+        timeout=_timeout(),
+        headers={"Accept": "application/json"},
+        follow_redirects=True,
+        limits=limits,
+    )
+    return _CLIENT
+
+
+def _cache_get(key: str) -> Optional[Any]:
+    row = _WB_CACHE.get(key)
+    if not row:
+        return None
+    ts, payload = row
+    if (time.time() - ts) > WB_CACHE_TTL:
+        return None
+    return payload
+
+
+def _cache_set(key: str, payload: Any) -> None:
+    _WB_CACHE[key] = (time.time(), payload)
+
+
+def _http_get_json(url: str) -> Optional[Any]:
+    # cache first
+    cached = _cache_get(url)
+    if cached is not None:
+        return cached
+
+    client = _get_client()
+
     for attempt in range(1, WB_RETRIES + 1):
         try:
             if WB_DEBUG:
                 print(f"[WB] GET {url} (attempt {attempt})")
             r = client.get(url)
             r.raise_for_status()
-            return r.json()
+            data = r.json()
+            _cache_set(url, data)
+            return data
         except Exception as e:
             if WB_DEBUG:
                 print(f"[WB] attempt {attempt} failed {url}: {e!r}")
@@ -74,8 +121,15 @@ def _http_get_json(client: httpx.Client, url: str) -> Optional[Any]:
 
 
 def _build_url(iso3: str, code: str, per_page: int = WB_PER_PAGE) -> str:
-    # format=json ensures list response; per_page controls payload size.
-    return f"{WB_BASE}/country/{iso3}/indicator/{code}?format=json&per_page={per_page}"
+    # Reduce payload: only pull last N years by using date=YYYY:YYYY
+    try:
+        y2 = time.gmtime().tm_year
+        y1 = max(1960, y2 - (MAX_YEARS_DEFAULT + 5))  # a little buffer
+        date_param = f"&date={y1}:{y2}"
+    except Exception:
+        date_param = ""
+
+    return f"{WB_BASE}/country/{iso3}/indicator/{code}?format=json&per_page={per_page}{date_param}"
 
 
 # -------------------------------------------------------------------
@@ -87,13 +141,7 @@ def fetch_wb_indicator_raw(iso3: str, code: str) -> Optional[List[Dict[str, Any]
        [ {date: "2023", value: 4.3, ...}, ... ]
     """
     url = _build_url(iso3, code, per_page=WB_PER_PAGE)
-
-    with httpx.Client(
-        timeout=_timeout(),
-        headers={"Accept": "application/json"},
-        follow_redirects=True,
-    ) as client:
-        data = _http_get_json(client, url)
+    data = _http_get_json(url)
 
     if WB_DEBUG:
         print(f"[WB] raw for {iso3}/{code}: type={type(data)}")
@@ -131,7 +179,6 @@ def wb_year_dict_from_raw(raw: Optional[List[Dict[str, Any]]]) -> Dict[str, floa
         except Exception:
             continue
 
-    # sort ascending by year string
     return dict(sorted(out.items(), key=lambda kv: kv[0]))
 
 
@@ -145,16 +192,13 @@ def _trim_last_n_years(series: Dict[str, float], years: int) -> Dict[str, float]
 
 
 # -------------------------------------------------------------------
-# PRIMARY "ANNUAL SERIES" HELPER (FIXES YOUR PLACEHOLDER ...)
+# PRIMARY ANNUAL HELPER
 # -------------------------------------------------------------------
 def _wb_indicator_annual(
     iso3: str,
     indicator: str,
     years: int = MAX_YEARS_DEFAULT,
 ) -> Dict[str, float]:
-    """
-    Fetch indicator series and return { "YYYY": value } limited to last `years`.
-    """
     raw = fetch_wb_indicator_raw(iso3, indicator)
     series = wb_year_dict_from_raw(raw)
     return _trim_last_n_years(series, years)
@@ -169,13 +213,9 @@ def _wb_years(iso3: str, code: str) -> Dict[str, float]:
 
 
 # -------------------------------------------------------------------
-# BATCH FETCHER (used only in probe & diagnostics)
+# BATCH FETCHER (diagnostics only)
 # -------------------------------------------------------------------
 def fetch_worldbank_data(iso2: str, iso3: str) -> Dict[str, Optional[List[Dict[str, Any]]]]:
-    """
-    Returns raw WB arrays for all key indicators.
-    NOTE: Keep for diagnostics; not optimized for runtime.
-    """
     out: Dict[str, Optional[List[Dict[str, Any]]]] = {}
     for code in WB_CODES:
         out[code] = fetch_wb_indicator_raw(iso3, code)
@@ -189,15 +229,6 @@ def wb_gov_debt_pct_gdp_annual(
     iso3: str,
     years: int = MAX_YEARS_DEFAULT,
 ) -> Dict[str, float]:
-    """
-    Government debt as % of GDP, annual, last `years`.
-
-    Priority:
-      1) GC.DOD.TOTL.GD.ZS  (ratio directly from WB)
-      2) If missing: compute ratio from levels:
-           - GC.DOD.TOTL.CN vs NY.GDP.MKTP.CN  (LCU)
-           - GC.DOD.TOTL.CD vs NY.GDP.MKTP.CD  (USD)
-    """
     # Tier 1: direct ratio
     direct = _wb_indicator_annual(iso3, "GC.DOD.TOTL.GD.ZS", years)
     if direct:
@@ -214,9 +245,15 @@ def wb_gov_debt_pct_gdp_annual(
         out: Dict[str, float] = {}
         for y, d in debt.items():
             g = gdp.get(y)
-            if g is None or g == 0:
+            if g is None:
                 continue
-            out[y] = (float(d) / float(g)) * 100.0
+            try:
+                gv = float(g)
+                if gv == 0.0:
+                    continue
+                out[y] = (float(d) / gv) * 100.0
+            except Exception:
+                continue
         return out
 
     ratio_lcu = _compute_ratio(debt_lcu, gdp_lcu) if debt_lcu and gdp_lcu else {}
@@ -226,7 +263,6 @@ def wb_gov_debt_pct_gdp_annual(
         return _trim_last_n_years(ratio_lcu, years)
     if ratio_usd:
         return _trim_last_n_years(ratio_usd, years)
-
     return {}
 
 
@@ -237,11 +273,6 @@ def wb_fiscal_balance_pct_gdp_annual(
     iso3: str,
     years: int = MAX_YEARS_DEFAULT,
 ) -> Dict[str, float]:
-    """
-    Fiscal balance (% of GDP), annual, last `years`.
-
-    Tries multiple WB codes and returns the first one with data.
-    """
     for code in FISCAL_BALANCE_RATIO_CODES:
         s = _wb_indicator_annual(iso3, code, years)
         if s:
@@ -285,14 +316,11 @@ def wb_government_effectiveness_annual(iso3: str) -> Dict[str, float]:
 
 
 __all__ = [
-    # raw/base
     "fetch_worldbank_data",
     "fetch_wb_indicator_raw",
     "wb_year_dict_from_raw",
-    # annual helper used by services
     "wb_gov_debt_pct_gdp_annual",
     "wb_fiscal_balance_pct_gdp_annual",
-    # common indicators
     "wb_cpi_yoy_annual",
     "wb_unemployment_rate_annual",
     "wb_fx_rate_usd_annual",
