@@ -144,8 +144,8 @@ def _cache_get(country: str) -> Optional[Dict[str, Any]]:
 
 
 def _cache_set(country: str, payload: Dict[str, Any]) -> None:
+    # Cache key normalized to avoid "Mexico" vs "mexico" misses.
     _COUNTRY_CACHE[country.lower()] = (_time.time(), payload)
-
 
 # -----------------------------------------------------------------------------
 # Compat provider wrapper (with retries + basic timeouts)
@@ -325,255 +325,230 @@ def country_lite(
 ) -> JSONResponse:
     started = _time.time()
 
+    # ----------------------------
+    # 0) Cache
+    # ----------------------------
+    if not fresh:
+        cached = _cache_get(country)
+        if cached:
+            logger.info("country_lite cache hit | country=%s", country)
+            return JSONResponse(content=cached)
+
+    iso = _iso_codes(country)
+
+    # ----------------------------
+    # Helper to safely fetch compat series without killing the route
+    # ----------------------------
+    def _safe_compat(fn_name: str, freq: str, keep_hint: int) -> Dict[str, float]:
+        try:
+            return _compat_fetch_series_retry(fn_name, country, freq, keep_hint=keep_hint) or {}
+        except Exception:
+            return {}
+
+    def _safe_wb(indicator_code: str) -> Dict[str, float]:
+        try:
+            return _wb_series_generic(country, indicator_code) or {}
+        except Exception:
+            return {}
+
+    # ----------------------------
+    # 1) Debt (hard timeout)
+    # ----------------------------
+    debt_series_full: Dict[str, float] = {}
+    debt_latest_summary: Dict[str, Any] = {"year": None, "value": None, "source": "computed:NA/Timeout"}
+    debt_bundle: Dict[str, Any] = {}
+
     try:
-        # --------------------------------------------------------------
-        # 0) Cache
-        # --------------------------------------------------------------
-        if not fresh:
-            cached = _cache_get(country)
-            if cached:
-                logger.info("country_lite cache hit | country=%s", country)
-                return JSONResponse(content=cached)
+        from app.services.debt_service import compute_debt_payload
+        bundle = _with_timeout(1.8, compute_debt_payload, country) or {}
+    except Exception as e:
+        logger.warning("country_lite debt import/call error for %s: %r", country, e)
+        bundle = {}
 
-        iso = _iso_codes(country)
+    if isinstance(bundle, Mapping):
+        debt_bundle = dict(bundle)
+        debt_block = debt_bundle.get("debt_to_gdp") or {}
+        series = debt_block.get("series") or debt_bundle.get("debt_to_gdp_series") or {}
 
-        # --------------------------------------------------------------
-        # 1) Containers (default-safe)
-        # --------------------------------------------------------------
-        debt_series_full: Dict[str, float] = {}
-        debt_latest_summary: Dict[str, Any] = {
-            "year": None,
-            "value": None,
-            "source": "computed:NA/Timeout",
-        }
-        debt_bundle: Dict[str, Any] = {}
-
-        # compat series defaults
-        gdp_growth_q: Dict[str, float] = {}
-        cpi_m: Dict[str, float] = {}
-        une_m: Dict[str, float] = {}
-        fx_m: Dict[str, float] = {}
-        res_m: Dict[str, float] = {}
-        policy_m: Dict[str, float] = {}
-
-        # wb annual defaults
-        cab_a: Dict[str, float] = {}
-        ge_a: Dict[str, float] = {}
-        gdp_growth_a: Dict[str, float] = {}
-        ca_level_a: Dict[str, float] = {}
-        fiscal_a: Dict[str, float] = {}
-
-        indicators_matrix: Dict[str, Any] = {}
-        matrix_debug: Dict[str, Any] = {}
-
-        # --------------------------------------------------------------
-        # 2) Parallel work (bounded)
-        # --------------------------------------------------------------
-        def _run_debt() -> Dict[str, Any]:
+        if isinstance(series, Mapping) and series:
+            debt_series_full = dict(series)
             try:
-                from app.services.debt_service import compute_debt_payload
-                return _with_timeout(2.0, compute_debt_payload, country) or {}
-            except Exception as e:
-                logger.warning("country_lite debt block error for %s: %r", country, e)
+                years_sorted = sorted(debt_series_full.keys(), key=lambda y: int(str(y)))
+                latest_year = years_sorted[-1]
+                latest_val = debt_series_full[latest_year]
+            except Exception:
+                latest_year = None
+                latest_val = None
+
+            latest_meta = debt_block.get("latest") or {}
+            debt_latest_summary = {
+                "year": latest_year,
+                "value": latest_val,
+                "source": latest_meta.get("source") or "debt_service",
+            }
+
+    debt_series = _trim_series_policy(debt_series_full, HIST_POLICY)
+
+    # ----------------------------
+    # 2) Parallel fetches (compat monthly+quarterly + WB annual)
+    #    This prevents serial 20–60s behavior.
+    # ----------------------------
+    futures: Dict[str, Any] = {}
+    with _futures.ThreadPoolExecutor(max_workers=10) as ex:
+        # Quarterly (compat)
+        futures["gdp_growth_q"] = ex.submit(_safe_compat, "get_gdp_growth_quarterly", "Q", 12)
+
+        # Monthly (compat)
+        futures["cpi_m"] = ex.submit(_safe_compat, "get_cpi_yoy_monthly", "M", 36)
+        futures["une_m"] = ex.submit(_safe_compat, "get_unemployment_rate_monthly", "M", 36)
+        futures["fx_m"] = ex.submit(_safe_compat, "get_fx_rate_usd_monthly", "M", 36)
+        futures["res_m"] = ex.submit(_safe_compat, "get_reserves_usd_monthly", "M", 36)
+        futures["policy_m"] = ex.submit(_safe_compat, "get_policy_rate_monthly", "M", 48)
+
+        # Annual (World Bank)
+        futures["cab_pct_a"] = ex.submit(_safe_wb, "BN.CAB.XOKA.GD.ZS")      # CA % GDP
+        futures["ge_a"] = ex.submit(_safe_wb, "GE.EST")                     # governance
+        futures["gdp_growth_a"] = ex.submit(_safe_wb, "NY.GDP.MKTP.KD.ZG")   # GDP growth annual %
+        futures["ca_level_a"] = ex.submit(_safe_wb, "BN.CAB.XOKA.CD")        # CA USD
+        futures["fiscal_a"] = ex.submit(_safe_wb, "GC.BAL.CASH.GD.ZS")       # fiscal balance % GDP (often sparse)
+
+        # If your debt service timed out, at least try WB gov debt % GDP quickly:
+        # (keeps Nigeria/Mexico from returning empty debt too often)
+        if not debt_series:
+            futures["wb_debt_ratio"] = ex.submit(_safe_wb, "GC.DOD.TOTL.GD.ZS")
+
+        # Collect with a hard ceiling so route doesn't block forever
+        def _get(name: str, timeout: float = 4.0) -> Dict[str, float]:
+            fut = futures.get(name)
+            if not fut:
+                return {}
+            try:
+                return fut.result(timeout=timeout) or {}
+            except Exception:
                 return {}
 
-        def _run_matrix() -> Dict[str, Any]:
-            try:
-                from app.services.indicator_service import build_country_payload_v2
-                return _with_timeout(
-                    3.0,
-                    build_country_payload_v2,
-                    country,
-                    series="mini",
-                    keep=60,
-                ) or {}
-            except Exception as e:
-                return {"_debug": {"error": repr(e)}}
+        gdp_growth_q = _get("gdp_growth_q", 4.0)
 
-        def _run_compat() -> Dict[str, Any]:
-            # NOTE: These functions already do retries; keep hints bound the history.
-            return {
-                "gdp_growth_q": _compat_fetch_series_retry("get_gdp_growth_quarterly", country, "Q", keep_hint=12),
-                "cpi_m": _compat_fetch_series_retry("get_cpi_yoy_monthly", country, "M", keep_hint=36),
-                "une_m": _compat_fetch_series_retry("get_unemployment_rate_monthly", country, "M", keep_hint=36),
-                "fx_m": _compat_fetch_series_retry("get_fx_rate_usd_monthly", country, "M", keep_hint=36),
-                "res_m": _compat_fetch_series_retry("get_reserves_usd_monthly", country, "M", keep_hint=36),
-                "policy_m": _compat_fetch_series_retry("get_policy_rate_monthly", country, "M", keep_hint=48),
-            }
+        cpi_m = _get("cpi_m", 4.0)
+        une_m = _get("une_m", 4.0)
+        fx_m = _get("fx_m", 4.0)
+        res_m = _get("res_m", 4.0)
+        policy_m = _get("policy_m", 4.0)
 
-        def _run_wb() -> Dict[str, Any]:
-            cab = _wb_series_from_helpers(country, "wb_current_account_balance_pct_gdp_annual") or _wb_series_generic(country, "BN.CAB.XOKA.GD.ZS")
-            ge = _wb_series_from_helpers(country, "wb_government_effectiveness_annual") or _wb_series_generic(country, "GE.EST")
-            return {
-                "cab_a": cab,
-                "ge_a": ge,
-                "gdp_growth_a": _wb_series_generic(country, "NY.GDP.MKTP.KD.ZG"),
-                "ca_level_a": _wb_series_generic(country, "BN.CAB.XOKA.CD"),
-                "fiscal_a": _wb_series_generic(country, "GC.BAL.CASH.GD.ZS"),
-            }
+        cab_a = _get("cab_pct_a", 4.0)
+        ge_a = _get("ge_a", 4.0)
+        gdp_growth_a = _get("gdp_growth_a", 4.0)
+        ca_level_a = _get("ca_level_a", 4.0)
+        fiscal_a = _get("fiscal_a", 4.0)
 
-        with _futures.ThreadPoolExecutor(max_workers=4) as ex:
-            fut_debt = ex.submit(_run_debt)
-            fut_matrix = ex.submit(_run_matrix)
-            fut_compat = ex.submit(_run_compat)
-            fut_wb = ex.submit(_run_wb)
-
-            # Each section has its own cap. If it times out, we keep defaults.
-            try:
-                bundle = fut_debt.result(timeout=2.2)
-            except Exception:
-                bundle = {}
-
-            try:
-                matrix_payload = fut_matrix.result(timeout=3.2)
-            except Exception:
-                matrix_payload = {}
-
-            try:
-                compat_payload = fut_compat.result(timeout=5.0)
-            except Exception:
-                compat_payload = {}
-
-            try:
-                wb_payload = fut_wb.result(timeout=5.0)
-            except Exception:
-                wb_payload = {}
-
-        # --------------------------------------------------------------
-        # 3) Debt normalization (same logic you had)
-        # --------------------------------------------------------------
-        if isinstance(bundle, Mapping):
-            debt_bundle = dict(bundle)
-
-            debt_block = bundle.get("debt_to_gdp") or {}
-            series = debt_block.get("series") or bundle.get("debt_to_gdp_series") or {}
-
-            if isinstance(series, Mapping) and series:
-                debt_series_full = dict(series)
-                try:
-                    years_sorted = sorted(debt_series_full.keys(), key=lambda y: int(str(y)))
-                    latest_year = years_sorted[-1]
-                    latest_val = debt_series_full[latest_year]
-                except Exception:
-                    latest_year = None
-                    latest_val = None
-
-                latest_meta = debt_block.get("latest") or {}
+        # Apply WB debt fallback if needed
+        if not debt_series:
+            wb_debt = _get("wb_debt_ratio", 4.0)
+            if wb_debt:
+                debt_series = wb_debt
+                period, value = _latest(wb_debt)
                 debt_latest_summary = {
-                    "year": latest_year,
-                    "value": latest_val,
-                    "source": latest_meta.get("source") or "debt_service",
+                    "year": (str(period).split("-")[0] if period else None),
+                    "value": value,
+                    "source": "World Bank (ratio)",
                 }
 
-        debt_series = _trim_series_policy(debt_series_full, HIST_POLICY)
+    # ----------------------------
+    # 3) Latest extraction helper
+    # ----------------------------
+    def _kvl(d: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
+        return _latest(d)
 
-        # --------------------------------------------------------------
-        # 4) Unpack compat + wb payloads
-        # --------------------------------------------------------------
-        if isinstance(compat_payload, dict):
-            gdp_growth_q = compat_payload.get("gdp_growth_q") or {}
-            cpi_m = compat_payload.get("cpi_m") or {}
-            une_m = compat_payload.get("une_m") or {}
-            fx_m = compat_payload.get("fx_m") or {}
-            res_m = compat_payload.get("res_m") or {}
-            policy_m = compat_payload.get("policy_m") or {}
+    cpi_p, cpi_v = _kvl(cpi_m)
+    une_p, une_v = _kvl(une_m)
+    fx_p, fx_v = _kvl(fx_m)
+    res_p, res_v = _kvl(res_m)
+    pol_p, pol_v = _kvl(policy_m)
+    gdpq_p, gdpq_v = _kvl(gdp_growth_q)
 
-        if isinstance(wb_payload, dict):
-            cab_a = wb_payload.get("cab_a") or {}
-            ge_a = wb_payload.get("ge_a") or {}
-            gdp_growth_a = wb_payload.get("gdp_growth_a") or {}
-            ca_level_a = wb_payload.get("ca_level_a") or {}
-            fiscal_a = wb_payload.get("fiscal_a") or {}
+    cab_p, cab_v = _kvl(cab_a)
+    ge_p, ge_v = _kvl(ge_a)
+    gdpya_p, gdpya_v = _kvl(gdp_growth_a)
+    ca_lvl_p, ca_lvl_v = _kvl(ca_level_a)
+    fiscal_p, fiscal_v = _kvl(fiscal_a)
 
-        # --------------------------------------------------------------
-        # 5) Latest extraction (same as yours)
-        # --------------------------------------------------------------
-        def _kvl(d: Mapping[str, float]) -> Tuple[Optional[str], Optional[float]]:
-            return _latest(d)
+    # ----------------------------
+    # 4) indicators_matrix (optional, off by default for speed)
+    # ----------------------------
+    indicators_matrix: Dict[str, Any] = {}
+    matrix_debug: Dict[str, Any] = {}
+    # Keep this OFF until the matrix builder is proven fast.
+    ENABLE_MATRIX = False
 
-        cpi_p, cpi_v = _kvl(cpi_m)
-        une_p, une_v = _kvl(une_m)
-        fx_p, fx_v = _kvl(fx_m)
-        res_p, res_v = _kvl(res_m)
-        pol_p, pol_v = _kvl(policy_m)
-        gdpq_p, gdpq_v = _kvl(gdp_growth_q)
-
-        cab_p, cab_v = _kvl(cab_a)
-        ge_p, ge_v = _kvl(ge_a)
-        gdpya_p, gdpya_v = _kvl(gdp_growth_a)
-        ca_lvl_p, ca_lvl_v = _kvl(ca_level_a)
-        fiscal_p, fiscal_v = _kvl(fiscal_a)
-
-        # --------------------------------------------------------------
-        # 6) Matrix extraction (same)
-        # --------------------------------------------------------------
-        if isinstance(matrix_payload, dict):
-            indicators_matrix = matrix_payload.get("indicators_matrix") or {}
-            matrix_debug = matrix_payload.get("_debug") or {}
-
-        # --------------------------------------------------------------
-        # 7) Response (same schema as your current one, plus your extra annuals)
-        # --------------------------------------------------------------
-        resp: Dict[str, Any] = {
-            "country": country,
-            "iso_codes": iso,
-
-            "latest": {
-                "year": debt_latest_summary.get("year"),
-                "value": debt_latest_summary.get("value"),
-                "source": debt_latest_summary.get("source"),
-            },
-            "series": debt_series,
-            "source": debt_latest_summary.get("source"),
-
-            "imf_data": {},
-
-            "government_debt": debt_bundle.get("government_debt")
-            or {"latest": {"value": None, "date": None, "source": None}, "series": {}},
-
-            "nominal_gdp": debt_bundle.get("nominal_gdp")
-            or {"latest": {"value": None, "date": None, "source": None}, "series": {}},
-
-            "debt_to_gdp": debt_bundle.get("debt_to_gdp")
-            or {"latest": {"value": None, "date": None, "source": None}, "series": {}},
-
-            "debt_to_gdp_series": debt_bundle.get("debt_to_gdp_series") or debt_series,
-
-            "indicators_matrix": indicators_matrix,
-
-            "additional_indicators": {
-                "cpi_yoy": {"latest_value": cpi_v, "latest_period": cpi_p, "source": "compat/IMF", "series": cpi_m},
-                "unemployment_rate": {"latest_value": une_v, "latest_period": une_p, "source": "compat/IMF", "series": une_m},
-                "fx_rate_usd": {"latest_value": fx_v, "latest_period": fx_p, "source": "compat/IMF", "series": fx_m},
-                "reserves_usd": {"latest_value": res_v, "latest_period": res_p, "source": "compat/IMF", "series": res_m},
-                "policy_rate": {"latest_value": pol_v, "latest_period": pol_p, "source": "compat/IMF/ECB", "series": policy_m},
-                "gdp_growth": {"latest_value": gdpq_v, "latest_period": gdpq_p, "source": "compat/IMF", "series": gdp_growth_q},
-
-                "current_account_balance_pct_gdp": {"latest_value": cab_v, "latest_period": cab_p, "source": "WB(helper/generic)", "series": cab_a},
-                "government_effectiveness": {"latest_value": ge_v, "latest_period": ge_p, "source": "WB(helper/generic)", "series": ge_a},
-
-                # The three annuals you added:
-                "gdp_growth_annual": {"latest_value": gdpya_v, "latest_period": gdpya_p, "source": "WB(helper/generic)", "series": gdp_growth_a},
-                "current_account_level_usd": {"latest_value": ca_lvl_v, "latest_period": ca_lvl_p, "source": "WB(helper/generic)", "series": ca_level_a},
-                "fiscal_balance_pct_gdp": {"latest_value": fiscal_v, "latest_period": fiscal_p, "source": "WB(helper/generic)", "series": fiscal_a},
-            },
-
-            "_debug": {
-                "builder": "country_lite v3 (probe + parallel bounded fetches)",
-                "history_policy": HIST_POLICY,
-                "matrix_from_indicator_service": matrix_debug,
-                "elapsed_seconds": round(_time.time() - started, 2),
-            },
-        }
-
-        # cache best-effort
+    if ENABLE_MATRIX:
         try:
-            _cache_set(country, resp)
-        except Exception:
-            pass
+            from app.services.indicator_service import build_country_payload_v2
+            matrix_payload = _with_timeout(2.0, build_country_payload_v2, country, series="mini", keep=60) or {}
+            if isinstance(matrix_payload, dict):
+                indicators_matrix = matrix_payload.get("indicators_matrix") or {}
+                matrix_debug = matrix_payload.get("_debug") or {}
+        except Exception as e:
+            matrix_debug = {"error": repr(e)}
 
-        return JSONResponse(content=resp)
+    # ----------------------------
+    # 5) Build response (ALWAYS)
+    # ----------------------------
+    resp: Dict[str, Any] = {
+        "country": country,
+        "iso_codes": iso,
 
-    finally:
-        elapsed = _time.time() - started
-        logger.info("country_lite done | country=%s | elapsed=%.2fs", country, elapsed)
+        # Debt block (annual, trimmed)
+        "latest": {
+            "year": debt_latest_summary.get("year"),
+            "value": debt_latest_summary.get("value"),
+            "source": debt_latest_summary.get("source"),
+        },
+        "series": debt_series,
+        "source": debt_latest_summary.get("source"),
+
+        # Legacy top-levels retained (compatibility with older clients)
+        "imf_data": {},
+        "government_debt": debt_bundle.get("government_debt")
+            or {"latest": {"value": None, "date": None, "source": None}, "series": {}},
+        "nominal_gdp": debt_bundle.get("nominal_gdp")
+            or {"latest": {"value": None, "date": None, "source": None}, "series": {}},
+        "debt_to_gdp": debt_bundle.get("debt_to_gdp")
+            or {"latest": {"value": None, "date": None, "source": None}, "series": {}},
+        "debt_to_gdp_series": debt_bundle.get("debt_to_gdp_series") or debt_series,
+
+        "indicators_matrix": indicators_matrix,
+
+        "additional_indicators": {
+            "cpi_yoy": {"latest_value": cpi_v, "latest_period": cpi_p, "source": "compat/IMF", "series": cpi_m},
+            "unemployment_rate": {"latest_value": une_v, "latest_period": une_p, "source": "compat/IMF", "series": une_m},
+            "fx_rate_usd": {"latest_value": fx_v, "latest_period": fx_p, "source": "compat/IMF", "series": fx_m},
+            "reserves_usd": {"latest_value": res_v, "latest_period": res_p, "source": "compat/IMF", "series": res_m},
+            "policy_rate": {"latest_value": pol_v, "latest_period": pol_p, "source": "compat/IMF/ECB", "series": policy_m},
+            "gdp_growth": {"latest_value": gdpq_v, "latest_period": gdpq_p, "source": "compat/IMF", "series": gdp_growth_q},
+
+            "gdp_growth_annual": {"latest_value": gdpya_v, "latest_period": gdpya_p, "source": "WB(helper/generic)", "series": gdp_growth_a},
+            "current_account_balance_pct_gdp": {"latest_value": cab_v, "latest_period": cab_p, "source": "WB(helper/generic)", "series": cab_a},
+            "current_account_level_usd": {"latest_value": ca_lvl_v, "latest_period": ca_lvl_p, "source": "WB(helper/generic)", "series": ca_level_a},
+            "fiscal_balance_pct_gdp": {"latest_value": fiscal_v, "latest_period": fiscal_p, "source": "WB(helper/generic)", "series": fiscal_a},
+            "government_effectiveness": {"latest_value": ge_v, "latest_period": ge_p, "source": "WB(helper/generic)", "series": ge_a},
+        },
+
+        "_debug": {
+            "builder": "country_lite v3 (probe + parallel bounded fetches)",
+            "history_policy": HIST_POLICY,
+            "matrix_from_indicator_service": matrix_debug,
+            "elapsed_seconds": round((_time.time() - started), 2),
+        },
+    }
+
+    # ----------------------------
+    # 6) Cache + return
+    # ----------------------------
+    try:
+        _cache_set(country, resp)
+    except Exception:
+        pass
+
+    logger.info("country_lite done | country=%s | elapsed=%.2fs", country, (_time.time() - started))
+    return JSONResponse(content=resp)
+
