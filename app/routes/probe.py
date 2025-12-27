@@ -18,6 +18,20 @@ router = APIRouter(tags=["probe"])
 # Small helpers and shared utilities
 # -----------------------------------------------------------------------------
 
+def _source_for_series(series: Mapping[str, float], primary: str, fallback: str) -> str:
+    # If series is empty, we can't claim a source.
+    if not series:
+        return "N/A"
+    # Heuristic: monthly series contain "-", quarterly contain "-Q"
+    try:
+        k = sorted(series.keys())[-1]
+    except Exception:
+        return primary
+    # If it's annual (YYYY), it might be WB fallback for many metrics
+    s = str(k)
+    if "-Q" in s or "-" in s:
+        return primary
+    return fallback
 
 def _safe_import(module: str):
     try:
@@ -444,12 +458,42 @@ def country_lite(
         "indicators_matrix": indicators_matrix,
 
         "additional_indicators": {
-            "cpi_yoy": {"latest_value": cpi_v, "latest_period": cpi_p, "source": "compat/IMF", "series": cpi_m},
-            "unemployment_rate": {"latest_value": une_v, "latest_period": une_p, "source": "compat/IMF", "series": une_m},
-            "fx_rate_usd": {"latest_value": fx_v, "latest_period": fx_p, "source": "compat/IMF", "series": fx_m},
-            "reserves_usd": {"latest_value": res_v, "latest_period": res_p, "source": "compat/IMF", "series": res_m},
-            "policy_rate": {"latest_value": pol_v, "latest_period": pol_p, "source": "compat/IMF/ECB", "series": policy_m},
-            "gdp_growth": {"latest_value": gdpq_v, "latest_period": gdpq_p, "source": "compat/IMF", "series": gdp_growth_q},
+            "cpi_yoy": {
+                "latest_value": cpi_v,
+                "latest_period": cpi_p,
+                "source": _source_for_series(cpi_m, "IMF", "World Bank"),
+                "series": cpi_m,
+            },
+            "unemployment_rate": {
+                "latest_value": une_v,
+                "latest_period": une_p,
+                "source": _source_for_series(une_m, "IMF", "World Bank"),
+                "series": une_m,
+            },
+            "fx_rate_usd": {
+                "latest_value": fx_v,
+                "latest_period": fx_p,
+                "source": _source_for_series(fx_m, "IMF", "World Bank"),
+                "series": fx_m,
+            },
+            "reserves_usd": {
+                "latest_value": res_v,
+                "latest_period": res_p,
+                "source": _source_for_series(res_m, "IMF", "World Bank"),
+                "series": res_m,
+            },
+            "policy_rate": {
+                "latest_value": pol_v,
+                "latest_period": pol_p,
+                "source": ("ECB" if policy_m else "N/A"),
+                "series": policy_m,
+            },
+            "gdp_growth": {
+                "latest_value": gdpq_v,
+                "latest_period": gdpq_p,
+                "source": _source_for_series(gdp_growth_q, "IMF", "World Bank"),
+                "series": gdp_growth_q,
+            },
 
             "gdp_growth_annual": {"latest_value": gdpya_v, "latest_period": gdpya_p, "source": "WB(helper/generic)", "series": gdp_growth_a},
             "current_account_balance_pct_gdp": {"latest_value": cab_v, "latest_period": cab_p, "source": "WB(helper/generic)", "series": cab_a},
